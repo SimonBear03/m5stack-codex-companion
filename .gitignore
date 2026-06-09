@@ -1,0 +1,9 @@
+.pio/
+.platformio/
+.venv/
+.vscode/
+*.bin
+*.elf
+*.map
+*.log
+.DS_Store
