@@ -22,7 +22,9 @@ The StickS3 should act as a compact terminal-style status device:
 - Long A opens/closes settings.
 - Long B jumps to newest when reading older text and the unread dot is visible; otherwise it enters display sleep.
 - Settings include brightness, power profile, sound, text navigation, and auto-newest.
-- Display dims and auto-sleeps after about 5 seconds in all modes when no unread marker is present, settings are closed, and the user is not reading older text.
+- Display auto-sleeps after about 10 seconds in all modes when no unread marker is present, settings are closed, and the user is not reading older text; there is no pre-sleep dimming.
+- Normal display sleep keeps BLE reachable; `Travel` power mode requests PMIC shutdown after idle display sleep and trades away BLE wake for longer standby.
+- 20% battery or lower on battery temporarily forces effective `Max` behavior while preserving the saved profile.
 - Soft, office-safe sound cues for activity and important state changes.
 - Firmware attempts to turn off the PMIC/internal green board status LED at boot.
 - Read-only operation for the current Codex Desktop workflow.
@@ -58,6 +60,7 @@ The current product path is status mirroring through `desktop-observer`. True co
 - `scripts/sticks3-macos-bridge` - macOS supervisor for starting, stopping, and reporting Desktop observer state.
 - `macos/swiftbar/sticks3-codex.5s.sh` - SwiftBar/xbar menu plugin that displays bridge state and exposes Start/Stop/Restart.
 - `macos/LaunchAgents/com.simon.sticks3-codex-companion.plist` - launch-at-login template for the supervisor.
+- `runtime/StickS3Bridge.app` - generated local app wrapper, ignored by Git, used so macOS can grant Bluetooth permission to the menu-bar-started bridge.
 - `tests/` - Python protocol and bridge tests.
 - `platformio.ini` - PlatformIO config targeting ESP32-S3 Arduino with M5Unified, M5PM1, ArduinoJson, and NimBLE-Arduino.
 - `src/main.cpp` - current firmware implementation:
@@ -68,15 +71,15 @@ The current product path is status mirroring through `desktop-observer`. True co
   - structured `status` and `activity` snapshot handling.
   - raw activity message cache plus wrapped activity ring buffer with page/line navigation, colored message headers, and blank message separators.
   - compact text wraps from raw message text using rendered pixel width.
-  - 1000-character desktop observer activity cap with 4 recent activity records per snapshot.
+  - 1000-character desktop observer activity cap with 4 recent activity records on first send, then delta activity snapshots.
   - 8192-byte firmware JSON line receive buffer.
   - smart punctuation normalization before device display.
   - tool activity filtering so tool events update pinned status without filling scrollback.
   - settings menu and persisted dashboard settings.
   - display sleep with long-B shortcut, delayed shake wake, BLE wake, and work/new-activity wake.
-  - battery-saving power profiles: Balanced, Saver, Max.
+  - battery-saving power profiles: Balanced, Saver, Max, Travel.
   - cached battery telemetry with voltage/current status ack fields.
-  - lower brightness levels, auto-dim, on-demand speaker/amp shutdown, reduced redraws, adaptive loop delays, BLE TX/interval tuning, and optional long-idle deep sleep in Max mode.
+  - lower brightness levels, low-battery Max override, PMIC LED/external boost shutdown, reduced redraws, adaptive loop delays, BLE TX/interval tuning, optional long-idle deep sleep in Max mode, and PMIC shutdown in Travel mode.
   - soft buzzer cues.
   - status command ack.
   - owner/name/unpair command ack.
@@ -88,15 +91,18 @@ This repo has completed successful firmware builds on Simon's Mac with repo-loca
 Current validation:
 
 - `.venv/bin/pio run` succeeds on Simon's Mac.
-- `.bridge-venv/bin/python -m unittest discover -s tests` succeeds with 25 tests.
-- Firmware binary is about 1.09 MB.
+- `.bridge-venv/bin/python -m unittest discover -s tests` succeeds with 26 tests.
+- Firmware binary is about 1.10 MB.
 - USB flashing to `/dev/cu.usbmodem101` and `/dev/cu.usbmodem2101` has succeeded.
 - BLE status validation has succeeded; Simon's device replies as `Codex-S3-0470`.
 - `desktop-observer` parses local Codex Desktop rollouts, skips newer subagent rollouts by default, normalizes token/rate-limit events, and emits structured `status`/`activity` snapshots.
 - `desktop-observer` can write a status JSON file for the macOS menu bar helper.
 - `scripts/sticks3-macos-bridge` provides supervised start/stop/restart/status and SwiftBar/xbar output without killing manually started bridge processes.
+- `scripts/sticks3-macos-bridge start` now launches the bridge through a generated `StickS3Bridge.app` wrapper with an `NSBluetoothAlwaysUsageDescription`, avoiding SwiftBar-launched Homebrew Python TCC crashes on macOS 27.
 - The old flicker issue was addressed by drawing to an `M5Canvas` sprite and pushing only on redraw.
-- The battery pass builds and adds 5-second all-mode display sleep, power profiles, telemetry, speaker amp shutdown, redraw throttling, adaptive loop delay, and BLE power tuning.
+- The battery pass builds and adds 10-second all-mode display sleep, power profiles, telemetry, redraw throttling, adaptive loop delay, BLE power tuning, low-battery Max override, explicit PMIC LED/boost shutdown, and Travel-mode PMIC shutdown.
+- Manual audio-enable toggling was removed after hardware noise appeared; sound cues now work on hardware through M5Unified's StickS3 speaker path.
+- The Desktop observer now slows idle heartbeat traffic and sends only new activity records after the first snapshot instead of repeating scrollback on every heartbeat.
 
 M5Launcher notes:
 
@@ -188,14 +194,17 @@ SwiftBar/xbar can use this plugin folder:
 10. Confirm long A opens settings, Button B cycles options, Button A rotates values, and long A closes settings.
 11. Confirm long B jumps to newest when the unread dot is shown.
 12. Confirm long B enters display sleep when not reading old text.
-13. Confirm display dims and auto-sleeps after about 5 seconds in WORK, IDLE, WAIT, STALE, ERR, and OFF modes when not reading old text.
+13. Confirm display auto-sleeps after about 10 seconds in WORK, IDLE, WAIT, STALE, ERR, and OFF modes when not reading old text, with no pre-sleep dimming.
 14. Confirm sound modes are quiet and not repetitive.
 15. Confirm no old pet wording, screens, stats, or animations remain.
 16. Confirm `scripts/sticks3-macos-bridge start/status/stop` controls the bridge when no manual observer is already running.
 17. Confirm the SwiftBar/xbar plugin shows `S3 Link`, `S3 Idle`, `S3 Work`, and `S3 Err` states correctly.
 18. Confirm new BLE activity and shake wake the display after auto sleep.
-19. Confirm speaker noise is gone or reduced after cue playback.
+19. Confirm speaker cues play as tones, not only pops, after removing manual audio-enable toggling. Done on 2026-06-11.
 20. Confirm battery telemetry appears in status ack and settings footer.
+21. Confirm low-battery effective Max behavior when battery is 20% or lower.
+22. Confirm `Travel` mode enters PMIC shutdown after display sleep on battery and document the actual wake behavior on hardware.
+23. Confirm idle observer heartbeats no longer duplicate body activity.
 
 ## Known Risks
 
@@ -206,8 +215,9 @@ SwiftBar/xbar can use this plugin folder:
 - Token totals are session/event dependent and may remain unavailable until Codex Desktop writes token events.
 - Chinese display is in test mode: UTF-8 travels through BLE/JSON, dashboard text uses `efontCN_14` for both ASCII and non-ASCII body/current-status text, and wrapping is UTF-8/pixel-width aware. Broader CJK typography and mixed-language polish still need hardware validation.
 - The internal green LED off path uses the M5PM1 PMIC API and still needs hardware validation; boot/download indicator behavior may be hardware-controlled.
+- Travel mode uses M5PM1 PMIC shutdown and best-effort PMIC GPIO4 wake-source arming. BLE cannot wake the device from this state; actual shake wake depends on the board IMU interrupt chain and still needs hardware validation.
 - M5Launcher WebUI install is not currently reliable for this no-SD StickS3 workflow.
 
 ## Immediate Next Engineering Task
 
-Validate the latest dashboard, battery, and Mac helper pass on hardware: revised top bar mode colors, smoother flat 3x3 status animation matrix, PMIC green LED off attempt, unread marker, 14px CJK-capable dashboard text, longer message scrollback, smart punctuation, tool-status filtering, 5-second all-mode display sleep, new activity/shake wake behavior, audible soft sound cues, speaker noise reduction, battery telemetry, and the SwiftBar/xbar bridge supervisor workflow.
+Validate the remaining dashboard, battery, and Mac helper behavior on hardware: PMIC green LED off attempt, unread marker, 14px CJK-capable dashboard text, new activity/shake wake behavior, battery telemetry, low-battery effective Max behavior, Travel-mode shutdown/wake behavior, idle observer heartbeat dedupe, and the SwiftBar/xbar bridge supervisor workflow.

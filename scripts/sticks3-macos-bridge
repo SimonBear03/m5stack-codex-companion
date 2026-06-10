@@ -19,6 +19,13 @@ RUNTIME_DIR = Path(os.environ.get("STICKS3_RUNTIME_DIR", REPO_ROOT / "runtime"))
 PID_FILE = RUNTIME_DIR / "bridge.pid"
 STATUS_FILE = RUNTIME_DIR / "bridge-status.json"
 LOG_FILE = RUNTIME_DIR / "bridge.log"
+APP_DIR = RUNTIME_DIR / "StickS3Bridge.app"
+APP_CONTENTS = APP_DIR / "Contents"
+APP_MACOS = APP_CONTENTS / "MacOS"
+APP_RESOURCES = APP_CONTENTS / "Resources"
+APP_EXEC = APP_MACOS / "StickS3BridgePython"
+APP_MAIN = APP_RESOURCES / "bridge_app_main.py"
+APP_PLIST = APP_CONTENTS / "Info.plist"
 
 
 def now_iso() -> str:
@@ -92,9 +99,8 @@ def bridge_bin() -> Path:
     )
 
 
-def bridge_command(args: argparse.Namespace) -> list[str]:
+def bridge_args(args: argparse.Namespace) -> list[str]:
     command = [
-        str(bridge_bin()),
         "--log-level",
         args.log_level,
         "desktop-observer",
@@ -104,6 +110,8 @@ def bridge_command(args: argparse.Namespace) -> list[str]:
         str(args.poll_interval),
         "--heartbeat-interval",
         str(args.heartbeat_interval),
+        "--idle-heartbeat-interval",
+        str(args.idle_heartbeat_interval),
         "--status-file",
         str(STATUS_FILE),
     ]
@@ -122,6 +130,119 @@ def bridge_command(args: argparse.Namespace) -> list[str]:
     if args.fake_device:
         command.append("--fake-device")
     return command
+
+
+def bridge_command(args: argparse.Namespace) -> list[str]:
+    return [str(bridge_bin()), *bridge_args(args)]
+
+
+def python_bin() -> Path:
+    local_bin = REPO_ROOT / ".bridge-venv" / "bin" / "python"
+    if local_bin.exists():
+        return local_bin.resolve()
+    return Path(sys.executable).resolve()
+
+
+def app_info_plist() -> str:
+    return """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>en</string>
+  <key>CFBundleDisplayName</key>
+  <string>StickS3 Codex Bridge</string>
+  <key>CFBundleExecutable</key>
+  <string>StickS3BridgePython</string>
+  <key>CFBundleIdentifier</key>
+  <string>com.simon.sticks3-codex-companion.bridge</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleName</key>
+  <string>StickS3 Codex Bridge</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>0.1.0</string>
+  <key>CFBundleVersion</key>
+  <string>1</string>
+  <key>LSUIElement</key>
+  <true/>
+  <key>NSBluetoothAlwaysUsageDescription</key>
+  <string>StickS3 Codex Bridge uses Bluetooth to connect to Simon's M5Stack StickS3 dashboard.</string>
+  <key>NSBluetoothPeripheralUsageDescription</key>
+  <string>StickS3 Codex Bridge uses Bluetooth to connect to Simon's M5Stack StickS3 dashboard.</string>
+</dict>
+</plist>
+"""
+
+
+def app_main_source() -> str:
+    return f"""from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+REPO_ROOT = Path({str(REPO_ROOT)!r})
+RUNTIME_DIR = Path(os.environ.get("STICKS3_RUNTIME_DIR", REPO_ROOT / "runtime")).expanduser()
+PID_FILE = RUNTIME_DIR / "bridge.pid"
+LOG_FILE = RUNTIME_DIR / "bridge.log"
+
+RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+PID_FILE.write_text(f"{{os.getpid()}}\\n", encoding="utf-8")
+
+log = LOG_FILE.open("ab", buffering=0)
+os.dup2(log.fileno(), 1)
+os.dup2(log.fileno(), 2)
+print(f"\\n[app {{os.getpid()}}] starting StickS3 bridge", flush=True)
+
+version = f"python{{sys.version_info.major}}.{{sys.version_info.minor}}"
+site_packages = REPO_ROOT / ".bridge-venv" / "lib" / version / "site-packages"
+bridge_src = REPO_ROOT / "bridge"
+for path in (str(site_packages), str(bridge_src)):
+    if path not in sys.path:
+        sys.path.insert(0, path)
+
+os.environ.setdefault("STICKS3_REPO", str(REPO_ROOT))
+os.chdir(REPO_ROOT)
+
+try:
+    from sticks3_bridge.cli import main
+    raise SystemExit(main(sys.argv[1:]))
+finally:
+    try:
+        if PID_FILE.read_text(encoding="utf-8").strip() == str(os.getpid()):
+            PID_FILE.unlink()
+    except OSError:
+        pass
+"""
+
+
+def ensure_bridge_app() -> Path:
+    source_python = python_bin()
+    APP_MACOS.mkdir(parents=True, exist_ok=True)
+    APP_RESOURCES.mkdir(parents=True, exist_ok=True)
+    APP_PLIST.write_text(app_info_plist(), encoding="utf-8")
+    APP_MAIN.write_text(app_main_source(), encoding="utf-8")
+
+    needs_copy = not APP_EXEC.exists()
+    if not needs_copy:
+        try:
+            needs_copy = source_python.stat().st_mtime > APP_EXEC.stat().st_mtime
+        except OSError:
+            needs_copy = True
+    if needs_copy:
+        shutil.copy2(source_python, APP_EXEC)
+        APP_EXEC.chmod(0o755)
+
+    return APP_DIR
+
+
+def app_open_command(args: argparse.Namespace) -> list[str]:
+    app_dir = ensure_bridge_app()
+    return ["/usr/bin/open", "-n", str(app_dir), "--args", str(APP_MAIN), *bridge_args(args)]
 
 
 def status_payload() -> dict[str, Any]:
@@ -148,7 +269,7 @@ def command_start(args: argparse.Namespace) -> int:
         remove_stale_pid()
 
     try:
-        command = bridge_command(args)
+        command = app_open_command(args)
     except RuntimeError as exc:
         write_status("error", error=str(exc))
         print(str(exc), file=sys.stderr)
@@ -166,9 +287,18 @@ def command_start(args: argparse.Namespace) -> int:
             stderr=subprocess.STDOUT,
             start_new_session=True,
         )
-    PID_FILE.write_text(f"{process.pid}\n", encoding="utf-8")
-    write_status("starting", detail=f"Started pid {process.pid}")
-    print(f"started bridge: pid {process.pid}")
+
+    deadline = time.monotonic() + 6.0
+    pid = None
+    while time.monotonic() < deadline:
+        pid = read_pid()
+        if pid and pid_is_running(pid):
+            break
+        time.sleep(0.2)
+    current = read_json(STATUS_FILE)
+    if current.get("state") in {None, "starting", "error", "stopped"}:
+        write_status("starting", detail=f"Started pid {pid}" if pid else "Started app launcher")
+    print(f"started bridge: pid {pid}" if pid else "started bridge app launcher")
     return 0
 
 
@@ -315,6 +445,11 @@ def add_bridge_options(parser: argparse.ArgumentParser) -> None:
         "--heartbeat-interval",
         type=float,
         default=float(os.environ.get("STICKS3_HEARTBEAT_INTERVAL", "10")),
+    )
+    parser.add_argument(
+        "--idle-heartbeat-interval",
+        type=float,
+        default=float(os.environ.get("STICKS3_IDLE_HEARTBEAT_INTERVAL", "45")),
     )
     parser.add_argument("--device-prefix", default=os.environ.get("STICKS3_DEVICE_PREFIX", "Codex-S3-"))
     parser.add_argument("--address", default=os.environ.get("STICKS3_ADDRESS"))

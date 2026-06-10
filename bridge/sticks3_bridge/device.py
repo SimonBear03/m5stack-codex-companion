@@ -40,6 +40,10 @@ class StickS3Device(abc.ABC):
     async def wait_for_control(self) -> dict[str, Any]:
         raise NotImplementedError
 
+    @abc.abstractmethod
+    async def request_status(self) -> None:
+        raise NotImplementedError
+
 
 class BleStickS3Device(StickS3Device):
     def __init__(
@@ -58,6 +62,7 @@ class BleStickS3Device(StickS3Device):
         self._decoder = JsonLineDecoder()
         self._interaction_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self._control_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        self.last_status_ack: dict[str, Any] | None = None
 
     async def connect(self) -> None:
         try:
@@ -83,7 +88,7 @@ class BleStickS3Device(StickS3Device):
         await client.connect()
         await client.start_notify(NUS_TX_UUID, self._handle_notification)
         self._client = client
-        await self.send_json({"cmd": "status"})
+        await self.request_status()
 
     async def close(self) -> None:
         if self._client is None:
@@ -103,6 +108,9 @@ class BleStickS3Device(StickS3Device):
         for chunk in chunk_bytes(encode_json_line(data), self.chunk_size):
             await self._client.write_gatt_char(NUS_RX_UUID, chunk, response=False)
             await asyncio.sleep(0.008)
+
+    async def request_status(self) -> None:
+        await self.send_json({"cmd": "status"})
 
     async def wait_for_interaction(self, interaction_id: str, timeout: float) -> dict[str, Any]:
         while True:
@@ -129,6 +137,10 @@ class BleStickS3Device(StickS3Device):
                 self._interaction_queue.put_nowait(message)
             elif message.get("cmd") == "control":
                 self._control_queue.put_nowait(message)
+            elif message.get("ack") == "status" and message.get("ok"):
+                data = message.get("data")
+                if isinstance(data, dict):
+                    self.last_status_ack = data
 
 
 class FakeStickS3Device(StickS3Device):
@@ -137,6 +149,7 @@ class FakeStickS3Device(StickS3Device):
             raise ValueError("auto_decision must be one of: once, session, deny, cancel")
         self.auto_decision = auto_decision
         self.snapshots: list[Snapshot] = []
+        self.last_status_ack: dict[str, Any] | None = None
 
     async def connect(self) -> None:
         LOGGER.info("Using fake StickS3 device with auto decision: %s", self.auto_decision)
@@ -156,3 +169,6 @@ class FakeStickS3Device(StickS3Device):
     async def wait_for_control(self) -> dict[str, Any]:
         future: asyncio.Future[dict[str, Any]] = asyncio.Future()
         return await future
+
+    async def request_status(self) -> None:
+        return None

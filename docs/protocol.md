@@ -72,11 +72,11 @@ The device accepts snapshots like:
 }
 ```
 
-`status` is the pinned newest action line. `activity` is the scrollable body input and should be ordered oldest-to-newest so the newest message lands at the bottom of the terminal window. Each activity item should include a stable `seq`; the firmware dedupes recently seen sequence IDs so heartbeat snapshots do not duplicate body text.
+`status` is the pinned newest action line. `activity` is the scrollable body input and should be ordered oldest-to-newest so the newest message lands at the bottom of the terminal window. Each activity item should include a stable `seq`; the firmware dedupes recently seen sequence IDs so heartbeat snapshots do not duplicate body text. Bridges may omit `activity` on heartbeat snapshots when no new body text exists.
 
 The firmware renders conversation activity as compact message blocks, not a raw line stream: a colored header such as `[Codex]` or `[User]`, followed by flush-left wrapped body lines and a blank separator line before the next message. Tool activity is treated as pinned current status only and is not added to scrollback, so command noise does not displace the readable conversation.
 
-The desktop observer caps each activity text at 1000 characters and keeps the latest 4 activity records in each snapshot. BLE still sends JSON as 20-byte chunks, but that is only a transport chunk size. The firmware accepts JSON lines up to 8192 bytes, keeps the latest raw activity messages, and rebuilds wrapped body lines for the selected text mode. The rendered body uses a fixed 190-line ring buffer.
+The desktop observer caps each activity text at 1000 characters and keeps the latest 4 activity records for the first snapshot after connect or rollout switch. After that, it sends only new activity records. BLE still sends JSON as 20-byte chunks, but that is only a transport chunk size. The firmware accepts JSON lines up to 8192 bytes, keeps the latest raw activity messages, and rebuilds wrapped body lines for the selected text mode. The rendered body uses a fixed 190-line ring buffer.
 
 The bridge normalizes common smart punctuation such as curly apostrophes, curly quotes, long dashes, and ellipses to terminal-safe ASCII before sending text to the device. Chinese display is currently a test path: the BLE/JSON path carries UTF-8, dashboard text uses M5GFX `efontCN_14` for both ASCII and non-ASCII text, and body wrapping measures rendered pixel width instead of raw byte count. Mixed-language typography still needs hardware validation.
 
@@ -137,18 +137,21 @@ The device replies:
     "settings": {
       "brightness": 1,
       "power": 1,
+      "effective_power": 1,
+      "low_battery_max": false,
       "sound": 1,
       "nav": 0,
       "auto_newest": true,
-      "auto_dim_ms": 1500,
-      "auto_sleep_ms": 5000,
-      "deep_sleep_ms": 0
+      "auto_dim_ms": 0,
+      "auto_sleep_ms": 10000,
+      "deep_sleep_ms": 0,
+      "travel_shutdown_ms": 0
     }
   }
 }
 ```
 
-Battery telemetry fields are best-effort. `bat.mv` and `bat.ma` are omitted when the board API cannot provide a plausible reading. `settings.power` maps to `0=Balanced`, `1=Saver`, and `2=Max`.
+Battery telemetry fields are best-effort. `bat.mv` and `bat.ma` are omitted when the board API cannot provide a plausible reading. `settings.power` maps the saved profile: `0=Balanced`, `1=Saver`, `2=Max`, `3=Travel`. `settings.effective_power` can report `2=Max` when the low-battery auto policy is active even if the saved profile is lower.
 
 The firmware also accepts `owner`, `name`, and `unpair` commands for compatibility with existing bridge tooling.
 
@@ -174,6 +177,8 @@ The device displays remaining percentages beside compact bars, for example `5h 6
 - `response_item` function calls -> `Tool` activity with a cleaned tool name
 - `token_count` -> token total and rate-limit windows without replacing the current action line
 - `patch_apply_end` -> `Tool: Patch applied` or `Tool: Patch failed`
+
+The observer sends active changes immediately. Idle heartbeat defaults to 45 seconds and does not repeat old `activity` items; this keeps the BLE radio and firmware JSON parser quieter while preserving the pinned status and usage rows.
 
 ## App Server Compatibility
 

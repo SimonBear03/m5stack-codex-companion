@@ -86,6 +86,12 @@ def build_parser() -> argparse.ArgumentParser:
     desktop_observer.add_argument("--poll-interval", type=float, default=2.0)
     desktop_observer.add_argument("--heartbeat-interval", type=float, default=10.0)
     desktop_observer.add_argument(
+        "--idle-heartbeat-interval",
+        type=float,
+        default=45.0,
+        help="Heartbeat interval when no Codex turn is active.",
+    )
+    desktop_observer.add_argument(
         "--status-file",
         help="Write desktop-observer lifecycle/status JSON to this file for menu bar helpers.",
     )
@@ -123,6 +129,7 @@ async def run_desktop_observer(args: argparse.Namespace) -> None:
         thread_id=args.thread_id,
         poll_interval=args.poll_interval,
         heartbeat_interval=args.heartbeat_interval,
+        idle_heartbeat_interval=args.idle_heartbeat_interval,
         status_file=Path(args.status_file).expanduser() if args.status_file else None,
     )
 

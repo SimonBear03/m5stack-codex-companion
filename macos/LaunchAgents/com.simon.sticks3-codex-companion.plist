@@ -9,7 +9,7 @@
   <key>ProgramArguments</key>
   <array>
     <string>/Users/simon/Documents/workspace/repos/sticks3-codex-companion/scripts/sticks3-macos-bridge</string>
-    <string>run</string>
+    <string>start</string>
   </array>
 
   <key>WorkingDirectory</key>
@@ -23,12 +23,6 @@
 
   <key>RunAtLoad</key>
   <true/>
-
-  <key>KeepAlive</key>
-  <dict>
-    <key>SuccessfulExit</key>
-    <false/>
-  </dict>
 
   <key>StandardOutPath</key>
   <string>/tmp/sticks3-codex-companion.launchd.out.log</string>

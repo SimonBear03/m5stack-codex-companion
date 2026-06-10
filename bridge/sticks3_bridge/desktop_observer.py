@@ -18,6 +18,8 @@ LOGGER = logging.getLogger(__name__)
 
 DESKTOP_ACTIVITY_HISTORY = 4
 DESKTOP_ACTIVITY_TEXT_LIMIT = 1000
+DEFAULT_ACTIVE_HEARTBEAT_INTERVAL = 10.0
+DEFAULT_IDLE_HEARTBEAT_INTERVAL = 45.0
 
 
 def default_codex_home() -> Path:
@@ -139,15 +141,15 @@ class DesktopObserverState:
     rate_limits: dict[str, dict[str, Any]] | None = None
     last_event_ts: float | None = None
 
-    def snapshot(self) -> Snapshot:
+    def snapshot(self, activity: tuple[dict[str, Any], ...] | None = None) -> Snapshot:
         label = self.thread_name or (self.thread_id[:8] if self.thread_id else "Desktop")
         msg = self.last_message
         if not self.active and self.thread_id and msg == "Desktop observer connected":
             msg = short_text(f"Idle: {label}", 80)
-        ordered_activity = tuple(reversed(self.activity))
+        ordered_activity = tuple(reversed(self.activity)) if activity is None else activity
         entries = tuple(
             short_text(f"{item.get('speaker', 'Codex')}: {item.get('text', '')}", 48)
-            for item in self.activity
+            for item in reversed(ordered_activity)
         )
         return Snapshot(
             total=1 if self.thread_id else 0,
@@ -171,7 +173,8 @@ class DesktopObserverBridge:
         rollout_path: Path | None = None,
         thread_id: str | None = None,
         poll_interval: float = 2.0,
-        heartbeat_interval: float = 10.0,
+        heartbeat_interval: float = DEFAULT_ACTIVE_HEARTBEAT_INTERVAL,
+        idle_heartbeat_interval: float = DEFAULT_IDLE_HEARTBEAT_INTERVAL,
         status_file: Path | None = None,
     ) -> None:
         self.device = device
@@ -180,11 +183,13 @@ class DesktopObserverBridge:
         self.thread_id = thread_id
         self.poll_interval = poll_interval
         self.heartbeat_interval = heartbeat_interval
+        self.idle_heartbeat_interval = idle_heartbeat_interval
         self.status_file = status_file
         self.state = DesktopObserverState()
         self._offset = 0
         self._last_size = 0
         self._last_sent = 0.0
+        self._last_activity_seq_sent = 0
         self._snapshot_lock = asyncio.Lock()
 
     async def run(self) -> None:
@@ -196,7 +201,8 @@ class DesktopObserverBridge:
         while True:
             changed = await self.poll_once()
             now = time.monotonic()
-            if changed or now - self._last_sent >= self.heartbeat_interval:
+            heartbeat_interval = self.heartbeat_interval if self.state.active else self.idle_heartbeat_interval
+            if changed or now - self._last_sent >= heartbeat_interval:
                 await self.send_snapshot()
             await asyncio.sleep(self.poll_interval)
 
@@ -213,6 +219,7 @@ class DesktopObserverBridge:
             self.rollout_path = path
             self._offset = 0
             self._last_size = 0
+            self._last_activity_seq_sent = 0
             self.state = DesktopObserverState()
             LOGGER.info("Observing Codex Desktop rollout: %s", path)
 
@@ -384,9 +391,27 @@ class DesktopObserverBridge:
             )
             self.state.next_seq += 1
 
+    @staticmethod
+    def activity_seq_value(item: dict[str, Any]) -> int:
+        seq = str(item.get("seq") or "")
+        if seq.startswith("d") and seq[1:].isdigit():
+            return int(seq[1:])
+        return 0
+
+    def pending_activity(self) -> tuple[dict[str, Any], ...]:
+        ordered = tuple(reversed(self.state.activity))
+        if self._last_activity_seq_sent <= 0:
+            return ordered
+        return tuple(item for item in ordered if self.activity_seq_value(item) > self._last_activity_seq_sent)
+
     async def send_snapshot(self) -> None:
         async with self._snapshot_lock:
-            await self.device.send_snapshot(self.state.snapshot())
+            activity = self.pending_activity()
+            await self.device.send_snapshot(self.state.snapshot(activity=activity))
+            if activity:
+                self._last_activity_seq_sent = max(self.activity_seq_value(item) for item in activity)
+            await self.device.request_status()
+            await asyncio.sleep(0.05)
             self._last_sent = time.monotonic()
             self.write_status("connected", detail=self.state.last_message)
 
@@ -416,6 +441,9 @@ class DesktopObserverBridge:
             "tokens": self.state.tokens_total,
             "rate_limits": self.state.rate_limits,
         }
+        device_status = getattr(self.device, "last_status_ack", None)
+        if isinstance(device_status, dict):
+            payload["device"] = device_status
 
         try:
             self.status_file.parent.mkdir(parents=True, exist_ok=True)

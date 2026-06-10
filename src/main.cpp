@@ -12,12 +12,11 @@ constexpr const char* NUS_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
 constexpr const char* NUS_RX_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
 constexpr const char* NUS_TX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
 
-constexpr uint32_t STALE_AFTER_MS = 30000;
+constexpr uint32_t STALE_AFTER_MS = 90000;
 constexpr uint32_t BLE_NOTIFY_CHUNK_DELAY_MS = 8;
 constexpr uint32_t LONG_PRESS_MS = 650;
 constexpr uint32_t SETTINGS_IDLE_MS = 12000;
 constexpr uint32_t ACTIVITY_SOUND_COOLDOWN_MS = 1400;
-constexpr uint32_t SHAKE_CHECK_MS = 180;
 constexpr uint32_t SHAKE_WAKE_ARM_DELAY_MS = 2500;
 constexpr float SHAKE_WAKE_DELTA = 0.85f;
 constexpr uint8_t DASHBOARD_FONT_HEIGHT = 14;
@@ -28,7 +27,10 @@ constexpr uint32_t WORK_ANIMATION_MS = 260;
 constexpr uint32_t POWER_TELEMETRY_MS = 30000;
 constexpr uint32_t SPEAKER_IDLE_OFF_MS = 180;
 constexpr uint32_t BLE_CONN_TUNE_DELAY_MS = 800;
+constexpr uint32_t PERIPHERAL_ENFORCE_MS = 30000;
 constexpr uint32_t MAX_POWER_DEEP_SLEEP_MS = 20UL * 60UL * 1000UL;
+constexpr uint32_t TRAVEL_SHUTDOWN_AFTER_MS = 15000;
+constexpr uint8_t LOW_BATTERY_POWER_MAX_PCT = 20;
 constexpr size_t BODY_LINE_COUNT = 190;
 constexpr size_t RAW_ACTIVITY_COUNT = 8;
 constexpr size_t SEEN_SEQ_COUNT = 24;
@@ -66,7 +68,8 @@ enum SettingIndex : uint8_t {
 enum PowerMode : uint8_t {
   POWER_BALANCED = 0,
   POWER_SAVER,
-  POWER_MAX
+  POWER_MAX,
+  POWER_TRAVEL
 };
 
 enum Cue : uint8_t {
@@ -177,12 +180,14 @@ uint32_t lastShakeCheckMs = 0;
 uint32_t sleepEnteredMs = 0;
 uint32_t speakerOffAtMs = 0;
 uint32_t bleTuneRequestedMs = 0;
+uint32_t lastPeripheralEnforceMs = 0;
 bool displaySleeping = false;
 bool displayDimmed = false;
 bool accelPrimed = false;
 bool pmicReady = false;
 bool speakerOutputActive = false;
 bool bleConnParamsPending = false;
+bool travelShutdownStarted = false;
 float lastAx = 0.0f;
 float lastAy = 0.0f;
 float lastAz = 0.0f;
@@ -333,6 +338,22 @@ StatusMode currentStatusMode() {
   return MODE_IDLE;
 }
 
+bool lowBatteryPowerSaveActive() {
+  const int pct = batteryPercent();
+  return !isUsbPowered() && pct >= 0 && pct <= LOW_BATTERY_POWER_MAX_PCT && app.settings.power < POWER_MAX;
+}
+
+PowerMode effectivePowerMode() {
+  if (lowBatteryPowerSaveActive()) {
+    return POWER_MAX;
+  }
+  return app.settings.power;
+}
+
+bool travelModeActive() {
+  return app.settings.power == POWER_TRAVEL;
+}
+
 uint16_t statusColor(StatusMode mode) {
   switch (mode) {
     case MODE_ERR:
@@ -374,7 +395,9 @@ bool statusModeAnimates(StatusMode mode) {
 }
 
 uint32_t powerProfileFactor() {
-  switch (app.settings.power) {
+  switch (effectivePowerMode()) {
+    case POWER_TRAVEL:
+      return 3;
     case POWER_MAX:
       return 2;
     case POWER_SAVER:
@@ -408,43 +431,61 @@ uint16_t limitColor(int remainingPct) {
 
 uint8_t brightnessValue() {
   static const uint8_t values[] = {24, 76, 148};
+  if (lowBatteryPowerSaveActive()) {
+    return values[0];
+  }
   return values[constrain(app.settings.brightness, 0, 2)];
 }
 
-uint8_t dimBrightnessValue() {
-  return app.settings.power == POWER_MAX ? 8 : 14;
-}
-
 void applyBrightness() {
-  M5.Display.setBrightness(displayDimmed ? dimBrightnessValue() : brightnessValue());
+  M5.Display.setBrightness(brightnessValue());
 }
 
 uint32_t autoDimAfterMs() {
-  switch (app.settings.power) {
-    case POWER_MAX:
-      return 1000;
-    case POWER_SAVER:
-      return 1500;
-    case POWER_BALANCED:
-    default:
-      return 2500;
-  }
+  return 0;
 }
 
 uint32_t autoSleepAfterMs() {
-  return 5000;
+  return 10000;
 }
 
 uint32_t deepSleepAfterMs() {
-  return app.settings.power == POWER_MAX ? MAX_POWER_DEEP_SLEEP_MS : 0;
+  return effectivePowerMode() == POWER_MAX ? MAX_POWER_DEEP_SLEEP_MS : 0;
+}
+
+uint32_t travelShutdownAfterMs() {
+  return travelModeActive() ? TRAVEL_SHUTDOWN_AFTER_MS : 0;
 }
 
 uint32_t activeCpuMhz() {
-  return app.settings.power == POWER_BALANCED ? 160 : 120;
+  switch (effectivePowerMode()) {
+    case POWER_TRAVEL:
+    case POWER_MAX:
+      return 80;
+    case POWER_SAVER:
+      return 120;
+    case POWER_BALANCED:
+    default:
+      return 160;
+  }
 }
 
 uint32_t sleepCpuMhz() {
   return 80;
+}
+
+uint32_t shakeCheckMs() {
+  switch (effectivePowerMode()) {
+    case POWER_TRAVEL:
+      return 700;
+    case POWER_MAX:
+      return 500;
+    case POWER_SAVER:
+      return 320;
+    case POWER_BALANCED:
+    default:
+      return 220;
+  }
 }
 
 void setCpuMhzIfNeeded(uint32_t mhz) {
@@ -456,21 +497,36 @@ void setCpuMhzIfNeeded(uint32_t mhz) {
   currentMhz = mhz;
 }
 
-void setSpeakerAmp(bool enabled) {
+void enforceUnusedPowerRails(bool force = false) {
+  const uint32_t now = millis();
+  if (!force && lastPeripheralEnforceMs > 0 && now - lastPeripheralEnforceMs < PERIPHERAL_ENFORCE_MS) {
+    return;
+  }
+  lastPeripheralEnforceMs = now;
+
+  M5.Power.setLed(0);
+  M5.Power.setExtOutput(false);
   if (!pmicReady) {
     return;
   }
-  pm1.setAw8737aMode(
-    M5PM1_GPIO_NUM_3,
-    enabled ? M5PM1_AW8737A_MODE_2 : M5PM1_AW8737A_MODE_1,
-    M5PM1_AW8737A_REFRESH_NOW
-  );
+  pm1.disableLeds();
+  pm1.setLedEnLevel(false);
+  pm1.setBoostEnable(false);
+  pm1.boostSetPowerHold(false);
 }
 
 void shutdownSpeakerOutput() {
   M5.Speaker.stop();
-  M5.Speaker.end();
-  setSpeakerAmp(false);
+  M5.Speaker.setVolume(0);
+  speakerOutputActive = false;
+  speakerOffAtMs = 0;
+}
+
+void setupSpeakerOutput() {
+  M5.Speaker.begin();
+  M5.Speaker.setAllChannelVolume(255);
+  M5.Speaker.setChannelVolume(0, 255);
+  M5.Speaker.setVolume(0);
   speakerOutputActive = false;
   speakerOffAtMs = 0;
 }
@@ -484,7 +540,11 @@ void setupPmicPowerSaving() {
   pm1.disableLeds();
   pm1.setI2cSleepTime(2);
   pm1.setAutoWakeEnable(true);
-  setSpeakerAmp(false);
+  pm1.setBoostEnable(false);
+  pm1.boostSetPowerHold(false);
+  pm1.ldoSetPowerHold(false);
+  pm1.gpioSetWakeEnable(M5PM1_GPIO_NUM_4, false);
+  enforceUnusedPowerRails(true);
 }
 
 void loadSettings() {
@@ -493,7 +553,7 @@ void loadSettings() {
     app.settings.brightness = isUsbPowered() ? 1 : 0;
   }
   app.settings.power = static_cast<PowerMode>(prefs.isKey("pwr") ? prefs.getUChar("pwr", POWER_BALANCED) : (isUsbPowered() ? POWER_BALANCED : POWER_SAVER));
-  if (app.settings.power > POWER_MAX) {
+  if (app.settings.power > POWER_TRAVEL) {
     app.settings.power = POWER_BALANCED;
   }
   app.settings.sound = static_cast<SoundMode>(prefs.getUChar("snd", SOUND_SOFT));
@@ -516,6 +576,7 @@ void saveSettings() {
 }
 
 void wakeDisplay() {
+  travelShutdownStarted = false;
   if (!displaySleeping) {
     if (displayDimmed) {
       displayDimmed = false;
@@ -542,6 +603,7 @@ void enterDisplaySleep() {
   accelPrimed = false;
   autoSleepEligibleSinceMs = 0;
   sleepEnteredMs = millis();
+  travelShutdownStarted = false;
   displaySleeping = true;
   displayDimmed = false;
   pendingCue = CUE_NONE;
@@ -571,13 +633,14 @@ void requestCue(Cue cue) {
 }
 
 void toneSoft(float frequency, uint32_t duration) {
-  if (!speakerOutputActive) {
+  if (!M5.Speaker.isRunning()) {
     M5.Speaker.begin();
-    setSpeakerAmp(true);
-    speakerOutputActive = true;
   }
-  M5.Speaker.setVolume(app.settings.sound == SOUND_ALERTS ? 70 : 42);
-  M5.Speaker.tone(frequency, duration, -1, true);
+  M5.Speaker.setAllChannelVolume(255);
+  M5.Speaker.setChannelVolume(0, 255);
+  M5.Speaker.setVolume(app.settings.sound == SOUND_ALERTS ? 84 : 58);
+  M5.Speaker.tone(frequency, duration);
+  speakerOutputActive = true;
   speakerOffAtMs = millis() + duration + SPEAKER_IDLE_OFF_MS;
 }
 
@@ -586,7 +649,9 @@ void handleSpeakerPower() {
     return;
   }
   if (static_cast<int32_t>(millis() - speakerOffAtMs) >= 0 && !M5.Speaker.isPlaying()) {
-    shutdownSpeakerOutput();
+    M5.Speaker.setVolume(0);
+    speakerOutputActive = false;
+    speakerOffAtMs = 0;
   }
 }
 
@@ -682,12 +747,15 @@ void sendStatusAck() {
   JsonObject settings = data["settings"].to<JsonObject>();
   settings["brightness"] = app.settings.brightness;
   settings["power"] = app.settings.power;
+  settings["effective_power"] = effectivePowerMode();
+  settings["low_battery_max"] = lowBatteryPowerSaveActive();
   settings["sound"] = app.settings.sound;
   settings["nav"] = app.settings.textNav;
   settings["auto_newest"] = app.settings.autoNewest;
   settings["auto_dim_ms"] = autoDimAfterMs();
   settings["auto_sleep_ms"] = autoSleepAfterMs();
   settings["deep_sleep_ms"] = deepSleepAfterMs();
+  settings["travel_shutdown_ms"] = travelShutdownAfterMs();
   sendJson(doc);
 }
 
@@ -1222,7 +1290,9 @@ class RxCallbacks : public NimBLECharacteristicCallbacks {
 };
 
 uint16_t advertisingMinInterval() {
-  switch (app.settings.power) {
+  switch (effectivePowerMode()) {
+    case POWER_TRAVEL:
+      return 3200;  // 2.0s while waiting for a last connection before shutdown.
     case POWER_MAX:
       return 2400;  // 1.5s in 0.625ms units.
     case POWER_SAVER:
@@ -1234,7 +1304,9 @@ uint16_t advertisingMinInterval() {
 }
 
 uint16_t advertisingMaxInterval() {
-  switch (app.settings.power) {
+  switch (effectivePowerMode()) {
+    case POWER_TRAVEL:
+      return 4800;  // 3.0s.
     case POWER_MAX:
       return 3200;  // 2.0s.
     case POWER_SAVER:
@@ -1246,7 +1318,13 @@ uint16_t advertisingMaxInterval() {
 }
 
 void connectionParamsForPower(uint16_t& minInterval, uint16_t& maxInterval, uint16_t& latency, uint16_t& timeout) {
-  switch (app.settings.power) {
+  switch (effectivePowerMode()) {
+    case POWER_TRAVEL:
+      minInterval = 240;  // 300ms in 1.25ms units.
+      maxInterval = 400;  // 500ms.
+      latency = 10;
+      timeout = 800;      // 8s in 10ms units.
+      break;
     case POWER_MAX:
       minInterval = 160;  // 200ms in 1.25ms units.
       maxInterval = 320;  // 400ms.
@@ -1270,7 +1348,8 @@ void connectionParamsForPower(uint16_t& minInterval, uint16_t& maxInterval, uint
 }
 
 esp_power_level_t bleTxPowerLevel() {
-  switch (app.settings.power) {
+  switch (effectivePowerMode()) {
+    case POWER_TRAVEL:
     case POWER_MAX:
       return ESP_PWR_LVL_N9;
     case POWER_SAVER:
@@ -1314,6 +1393,24 @@ void handleBleConnectionTuning() {
   connectionParamsForPower(minInterval, maxInterval, latency, timeout);
   bleServer->updateConnParams(peers[0], minInterval, maxInterval, latency, timeout);
   bleConnParamsPending = false;
+}
+
+void handlePowerPolicyChange() {
+  static bool initialized = false;
+  static PowerMode lastMode = POWER_BALANCED;
+  const PowerMode mode = effectivePowerMode();
+  if (initialized && mode == lastMode) {
+    return;
+  }
+
+  initialized = true;
+  lastMode = mode;
+  applyBrightness();
+  applyBlePowerPolicy();
+  requestBleConnectionTuning();
+  setCpuMhzIfNeeded(displaySleeping ? sleepCpuMhz() : activeCpuMhz());
+  enforceUnusedPowerRails(true);
+  needsRedraw = true;
 }
 
 void setupBle() {
@@ -1600,13 +1697,17 @@ const char* brightnessName() {
 }
 
 const char* powerName() {
-  if (app.settings.power == POWER_MAX) {
-    return "Max";
+  switch (app.settings.power) {
+    case POWER_TRAVEL:
+      return "Travel";
+    case POWER_MAX:
+      return "Max";
+    case POWER_SAVER:
+      return "Saver";
+    case POWER_BALANCED:
+    default:
+      return "Balanced";
   }
-  if (app.settings.power == POWER_SAVER) {
-    return "Saver";
-  }
-  return "Balanced";
 }
 
 const char* soundName() {
@@ -1628,7 +1729,7 @@ String settingLabel(uint8_t index) {
     case SETTING_BRIGHTNESS:
       return "Brightness " + String(brightnessName());
     case SETTING_POWER:
-      return "Power " + String(powerName());
+      return String("Power ") + powerName() + (lowBatteryPowerSaveActive() ? ">Max" : "");
     case SETTING_SOUND:
       return "Sound " + String(soundName());
     case SETTING_TEXT_NAV:
@@ -1737,7 +1838,7 @@ void rotateSetting() {
       applyBrightness();
       break;
     case SETTING_POWER:
-      app.settings.power = static_cast<PowerMode>((app.settings.power + 1) % 3);
+      app.settings.power = static_cast<PowerMode>((app.settings.power + 1) % 4);
       if (!isUsbPowered() && app.settings.power != POWER_BALANCED && app.settings.brightness > 1) {
         app.settings.brightness = 1;
       }
@@ -1852,7 +1953,7 @@ void handleButtons() {
 }
 
 void checkShakeWake() {
-  if (!displaySleeping || millis() - lastShakeCheckMs < SHAKE_CHECK_MS) {
+  if (!displaySleeping || millis() - lastShakeCheckMs < shakeCheckMs()) {
     return;
   }
   if (millis() - sleepEnteredMs < SHAKE_WAKE_ARM_DELAY_MS) {
@@ -1883,10 +1984,52 @@ void checkShakeWake() {
   }
 }
 
+void prepareTravelWakeSources() {
+  if (!pmicReady) {
+    return;
+  }
+
+  pm1.disableLeds();
+  pm1.setLedEnLevel(false);
+  pm1.setBoostEnable(false);
+  pm1.boostSetPowerHold(false);
+  pm1.gpioSetPowerHold(M5PM1_GPIO_NUM_3, false);
+
+  // Keep the IMU rail available for the StickS3 PMIC wake chain and arm GPIO4,
+  // which is wired to the IMU interrupt path on StickS3-class hardware.
+  pm1.ldoSetPowerHold(true);
+  pm1.gpioSetFunc(M5PM1_GPIO_NUM_4, M5PM1_GPIO_FUNC_WAKE);
+  pm1.gpioSetWakeEdge(M5PM1_GPIO_NUM_4, M5PM1_GPIO_WAKE_RISING);
+  pm1.gpioSetWakeEnable(M5PM1_GPIO_NUM_4, true);
+  pm1.clearWakeSource(0x7F);
+}
+
+void enterTravelShutdown() {
+  if (travelShutdownStarted) {
+    return;
+  }
+  travelShutdownStarted = true;
+  app.settings.open = false;
+  saveSettings();
+  shutdownSpeakerOutput();
+  enforceUnusedPowerRails(true);
+  prepareTravelWakeSources();
+  M5.Display.sleep();
+  delay(120);
+  if (pmicReady) {
+    pm1.shutdown();
+    delay(500);
+  }
+  M5.Power.powerOff();
+  delay(200);
+  M5.Power.deepSleep(0, true);
+}
+
 void enterDeepSleep() {
   app.settings.open = false;
   saveSettings();
   shutdownSpeakerOutput();
+  enforceUnusedPowerRails(true);
   M5.Display.sleep();
   delay(20);
   M5.Power.deepSleep(0, true);
@@ -1909,6 +2052,10 @@ void handleStatusAnimation() {
 void handleSleepTimers() {
   if (displaySleeping) {
     checkShakeWake();
+    const uint32_t travelMs = travelShutdownAfterMs();
+    if (travelMs > 0 && !isUsbPowered() && app.running == 0 && app.waiting == 0 && !app.hasNew && millis() - sleepEnteredMs > travelMs) {
+      enterTravelShutdown();
+    }
     const uint32_t deepMs = deepSleepAfterMs();
     if (deepMs > 0 && !isUsbPowered() && app.running == 0 && app.waiting == 0 && !app.hasNew && millis() - sleepEnteredMs > deepMs) {
       enterDeepSleep();
@@ -1926,27 +2073,22 @@ void handleSleepTimers() {
     autoSleepEligibleSinceMs = millis();
     return;
   }
-  const uint32_t idleMs = millis() - autoSleepEligibleSinceMs;
-  if (!displayDimmed && idleMs > autoDimAfterMs()) {
-    displayDimmed = true;
-    applyBrightness();
-  }
-  if (idleMs > autoSleepAfterMs()) {
+  if (millis() - autoSleepEligibleSinceMs > autoSleepAfterMs()) {
     enterDisplaySleep();
   }
 }
 
 uint32_t loopDelayMs() {
   if (displaySleeping) {
-    return app.settings.power == POWER_BALANCED ? 160 : 260;
+    return effectivePowerMode() == POWER_BALANCED ? 160 : 280;
   }
   if (app.settings.open || pendingCue != CUE_NONE || speakerOutputActive) {
     return 20;
   }
   if (currentStatusMode() == MODE_WORK) {
-    return app.settings.power == POWER_BALANCED ? 50 : 80;
+    return effectivePowerMode() == POWER_BALANCED ? 50 : 120;
   }
-  return app.settings.power == POWER_BALANCED ? 60 : 100;
+  return effectivePowerMode() == POWER_BALANCED ? 60 : 140;
 }
 
 void seedBody() {
@@ -1968,8 +2110,8 @@ void setup() {
   M5.begin(cfg);
   M5.Power.setLed(0);
   setupPmicPowerSaving();
+  setupSpeakerOutput();
   M5.Display.setRotation(0);
-  shutdownSpeakerOutput();
   canvas.setColorDepth(16);
   canvas.createSprite(M5.Display.width(), M5.Display.height());
   useUiFont();
@@ -1992,6 +2134,7 @@ void loop() {
   handleButtons();
   handleSleepTimers();
   handleStatusAnimation();
+  handlePowerPolicyChange();
   handleBleConnectionTuning();
   playPendingCue();
   handleSpeakerPower();
@@ -2002,7 +2145,10 @@ void loop() {
 
   if (samplePowerTelemetry(false)) {
     needsRedraw = true;
+    handlePowerPolicyChange();
   }
+
+  enforceUnusedPowerRails(false);
 
   if (needsRedraw) {
     redraw();

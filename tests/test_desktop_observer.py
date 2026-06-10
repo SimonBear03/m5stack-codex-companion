@@ -164,6 +164,27 @@ class DesktopObserverTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual({"speaker": "Codex", "kind": "working", "text": "Working"}, status["status"])
             self.assertEqual("Working", status["detail"])
 
+    async def test_send_snapshot_only_sends_new_activity_after_first_snapshot(self) -> None:
+        device = FakeStickS3Device()
+        bridge = DesktopObserverBridge(device=device)
+        bridge.state.thread_id = "thread-delta"
+        bridge.add_activity("User", "message", "First message")
+        bridge.add_activity("Codex", "message", "Second message")
+
+        await bridge.send_snapshot()
+        first_wire = device.snapshots[-1].to_wire()
+        self.assertEqual(["First message", "Second message"], [item["text"] for item in first_wire["activity"]])
+
+        await bridge.send_snapshot()
+        second_wire = device.snapshots[-1].to_wire()
+        self.assertNotIn("activity", second_wire)
+        self.assertEqual({"speaker": "System", "kind": "connected", "text": "Desktop observer connected"}, second_wire["status"])
+
+        bridge.add_activity("Codex", "message", "Third message")
+        await bridge.send_snapshot()
+        third_wire = device.snapshots[-1].to_wire()
+        self.assertEqual(["Third message"], [item["text"] for item in third_wire["activity"]])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -86,12 +86,20 @@ scripts/sticks3-macos-bridge stop
 Runtime files live in `runtime/` and are ignored by Git:
 
 - `bridge.pid`: the process started by the supervisor
-- `bridge-status.json`: lifecycle, current status, thread, tokens, and rate limits
+- `bridge-status.json`: lifecycle, current status, thread, tokens, rate limits, and latest device telemetry when the StickS3 replies to `status`
 - `bridge.log`: bridge stdout/stderr from background starts
+- `StickS3Bridge.app`: generated macOS app wrapper for Bluetooth permission
 
 The helper does not search for and kill unrelated `sticks3-bridge` processes. If
 you started the observer manually in a terminal, stop that terminal process before
 switching to the supervisor so BLE is not claimed by two processes.
+
+SwiftBar must not launch Homebrew Python directly for BLE. New macOS TCC checks
+can kill that Python process because its app bundle lacks
+`NSBluetoothAlwaysUsageDescription`. The supervisor now generates and opens
+`runtime/StickS3Bridge.app`, a local app wrapper with the Bluetooth usage string,
+and runs the bridge inside that app process. If macOS prompts for Bluetooth
+access to `StickS3 Codex Bridge`, allow it.
 
 For SwiftBar/xbar, use the included plugin folder:
 
@@ -165,8 +173,9 @@ Settings menu:
 - Long A: close settings.
 - Auto-closes after 12 seconds of no input.
 - Settings options are brightness, power profile, sound, text navigation, and auto-newest.
-- The display dims and auto-sleeps after about 5 seconds in all modes when there is no unread marker, settings are closed, and you are not reading older text. Shake wake is armed 2.5 seconds after sleep starts, while button input and new Codex BLE activity can wake immediately.
+- The display auto-sleeps after about 10 seconds in normal modes when there is no unread marker, settings are closed, and you are not reading older text. There is no pre-sleep dimming step. Shake wake is armed 2.5 seconds after sleep starts, while button input and new Codex BLE activity can wake immediately.
 - Power profiles tune brightness behavior, animation cadence, loop delay, BLE TX/connection parameters, and optional long-idle deep sleep in `Max`.
+- `Travel` is an aggressive battery profile. After display sleep and a short idle window on battery, it requests M5PM1 PMIC shutdown. BLE cannot receive new Codex messages while the device is in that state.
 
 ## Usage Mapping
 
@@ -185,19 +194,24 @@ In `desktop-observer` mode, the bridge reads `event_msg` `token_count` events fr
 
 ## Battery Behavior
 
-Battery-saving behavior is firmware-local. The Mac bridge does not need to know when the display is asleep; BLE stays connected in normal display sleep and incoming snapshots can wake the screen.
+Battery-saving behavior is mostly firmware-local. The Mac bridge does not need to know when the display is asleep; BLE stays connected in normal display sleep and incoming snapshots can wake the screen. `Travel` mode is different because it powers the device down and drops BLE until the StickS3 is woken/restarted.
 
 The device now:
 
 - caches battery telemetry and samples it roughly every 30 seconds,
 - reports battery percent, voltage/current when supported, and CPU MHz in `status` acks,
 - lowers LCD brightness levels and defaults to lower settings on battery when no saved preference exists,
-- shuts down the speaker task and AW8737 amplifier after sound cues,
+- temporarily forces effective `Max` behavior at 20% battery or lower while preserving the saved profile,
+- keeps hardware-validated soft speaker cues enabled through M5Unified's StickS3 speaker path without manually toggling the audio enable path from the unused-rail saver,
+- explicitly keeps PMIC LEDs and external 5V/boost off unless needed,
 - stops redraws for unchanged heartbeat snapshots,
 - slows animations and the main loop when idle/asleep, including during `WORK`,
 - lowers BLE transmit power and relaxes advertising/connection intervals according to the selected power profile,
-- enters display sleep after about 5 seconds in all modes when settings are closed, no unread marker is present, and you are not reading older text,
-- optionally enters ESP32 deep sleep in `Max` mode after extended idle, which disconnects BLE until the device is woken and reboots.
+- enters display sleep after about 10 seconds in all modes when settings are closed, no unread marker is present, and you are not reading older text,
+- optionally enters ESP32 deep sleep in `Max` mode after extended idle, which disconnects BLE until the device is woken and reboots,
+- requests M5PM1 PMIC shutdown in `Travel` mode after idle display sleep for longer standby at the cost of BLE wake.
+
+The Desktop observer also reduces battery impact by sending only new activity records after the first snapshot and by using a slower idle heartbeat. Active Codex turns still send immediately when the rollout changes.
 
 ## Current Validation Status
 
@@ -213,7 +227,7 @@ Validated on 2026-06-10:
 Still to validate after the dashboard redesign:
 
 - Flash the redesigned firmware to the physical StickS3.
-- Confirm the one-screen layout, wrapped body text, settings menu, unread-dot behavior, and soft sounds on hardware.
+- Confirm the one-screen layout, wrapped body text, settings menu, and unread-dot behavior on hardware. Soft sounds have been validated on the physical StickS3 after removing manual audio-enable toggling.
 
 ## Security Notes
 
