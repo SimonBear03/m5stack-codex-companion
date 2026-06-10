@@ -128,9 +128,9 @@ class DesktopObserverTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(1234, wire["tokens"])
             self.assertEqual("5h", wire["rate_limits"]["primary"]["label"])
             self.assertEqual({"speaker": "Codex", "kind": "completed", "text": "Turn completed"}, wire["status"])
-            self.assertEqual("Codex", wire["activity"][0]["speaker"])
-            self.assertEqual("completed", wire["activity"][0]["kind"])
-            self.assertIn("Finished observer update", wire["activity"][0]["text"])
+            self.assertEqual("Codex", wire["activity"][-1]["speaker"])
+            self.assertEqual("completed", wire["activity"][-1]["kind"])
+            self.assertIn("Finished observer update", wire["activity"][-1]["text"])
             self.assertTrue(any(item["speaker"] == "Tool" and item["text"] == "exec_command" for item in wire["activity"]))
             self.assertIn("Finished observer update", wire["entries"][0])
 

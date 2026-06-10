@@ -15,7 +15,7 @@ The StickS3 should act as a compact terminal-style status device:
 
 - One main dashboard screen, not a multi-page app.
 - Pinned top/status section with muted mode color, `NEW`, BLE/USB/battery state, `5h` and `7d` remaining bars, compact tokens, and the newest current action.
-- Scrollable wrapped body text for recent Codex activity.
+- Scrollable wrapped body text for recent Codex activity, rendered as compact message blocks instead of a continuous text stream.
 - Speaker labels in current status and body text: `User`, `Codex`, `Tool`, `System`, and subagent names if exposed later.
 - Button A moves newer/down through body text.
 - Button B moves older/up through body text.
@@ -61,7 +61,7 @@ The current product path is status mirroring through `desktop-observer`. True co
   - JSON line parser.
   - one-screen dashboard renderer.
   - structured `status` and `activity` snapshot handling.
-  - wrapped activity ring buffer with page/line navigation.
+  - wrapped activity ring buffer with page/line navigation and message-block rendering.
   - settings menu and persisted dashboard settings.
   - soft buzzer cues.
   - status command ack.

@@ -15,7 +15,7 @@ The StickS3 is a BLE display for Codex activity on Simon's Mac. A local bridge c
   - `5h` and `7d` remaining percentages with compact bars
   - compact token totals such as `842`, `12.4K`, `57.6M`, or `1.2B`
 - Pinned current action line with speaker labels such as `Codex`, `User`, `Tool`, and `System`.
-- Scrollable wrapped body text backed by a fixed ring buffer.
+- Scrollable wrapped body text backed by a fixed ring buffer, rendered as compact message blocks rather than one continuous line stream.
 - Settings menu for brightness, sound, text navigation, text size, and auto-newest behavior.
 - Soft buzzer cues for activity, connected, completed, and disconnected/error events.
 - BLE `status`, `owner`, `name`, and `unpair` command handling.

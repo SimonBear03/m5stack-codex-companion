@@ -141,6 +141,7 @@ class DesktopObserverState:
         msg = self.last_message
         if not self.active and self.thread_id and msg == "Desktop observer connected":
             msg = short_text(f"Idle: {label}", 80)
+        ordered_activity = tuple(reversed(self.activity))
         entries = tuple(
             short_text(f"{item.get('speaker', 'Codex')}: {item.get('text', '')}", 48)
             for item in self.activity
@@ -152,7 +153,7 @@ class DesktopObserverState:
             msg=msg,
             entries=entries[:3],
             status=self.status,
-            activity=tuple(self.activity),
+            activity=ordered_activity,
             tokens=self.tokens_total,
             rate_limits=self.rate_limits,
         )

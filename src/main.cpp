@@ -420,15 +420,12 @@ String bodyLineAt(size_t chronologicalIndex) {
   return app.bodyLines[(app.bodyStart + chronologicalIndex) % BODY_LINE_COUNT];
 }
 
-uint8_t appendWrapped(const String& speaker, String text) {
+uint8_t appendWrappedText(const String& firstPrefix, const String& nextPrefix, String text) {
   text = cleanText(text);
   if (text.isEmpty()) {
     return 0;
   }
 
-  const String cleanSpeaker = fitText(speaker.isEmpty() ? "Codex" : speaker, 8);
-  const String firstPrefix = cleanSpeaker + ": ";
-  const String nextPrefix = "  ";
   const uint8_t maxChars = maxBodyChars();
   String remaining = text;
   String prefix = firstPrefix;
@@ -461,6 +458,28 @@ uint8_t appendWrapped(const String& speaker, String text) {
     prefix = nextPrefix;
   }
 
+  return added;
+}
+
+String activityHeader(String speaker, String kind) {
+  speaker = fitText(speaker.isEmpty() ? "Codex" : speaker, 9);
+  kind = fitText(kind.isEmpty() ? "message" : kind, 9);
+  if (kind == "message" || kind == "status") {
+    return "[" + speaker + "]";
+  }
+  return "[" + speaker + " " + kind + "]";
+}
+
+uint8_t appendActivityBlock(const String& speaker, const String& kind, String text) {
+  text = cleanText(text);
+  if (text.isEmpty()) {
+    return 0;
+  }
+
+  uint8_t added = 0;
+  appendBodyLine(activityHeader(speaker, kind));
+  added += 1;
+  added += appendWrappedText("  ", "  ", text);
   return added;
 }
 
@@ -527,8 +546,9 @@ void handleActivity(JsonArray activity) {
       continue;
     }
     const String speaker = item["speaker"] | "Codex";
+    const String kind = item["kind"] | "message";
     const String text = item["text"] | "";
-    added += appendWrapped(speaker, text);
+    added += appendActivityBlock(speaker, kind, text);
   }
   applyNewLines(added);
 }
@@ -560,10 +580,10 @@ void handleLegacyText(JsonDocument& doc) {
   if (doc["entries"].is<JsonArray>()) {
     JsonArray entries = doc["entries"].as<JsonArray>();
     for (int index = static_cast<int>(entries.size()) - 1; index >= 0; --index) {
-      added += appendWrapped("Codex", entries[index].as<String>());
+      added += appendActivityBlock("Codex", "legacy", entries[index].as<String>());
     }
   } else if (doc["msg"].is<const char*>()) {
-    added += appendWrapped("Codex", doc["msg"].as<String>());
+    added += appendActivityBlock("Codex", "legacy", doc["msg"].as<String>());
   }
   applyNewLines(added);
 }
@@ -1074,7 +1094,7 @@ void handleButtons() {
 }
 
 void seedBody() {
-  uint8_t added = appendWrapped("System", "Dashboard booted. Waiting for Codex Desktop observer.");
+  uint8_t added = appendActivityBlock("System", "boot", "Dashboard booted. Waiting for Codex Desktop observer.");
   applyNewLines(added);
 }
 
