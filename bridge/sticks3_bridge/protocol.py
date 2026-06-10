@@ -10,6 +10,7 @@ NUS_RX_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e"
 NUS_TX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
 
 DEFAULT_BLE_CHUNK_SIZE = 20
+MAX_INTERACTION_OPTIONS = 8
 
 COMMAND_APPROVAL_METHOD = "item/commandExecution/requestApproval"
 FILE_APPROVAL_METHOD = "item/fileChange/requestApproval"
@@ -167,8 +168,8 @@ def approval_interaction(method: str, request_id: Any, params: dict[str, Any]) -
     }
 
 
-def handoff_interaction(request_id: Any, title: str, body: Any) -> dict[str, Any]:
-    return {
+def handoff_interaction(request_id: Any, title: str, body: Any, question_id: Any | None = None) -> dict[str, Any]:
+    interaction = {
         "id": str(request_id),
         "kind": "handoff",
         "title": short_text(title, 18),
@@ -178,6 +179,9 @@ def handoff_interaction(request_id: Any, title: str, body: Any) -> dict[str, Any
         "multi": False,
         "handoff": True,
     }
+    if question_id is not None:
+        interaction["question_id"] = str(question_id)
+    return interaction
 
 
 def tool_user_input_interaction(request_id: Any, params: dict[str, Any]) -> dict[str, Any]:
@@ -189,14 +193,24 @@ def tool_user_input_interaction(request_id: Any, params: dict[str, Any]) -> dict
     if not isinstance(question, dict):
         return handoff_interaction(request_id, "Codex Choice", "Open on Mac")
     if question.get("isSecret") or question.get("isOther"):
-        return handoff_interaction(request_id, question.get("header") or "Codex Choice", question.get("question"))
+        return handoff_interaction(
+            request_id,
+            question.get("header") or "Codex Choice",
+            question.get("question"),
+            question.get("id") or "answer",
+        )
 
     options = question.get("options")
     if not isinstance(options, list) or not options:
-        return handoff_interaction(request_id, question.get("header") or "Codex Choice", question.get("question"))
+        return handoff_interaction(
+            request_id,
+            question.get("header") or "Codex Choice",
+            question.get("question"),
+            question.get("id") or "answer",
+        )
 
     normalized_options: list[dict[str, str]] = []
-    for index, option in enumerate(options[:8]):
+    for index, option in enumerate(options[:MAX_INTERACTION_OPTIONS]):
         if not isinstance(option, dict):
             continue
         label = short_text(option.get("label"), 18)
@@ -204,7 +218,12 @@ def tool_user_input_interaction(request_id: Any, params: dict[str, Any]) -> dict
             normalized_options.append({"id": label, "label": label})
 
     if not normalized_options:
-        return handoff_interaction(request_id, question.get("header") or "Codex Choice", question.get("question"))
+        return handoff_interaction(
+            request_id,
+            question.get("header") or "Codex Choice",
+            question.get("question"),
+            question.get("id") or "answer",
+        )
 
     return {
         "id": str(request_id),
@@ -240,7 +259,7 @@ def mcp_elicitation_interaction(request_id: Any, params: dict[str, Any]) -> dict
         return handoff_interaction(request_id, field_schema.get("title") or "MCP Request", params.get("message"))
 
     normalized_options: list[dict[str, str]] = []
-    for index, value in enumerate(enum_values[:8]):
+    for index, value in enumerate(enum_values[:MAX_INTERACTION_OPTIONS]):
         label = enum_names[index] if isinstance(enum_names, list) and index < len(enum_names) else value
         normalized_options.append({"id": str(value), "label": short_text(label, 18)})
 
@@ -293,6 +312,13 @@ def tool_user_input_response(interaction: dict[str, Any], value: Any) -> dict[st
     return {"answers": {question_id: {"answers": answers}}}
 
 
+def empty_tool_user_input_response(interaction: dict[str, Any]) -> dict[str, Any]:
+    question_id = interaction.get("question_id")
+    if question_id is None:
+        return {"answers": {}}
+    return {"answers": {str(question_id): {"answers": []}}}
+
+
 def mcp_elicitation_response(interaction: dict[str, Any], value: Any) -> dict[str, Any]:
     question_id = str(interaction.get("question_id") or "answer")
     return {"action": "accept", "content": {question_id: value}}
@@ -305,7 +331,7 @@ def interaction_response(method: str, interaction: dict[str, Any], message: dict
             return {"action": "cancel"}
         if method in SUPPORTED_APPROVAL_METHODS:
             return approval_response(method, "cancel")
-        return tool_user_input_response(interaction, "Open on Mac")
+        return empty_tool_user_input_response(interaction)
 
     value = message.get("value")
     if method in SUPPORTED_APPROVAL_METHODS:

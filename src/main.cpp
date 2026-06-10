@@ -19,7 +19,7 @@ constexpr uint32_t LONG_PRESS_MS = 650;
 constexpr uint32_t DOUBLE_PRESS_MS = 280;
 constexpr uint32_t COMBO_HOLD_MS = 850;
 constexpr size_t ENTRY_COUNT = 3;
-constexpr size_t OPTION_COUNT = 6;
+constexpr size_t OPTION_COUNT = 8;
 constexpr size_t BLE_NOTIFY_CHUNK_SIZE = 20;
 constexpr uint8_t PET_SCHEMA_VERSION = 1;
 
@@ -45,6 +45,7 @@ enum InputEvent : uint8_t {
 
 NimBLECharacteristic* txCharacteristic = nullptr;
 Preferences prefs;
+M5Canvas canvas(&M5.Display);
 bool bleConnected = false;
 bool needsRedraw = true;
 uint8_t page = PAGE_PET;
@@ -62,6 +63,8 @@ struct ButtonTracker {
 ButtonTracker buttonA;
 ButtonTracker buttonB;
 bool comboSent = false;
+bool comboActive = false;
+uint32_t comboStartMs = 0;
 
 struct PromptState {
   bool active = false;
@@ -385,7 +388,7 @@ void submitChoice() {
   }
   if (app.interaction.handoff) {
     sendInteraction("handoff", "handoff");
-    finishInteraction("Open on Mac", false);
+    finishInteraction("Use Mac", false);
     return;
   }
   const InteractionOption& option = app.interaction.options[app.interaction.selected];
@@ -877,30 +880,30 @@ uint16_t limitColor(int remainingPct) {
 }
 
 void drawHeader() {
-  M5.Display.fillRect(0, 0, M5.Display.width(), 16, statusColor());
-  M5.Display.setTextColor(TFT_BLACK, statusColor());
-  M5.Display.setCursor(4, 4);
-  M5.Display.print(statusText());
-  M5.Display.setCursor(58, 4);
-  M5.Display.print(pageName());
-  M5.Display.setCursor(M5.Display.width() - 18, 4);
-  M5.Display.printf("%u", page + 1);
+  canvas.fillRect(0, 0, canvas.width(), 16, statusColor());
+  canvas.setTextColor(TFT_BLACK, statusColor());
+  canvas.setCursor(4, 4);
+  canvas.print(statusText());
+  canvas.setCursor(58, 4);
+  canvas.print(pageName());
+  canvas.setCursor(canvas.width() - 18, 4);
+  canvas.printf("%u", page + 1);
 }
 
 void drawLine(int y, const String& text, uint16_t color = TFT_WHITE) {
-  M5.Display.setTextColor(color, TFT_BLACK);
-  M5.Display.setCursor(4, y);
-  M5.Display.print(fitText(text, 21));
+  canvas.setTextColor(color, TFT_BLACK);
+  canvas.setCursor(4, y);
+  canvas.print(fitText(text, 21));
 }
 
 void drawBar(int x, int y, int w, int h, int value, uint16_t color, const String& label) {
-  M5.Display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-  M5.Display.setCursor(x, y - 10);
-  M5.Display.print(fitText(label, 7));
-  M5.Display.drawRect(x + 26, y - 1, w, h + 2, TFT_DARKGREY);
+  canvas.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+  canvas.setCursor(x, y - 10);
+  canvas.print(fitText(label, 7));
+  canvas.drawRect(x + 26, y - 1, w, h + 2, TFT_DARKGREY);
   if (value >= 0) {
     const int fill = map(constrain(value, 0, 100), 0, 100, 0, w - 2);
-    M5.Display.fillRect(x + 27, y, fill, h, color);
+    canvas.fillRect(x + 27, y, fill, h, color);
   }
 }
 
@@ -987,25 +990,25 @@ void drawBlob(int cx, int cy, uint8_t scale = 1) {
   const int bob = app.pet.sleeping ? 0 : (app.pet.animFrame % 2 == 0 ? 0 : -2);
   const uint16_t color = blobColor();
   const int r = 22 * scale;
-  M5.Display.fillCircle(cx, cy + bob, r, color);
-  M5.Display.fillRect(cx - r, cy + bob, r * 2, 18 * scale, color);
-  M5.Display.fillCircle(cx - r, cy + 18 * scale + bob, 5 * scale, color);
-  M5.Display.fillCircle(cx + r, cy + 18 * scale + bob, 5 * scale, color);
+  canvas.fillCircle(cx, cy + bob, r, color);
+  canvas.fillRect(cx - r, cy + bob, r * 2, 18 * scale, color);
+  canvas.fillCircle(cx - r, cy + 18 * scale + bob, 5 * scale, color);
+  canvas.fillCircle(cx + r, cy + 18 * scale + bob, 5 * scale, color);
 
   const bool blink = !app.pet.sleeping && app.pet.animFrame % 5 == 4;
-  M5.Display.fillCircle(cx - 8 * scale, cy - 2 * scale + bob, 3 * scale, TFT_BLACK);
-  M5.Display.fillCircle(cx + 8 * scale, cy - 2 * scale + bob, 3 * scale, TFT_BLACK);
+  canvas.fillCircle(cx - 8 * scale, cy - 2 * scale + bob, 3 * scale, TFT_BLACK);
+  canvas.fillCircle(cx + 8 * scale, cy - 2 * scale + bob, 3 * scale, TFT_BLACK);
   if (blink) {
-    M5.Display.drawLine(cx - 11 * scale, cy - 2 * scale + bob, cx - 5 * scale, cy - 2 * scale + bob, TFT_BLACK);
-    M5.Display.drawLine(cx + 5 * scale, cy - 2 * scale + bob, cx + 11 * scale, cy - 2 * scale + bob, TFT_BLACK);
+    canvas.drawLine(cx - 11 * scale, cy - 2 * scale + bob, cx - 5 * scale, cy - 2 * scale + bob, TFT_BLACK);
+    canvas.drawLine(cx + 5 * scale, cy - 2 * scale + bob, cx + 11 * scale, cy - 2 * scale + bob, TFT_BLACK);
   }
   if (app.pet.sleeping) {
-    M5.Display.drawLine(cx - 10 * scale, cy + 10 * scale + bob, cx + 10 * scale, cy + 10 * scale + bob, TFT_BLACK);
+    canvas.drawLine(cx - 10 * scale, cy + 10 * scale + bob, cx + 10 * scale, cy + 10 * scale + bob, TFT_BLACK);
   } else if (app.interaction.active || app.pet.mood < 35) {
-    M5.Display.drawCircle(cx, cy + 10 * scale + bob, 4 * scale, TFT_BLACK);
+    canvas.drawCircle(cx, cy + 10 * scale + bob, 4 * scale, TFT_BLACK);
   } else {
-    M5.Display.drawLine(cx - 8 * scale, cy + 8 * scale + bob, cx - 2 * scale, cy + 12 * scale + bob, TFT_BLACK);
-    M5.Display.drawLine(cx - 2 * scale, cy + 12 * scale + bob, cx + 8 * scale, cy + 8 * scale + bob, TFT_BLACK);
+    canvas.drawLine(cx - 8 * scale, cy + 8 * scale + bob, cx - 2 * scale, cy + 12 * scale + bob, TFT_BLACK);
+    canvas.drawLine(cx - 2 * scale, cy + 12 * scale + bob, cx + 8 * scale, cy + 8 * scale + bob, TFT_BLACK);
   }
 }
 
@@ -1026,7 +1029,7 @@ void drawLimitBars(int y, bool large) {
 
 void drawPetHome() {
   drawLine(20, "Agent Blob", TFT_WHITE);
-  drawBlob(M5.Display.width() / 2, 58);
+  drawBlob(canvas.width() / 2, 58);
   drawLine(90, blobMoodLabel(), TFT_LIGHTGREY);
   drawLimitBars(112, false);
 }
@@ -1082,24 +1085,24 @@ void drawSystem() {
 }
 
 void drawFooter() {
-  M5.Display.setTextColor(TFT_DARKGREY, TFT_BLACK);
-  M5.Display.setCursor(4, M5.Display.height() - 8);
+  canvas.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  canvas.setCursor(4, canvas.height() - 8);
   if (app.interaction.active) {
     if (app.interaction.kind == "approval") {
-      M5.Display.print("A once A+ sess B deny");
+      canvas.print("A once A+ sess B deny");
     } else if (app.interaction.handoff) {
-      M5.Display.print("A handoff B cancel");
+      canvas.print("A handoff B cancel");
     } else {
-      M5.Display.print("A select B next");
+      canvas.print("A select B next");
     }
     return;
   }
   if (page == PAGE_PET) {
-    M5.Display.print("A pet  B next");
+    canvas.print("A pet  B next");
   } else if (page == PAGE_CARE) {
-    M5.Display.print("A do  B action");
+    canvas.print("A do  B action");
   } else {
-    M5.Display.print("A refresh  B next");
+    canvas.print("A refresh  B next");
   }
 }
 
@@ -1108,8 +1111,8 @@ void drawInteractionOverlay() {
     return;
   }
 
-  M5.Display.fillRect(2, 18, M5.Display.width() - 4, 94, TFT_BLACK);
-  M5.Display.drawRect(2, 18, M5.Display.width() - 4, 94, app.interaction.handoff ? TFT_YELLOW : TFT_ORANGE);
+  canvas.fillRect(2, 18, canvas.width() - 4, 94, TFT_BLACK);
+  canvas.drawRect(2, 18, canvas.width() - 4, 94, app.interaction.handoff ? TFT_YELLOW : TFT_ORANGE);
   drawBlob(24, 47);
   drawLine(22, app.interaction.title, TFT_ORANGE);
   drawLine(36, app.interaction.details ? app.interaction.body : fitText(app.interaction.body, 42), TFT_WHITE);
@@ -1138,8 +1141,8 @@ void drawInteractionOverlay() {
 }
 
 void redraw() {
-  M5.Display.fillScreen(TFT_BLACK);
-  M5.Display.setTextSize(1);
+  canvas.fillScreen(TFT_BLACK);
+  canvas.setTextSize(1);
   drawHeader();
 
   switch (page) {
@@ -1163,6 +1166,7 @@ void redraw() {
   drawInteractionOverlay();
   drawFooter();
   lastRenderedStatus = statusText();
+  canvas.pushSprite(0, 0);
   needsRedraw = false;
 }
 
@@ -1285,7 +1289,7 @@ void dispatchInteraction(InputEvent event) {
     case INPUT_A_SINGLE:
       if (app.interaction.handoff) {
         sendInteraction("handoff", "handoff");
-        finishInteraction("Open on Mac", false);
+        finishInteraction("Use Mac", false);
       } else if (app.interaction.optionCount > 0) {
         app.interaction.options[app.interaction.selected].selected = !app.interaction.options[app.interaction.selected].selected;
         app.msg = "Selected " + app.interaction.options[app.interaction.selected].label;
@@ -1389,7 +1393,14 @@ void dispatchInput(InputEvent event) {
   }
 }
 
-void updateButtonTracker(ButtonTracker& tracker, bool pressed, InputEvent singleEvent, InputEvent doubleEvent, InputEvent longEvent) {
+void updateButtonTracker(
+  ButtonTracker& tracker,
+  bool pressed,
+  InputEvent singleEvent,
+  InputEvent doubleEvent,
+  InputEvent longEvent,
+  bool suppressIndividual
+) {
   const uint32_t now = millis();
   if (pressed && !tracker.down) {
     tracker.down = true;
@@ -1397,7 +1408,11 @@ void updateButtonTracker(ButtonTracker& tracker, bool pressed, InputEvent single
     tracker.pressMs = now;
   }
 
-  if (pressed && tracker.down && !tracker.longSent && now - tracker.pressMs >= LONG_PRESS_MS && !comboSent) {
+  if (suppressIndividual) {
+    tracker.pendingSingle = false;
+  }
+
+  if (pressed && tracker.down && !tracker.longSent && now - tracker.pressMs >= LONG_PRESS_MS && !comboSent && !suppressIndividual) {
     tracker.longSent = true;
     tracker.pendingSingle = false;
     dispatchInput(longEvent);
@@ -1405,7 +1420,7 @@ void updateButtonTracker(ButtonTracker& tracker, bool pressed, InputEvent single
 
   if (!pressed && tracker.down) {
     tracker.down = false;
-    if (!tracker.longSent && !comboSent) {
+    if (!tracker.longSent && !comboSent && !suppressIndividual) {
       if (tracker.pendingSingle && now - tracker.lastReleaseMs <= DOUBLE_PRESS_MS) {
         tracker.pendingSingle = false;
         dispatchInput(doubleEvent);
@@ -1416,7 +1431,7 @@ void updateButtonTracker(ButtonTracker& tracker, bool pressed, InputEvent single
     }
   }
 
-  if (tracker.pendingSingle && now - tracker.lastReleaseMs > DOUBLE_PRESS_MS) {
+  if (tracker.pendingSingle && now - tracker.lastReleaseMs > DOUBLE_PRESS_MS && !suppressIndividual) {
     tracker.pendingSingle = false;
     dispatchInput(singleEvent);
   }
@@ -1425,24 +1440,33 @@ void updateButtonTracker(ButtonTracker& tracker, bool pressed, InputEvent single
 void handleButtons() {
   const bool aPressed = M5.BtnA.isPressed();
   const bool bPressed = M5.BtnB.isPressed();
+  const bool bothPressed = aPressed && bPressed;
   const uint32_t now = millis();
 
-  if (aPressed && bPressed && !comboSent) {
-    const uint32_t aHeld = buttonA.down ? now - buttonA.pressMs : 0;
-    const uint32_t bHeld = buttonB.down ? now - buttonB.pressMs : 0;
-    if (max(aHeld, bHeld) >= COMBO_HOLD_MS) {
+  if (bothPressed) {
+    if (!comboActive) {
+      comboActive = true;
+      comboStartMs = now;
+      buttonA.pendingSingle = false;
+      buttonB.pendingSingle = false;
+    }
+    if (!comboSent && now - comboStartMs >= COMBO_HOLD_MS) {
       comboSent = true;
       buttonA.pendingSingle = false;
       buttonB.pendingSingle = false;
+      buttonA.longSent = true;
+      buttonB.longSent = true;
       dispatchInput(INPUT_AB_HOLD);
     }
   }
 
-  updateButtonTracker(buttonA, aPressed, INPUT_A_SINGLE, INPUT_A_DOUBLE, INPUT_A_LONG);
-  updateButtonTracker(buttonB, bPressed, INPUT_B_SINGLE, INPUT_B_DOUBLE, INPUT_B_LONG);
+  updateButtonTracker(buttonA, aPressed, INPUT_A_SINGLE, INPUT_A_DOUBLE, INPUT_A_LONG, comboActive || comboSent);
+  updateButtonTracker(buttonB, bPressed, INPUT_B_SINGLE, INPUT_B_DOUBLE, INPUT_B_LONG, comboActive || comboSent);
 
   if (!aPressed && !bPressed) {
     comboSent = false;
+    comboActive = false;
+    comboStartMs = 0;
   }
 }
 
@@ -1506,8 +1530,10 @@ void setup() {
   cfg.serial_baudrate = 115200;
   M5.begin(cfg);
   M5.Display.setRotation(0);
-  M5.Display.setTextSize(1);
   M5.Display.setBrightness(160);
+  canvas.setColorDepth(16);
+  canvas.createSprite(M5.Display.width(), M5.Display.height());
+  canvas.setTextSize(1);
 
   prefs.begin("agentblob", false);
   loadPet();

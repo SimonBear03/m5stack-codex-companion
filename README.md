@@ -2,7 +2,7 @@
 
 Custom M5Stack StickS3 firmware for Agent Blob, an offline slime e-pet that also acts as a Codex companion device.
 
-The target is the Codex app on Mac. The StickS3 acts as a small BLE display/approval/control device, and a local Mac bridge connects it to a Codex App-compatible app-server endpoint. Public Codex docs do not currently document native desktop-app BLE pairing, so the bridge is the supported path.
+The target is the Codex app on Mac. The StickS3 acts as a small BLE display/status device, and a local Mac bridge connects it either to Codex Desktop's local rollout logs in observer mode or to a Codex App-compatible app-server endpoint in control mode. Public Codex docs do not currently document native desktop-app BLE pairing, so the bridge is the supported path.
 
 ## Current Scope
 
@@ -31,7 +31,7 @@ The target is the Codex app on Mac. The StickS3 acts as a small BLE display/appr
   - optional total tokens, shown as `Tok: n/a` when the host has not emitted token usage
 - Reply to host `status`, `owner`, `name`, and `unpair` commands.
 
-The Mac bridge reads Codex App Server `account/rateLimits/read` and forwards the primary and secondary rolling windows to the StickS3. In the current App Server payload, those windows are 300 minutes and 10080 minutes, displayed as `5h` and `7d` bars. The bridge also listens for App Server plan and goal notifications and renders compact summaries on the Codex screen.
+The Mac bridge now has two modes. `desktop-observer` follows local Codex Desktop rollout JSONL files and mirrors active/idle state, recent activity, token totals, and rate limits from the actual Desktop thread when those events are present. `app-server` connects to a Codex App Server endpoint and can handle real approvals, choices, rate limits, plan updates, and goals for that App Server session.
 
 ## Implementation Status
 
@@ -41,13 +41,15 @@ As of 2026-06-10:
 - Physical StickS3 USB flashing has been validated with `/dev/cu.usbmodem101`.
 - The flashed firmware advertises over BLE as `Codex-S3-0470` and responds to `{"cmd":"status"}`.
 - The Mac bridge connects over BLE and initializes a Codex App Server `stdio` session.
-- Python bridge protocol tests pass.
+- The Mac bridge has a read-only `desktop-observer` mode for local Codex Desktop rollout files.
+- Python bridge tests pass.
 - Fake-device App Server smoke test initializes and receives Codex `5h` / `7d` rate-limit data.
 - The firmware now uses NimBLE instead of ESP32 BLE Arduino; the Agent Blob build is about 767 KB.
 - The display no longer does a full-screen redraw every 500 ms; redraws happen on state/page/status changes.
 - M5Launcher WebUI upload was unreliable on StickS3 without SD; direct USB flash is the current working install path.
 - Agent Blob home, care stats, approval overlays, choice overlays, and bar-based limits are implemented in firmware.
-- Live approval round-trip against a real Codex Desktop prompt is still pending.
+- Live approval round-trip against an App Server session is still pending.
+- True control of an already-open Codex Desktop app thread is blocked until Codex exposes a documented local attach/control endpoint.
 
 ## Next Machine Handoff
 
@@ -79,6 +81,14 @@ python -m pip install -U pip
 python -m pip install -e .
 sticks3-bridge --log-level INFO app-server --transport stdio --scan-timeout 15
 ```
+
+To mirror the current Codex Desktop app thread instead, use observer mode:
+
+```bash
+sticks3-bridge --log-level INFO desktop-observer --scan-timeout 15
+```
+
+Observer mode is read-only. It can show Desktop activity and usage data from local rollout logs, but it cannot approve prompts or interrupt turns in the Desktop UI.
 
 First hardware checks after flashing:
 
@@ -183,6 +193,19 @@ Run against a running Codex App-compatible app-server WebSocket endpoint:
 sticks3-bridge app-server --transport ws --target ws://127.0.0.1:4567
 ```
 
+Run read-only against local Codex Desktop rollout logs:
+
+```bash
+sticks3-bridge --log-level INFO desktop-observer --scan-timeout 15
+```
+
+By default this follows the freshest non-subagent rollout under `~/.codex/sessions`. You can pin it to a known thread or file:
+
+```bash
+sticks3-bridge desktop-observer --thread-id 019eaa0e-8e80-7821-aac1-a7c63bd09ad1
+sticks3-bridge desktop-observer --rollout ~/.codex/sessions/2026/06/09/rollout-example.jsonl
+```
+
 For bridge validation without hardware:
 
 ```bash
@@ -197,7 +220,7 @@ sticks3-bridge --log-level INFO app-server --transport stdio --scan-timeout 15
 
 This should initialize the App Server and log a snapshot containing `rate_limits.primary.label = 5h` and `rate_limits.secondary.label = 7d`. A command wrapped in `timeout` exits with code `124` when the long-running bridge is intentionally stopped.
 
-The `stdio` path starts its own App Server session. It is the reliable development path today, but it does not guarantee passive mirroring of every already-open Codex Desktop app thread.
+The `stdio` path starts its own App Server session. It is the reliable control-path development harness, but it does not mirror every already-open Codex Desktop app thread. Use `desktop-observer` for the Desktop-thread status display.
 
 See `docs/mac-codex-app-bridge.md` for the Mac-side flow and limitations.
 

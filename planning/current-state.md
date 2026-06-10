@@ -23,11 +23,18 @@ The StickS3 should act as an offline-first e-pet companion:
 - Show token usage only when Codex emits it; otherwise show `Tok: n/a` rather than a misleading zero.
 - Show the current Codex plan step and goal when the App Server sends updates.
 
-The Mac bridge reads App Server `account/rateLimits/read`, where the current Codex bucket exposes primary and secondary rolling windows. The observed durations are 300 minutes and 10080 minutes, displayed on-device as `5h` and `7d`.
+The Mac bridge now has two integration modes:
+
+- `desktop-observer` reads local Codex Desktop rollout JSONL under `~/.codex/sessions` and mirrors active/idle state, recent activity, token totals, and rate-limit windows from the actual Desktop thread.
+- `app-server` connects to a Codex App Server endpoint and can handle approvals, choices, interrupts, rate limits, plan updates, and goals for that App Server session.
+
+The `app-server` mode reads `account/rateLimits/read`, where the current Codex bucket exposes primary and secondary rolling windows. The observed durations are 300 minutes and 10080 minutes, displayed on-device as `5h` and `7d`. The `desktop-observer` mode reads the same window shape from rollout `token_count` events when Codex Desktop writes them locally.
 
 The Mac bridge also listens for App Server `turn/plan/updated`, `thread/goal/updated`, and `thread/goal/cleared` notifications. It forwards compact plan and goal summaries to the StickS3.
 
 Token totals are best-effort. The bridge listens for `thread/tokenUsage/updated`, but the `stdio` App Server validation path may not emit token usage unless the active work happens in that same App Server session. The firmware therefore renders missing token data as `Tok: n/a`.
+
+True control of an already-open Codex Desktop app thread is currently blocked. Official App Server transports can be exposed by a server process, but Simon's Desktop app is using private `stdio://` processes and no default app-server control socket was present during local inspection. The current product path is therefore status mirroring through `desktop-observer`, with real approvals/control reserved for `app-server` sessions the bridge owns or can explicitly connect to.
 
 ## Architecture Decision
 
@@ -61,10 +68,11 @@ Payloads are newline-delimited JSON objects.
   - status command ack.
   - owner/name/unpair command ack.
   - approval once/session/deny/cancel responses.
-  - simple option-list choice responses.
+  - simple option-list choice responses with up to eight options.
   - Agent Blob home, Codex detail, Limits, Care, and System screens.
   - persisted Agent Blob mood, energy, hunger, cleanliness, bond, and focus stats.
   - redraw-on-change rendering with a low-rate pet animation.
+  - read-only Codex Desktop observer mode over local rollout JSONL.
 
 ## Current Build State
 
@@ -76,14 +84,17 @@ What happened:
 - A repo-local Python venv was created at `.venv/`.
 - PlatformIO was installed into `.venv/`.
 - `.venv/bin/pio run` succeeds on Simon's Mac.
-- `python3 -m unittest discover -s tests` succeeds with 12 tests.
+- `python3 -m unittest discover -s tests` succeeds with 22 tests.
 - A fake-device App Server smoke test initialized `codex app-server --stdio` and received `5h` / `7d` rate-limit windows from `account/rateLimits/read`.
 - USB flashing to `/dev/cu.usbmodem101` succeeds with `pio run --target upload --upload-port /dev/cu.usbmodem101`.
 - BLE status validation succeeds; the device replies with `name = Codex-S3-0470`, battery, heap, and approval counters.
 - A short bridge run initializes Codex App Server over `stdio` and sends display snapshots to the StickS3.
+- `desktop-observer` mode parses local Codex Desktop rollouts, skips newer subagent rollouts by default, and normalizes Desktop `token_count` events into the same StickS3 snapshot format.
 - Firmware binary is currently about 767 KB after adding Agent Blob on top of the NimBLE build.
 - The screen flicker bug was fixed by removing the forced 500 ms full-screen redraw loop.
 - Token display now shows `Tok: n/a` until token usage is actually supplied by the host.
+- A+B combo handling now suppresses individual long/single actions while a chord is active, so interrupt/cancel is less likely to accidentally approve for session.
+- Handoff/cancel for complex `tool/requestUserInput` prompts returns an empty/no-device-answer payload instead of placeholder text.
 
 M5Launcher notes:
 
@@ -147,6 +158,12 @@ python -m pip install -e .
 sticks3-bridge --log-level INFO app-server --transport stdio --scan-timeout 15
 ```
 
+To mirror the actual Codex Desktop app thread status, use the read-only observer:
+
+```bash
+sticks3-bridge --log-level INFO desktop-observer --scan-timeout 15
+```
+
 ## Next Machine Handoff
 
 The next machine should pull this repo from GitHub, build, and flash the Agent Blob firmware to the physical StickS3. Use direct USB flashing first; M5Launcher WebUI remains a later install-path problem.
@@ -158,16 +175,18 @@ Hardware-first validation order:
 3. Confirm basic controls: A pets Blob, B changes screens, long A opens Care, long B sleeps/wakes Blob.
 4. Confirm BLE advertises as `Codex-S3-XXXX`.
 5. Run the Mac bridge over `stdio` and confirm rate-limit snapshots reach the device.
-6. Trigger a real command/file approval through Codex App Server and validate A, long A, B, and long B approval decisions.
-7. Trigger or synthesize a simple option-list user-input request and validate the choice overlay.
+6. Run `desktop-observer` while this Codex Desktop thread is active and confirm the StickS3 mirrors working/idle, recent activity, token totals, and `5h` / `7d` bars.
+7. Trigger a real command/file approval through an App Server session and validate A, long A, B, and long B approval decisions.
+8. Trigger or synthesize a simple option-list user-input request and validate the choice overlay with up to eight options.
 
 ## Next Validation
 
 - Decide whether to keep using direct USB flash or build a GitHub-release/Launcher OTA install path.
 - Keep testing the Python bridge on Simon's Mac.
-- Identify or expose a Codex Desktop app WebSocket/socket endpoint if passive desktop-thread mirroring is still desired.
+- Validate `desktop-observer` on hardware as the current Desktop-thread mirroring path.
+- Keep Codex Desktop WebSocket/socket endpoint discovery parked until Codex exposes a documented attach/control endpoint.
 - Trigger a command or file approval in Codex and confirm Button A accepts once, long Button A accepts for session, Button B declines, and long Button B cancels.
-- Trigger a simple option-list user-input request and confirm Agent Blob can select and submit an answer.
+- Trigger a simple option-list user-input request and confirm Agent Blob can select and submit an answer without fabricating fallback text for handoff-only prompts.
 - Confirm token usage updates only when real `thread/tokenUsage/updated` events arrive; otherwise expect `Tok: n/a`.
 
 ## Validation Plan
@@ -179,19 +198,21 @@ Hardware-first validation order:
 5. Install bridge dependencies on Mac with Python 3.11+ and `python -m pip install -e .`.
 6. Run `sticks3-bridge --log-level INFO app-server --transport stdio --scan-timeout 15`.
 7. Confirm the bridge sends snapshots to the StickS3.
-8. Trigger command/file approvals through the Codex app/app-server endpoint and confirm the Agent Blob approval overlay works.
-9. Trigger a simple option-list user-input request and confirm the Agent Blob choice overlay works.
-10. If a desktop app endpoint is found, run `sticks3-bridge app-server --transport ws --target <mac-codex-app-server-endpoint>` and compare event coverage against `stdio`.
+8. Run `sticks3-bridge --log-level INFO desktop-observer --scan-timeout 15` and confirm the actual Codex Desktop thread appears on the StickS3.
+9. Trigger command/file approvals through an App Server endpoint and confirm the Agent Blob approval overlay works.
+10. Trigger a simple option-list user-input request and confirm the Agent Blob choice overlay works.
+11. If a documented desktop app endpoint appears later, run `sticks3-bridge app-server --transport ws --target <mac-codex-app-server-endpoint>` and compare event coverage against `desktop-observer`.
 
 ## Known Risks
 
 - StickS3 PlatformIO board support may require tuning. Current config uses M5Stack's documented `esp32-s3-devkitc-1` PlatformIO shape plus StickS3-relevant flags.
 - M5Unified APIs may differ from assumptions in `src/main.cpp`, especially button names, battery APIs, or display setup.
 - The public Codex App Server protocol does not guarantee passive observation of every already-open desktop-app panel.
+- `desktop-observer` reads local rollout logs and is status-only; it cannot approve, answer prompts, or interrupt the active Desktop UI.
 - Exact account usage remaining depends on the App Server endpoint exposing `account/rateLimits/read` and `account/rateLimits/updated`.
 - Token totals are session/event dependent and may remain unavailable in `stdio` mode.
 - M5Launcher WebUI install is not currently reliable for this no-SD StickS3 workflow.
 
 ## Immediate Next Engineering Task
 
-Validate the Agent Blob approval and choice overlays against real Codex App Server prompts, then decide whether to invest next in Codex Desktop endpoint discovery, IMU gesture handling, voice, or a Launcher-friendly GitHub-release OTA install path.
+Validate `desktop-observer` against the physical StickS3 while this Codex Desktop thread is active, then validate Agent Blob approval and choice overlays against real App Server prompts.

@@ -140,7 +140,7 @@ The bridge still accepts legacy `permission` packets and normalizes them interna
 
 ## Choice Response
 
-For simple Codex option-list prompts, the bridge sends:
+For simple Codex option-list prompts, the bridge sends up to eight options:
 
 ```json
 {
@@ -167,7 +167,7 @@ The device replies:
 {"cmd":"interaction","id":"choice_1","action":"submit","value":"Careful"}
 ```
 
-The bridge maps this back to App Server `item/tool/requestUserInput` answers. Free-form, secret, multi-question, or complex form prompts become handoff interactions and should be completed on the Mac.
+The bridge maps this back to App Server `item/tool/requestUserInput` answers. Free-form, secret, multi-question, or complex form prompts become handoff interactions. Handoff responses do not submit placeholder text such as `Open on Mac`; the bridge returns an empty/no-device-answer payload so the request fails closed instead of inventing user input.
 
 ## Control Command
 
@@ -244,7 +244,7 @@ The Mac bridge consumes these app-server requests:
 - `item/tool/requestUserInput`
 - `mcpServer/elicitation/request`
 
-It renders the request as an Agent Blob `interaction`, waits for a device response, and replies to the app-server request with the documented payload. Command/file approvals also include a legacy `prompt` object for compatibility.
+It renders the request as an Agent Blob `interaction`, waits for a device response, and replies to the app-server request with the documented payload. Command/file approvals also include a legacy `prompt` object for compatibility. `mcpServer/elicitation/request` support is defensive and experimental until validated against a real App Server session.
 
 The bridge also listens for status and item notifications and renders them as snapshots:
 

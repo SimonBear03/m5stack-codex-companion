@@ -201,19 +201,23 @@ class CodexAppServerBridge:
         transport: AppServerTransport,
         device: StickS3Device,
         approval_timeout: float = 300.0,
+        heartbeat_interval: float = 10.0,
     ) -> None:
         self.transport = transport
         self.device = device
         self.approval_timeout = approval_timeout
+        self.heartbeat_interval = heartbeat_interval
         self.state = AppState()
         self._next_request_id = 1
+        self._snapshot_lock = asyncio.Lock()
 
     async def run(self) -> None:
         await self.device.connect()
         await self.initialize()
         await self.refresh_rate_limits()
-        await self.device.send_snapshot(self.state.snapshot())
+        await self.send_snapshot(self.state.snapshot())
         asyncio.create_task(self.handle_device_controls())
+        asyncio.create_task(self.send_heartbeats())
 
         while True:
             message = await self.transport.receive()
@@ -222,6 +226,15 @@ class CodexAppServerBridge:
                 await self.handle_server_request(message)
             elif "method" in message:
                 await self.handle_notification(message)
+
+    async def send_snapshot(self, snapshot: Snapshot) -> None:
+        async with self._snapshot_lock:
+            await self.device.send_snapshot(snapshot)
+
+    async def send_heartbeats(self) -> None:
+        while True:
+            await asyncio.sleep(self.heartbeat_interval)
+            await self.send_snapshot(self.state.snapshot())
 
     async def initialize(self) -> None:
         request_id = self._request_id()
@@ -320,7 +333,7 @@ class CodexAppServerBridge:
                 "hint": str(interaction.get("body") or "Approval requested"),
             }
         self.state.last_message = str(interaction.get("body") or interaction.get("title") or "Codex request")
-        await self.device.send_snapshot(self.state.snapshot(prompt=prompt, interaction=interaction))
+        await self.send_snapshot(self.state.snapshot(prompt=prompt, interaction=interaction))
 
         try:
             response = await self.device.wait_for_interaction(str(interaction["id"]), timeout=self.approval_timeout)
@@ -332,11 +345,13 @@ class CodexAppServerBridge:
 
         await self.transport.send({"id": request_id, "result": result})
         self.state.last_message = self.response_summary(str(method), response)
-        await self.device.send_snapshot(self.state.snapshot())
+        await self.send_snapshot(self.state.snapshot())
 
     def response_summary(self, method: str, response: dict[str, Any]) -> str:
         action = str(response.get("action") or "submit")
         value = str(response.get("value") or "")
+        if action == "handoff":
+            return "Skipped on device"
         if action == "cancel" or value == "cancel":
             return "Cancelled"
         if method == TOOL_REQUEST_USER_INPUT_METHOD:
@@ -380,7 +395,7 @@ class CodexAppServerBridge:
             }
         )
         self.state.last_message = "Interrupt sent"
-        await self.device.send_snapshot(self.state.snapshot())
+        await self.send_snapshot(self.state.snapshot())
 
     async def handle_notification(self, message: dict[str, Any]) -> None:
         method = message.get("method")
@@ -465,7 +480,7 @@ class CodexAppServerBridge:
             self.state.last_message = "Turn completed"
             self.state.active_turn_id = None
 
-        await self.device.send_snapshot(self.state.snapshot())
+        await self.send_snapshot(self.state.snapshot())
 
     def _request_id(self) -> int:
         request_id = self._next_request_id

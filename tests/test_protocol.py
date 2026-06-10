@@ -3,6 +3,7 @@ import unittest
 from sticks3_bridge.protocol import (
     COMMAND_APPROVAL_METHOD,
     FILE_APPROVAL_METHOD,
+    MAX_INTERACTION_OPTIONS,
     TOOL_REQUEST_USER_INPUT_METHOD,
     JsonLineDecoder,
     Snapshot,
@@ -106,6 +107,34 @@ class ProtocolTests(unittest.TestCase):
         )
         self.assertTrue(interaction["handoff"])
         self.assertEqual("handoff", interaction["kind"])
+        self.assertEqual("token", interaction["question_id"])
+        self.assertEqual(
+            {"answers": {"token": {"answers": []}}},
+            interaction_response(
+                TOOL_REQUEST_USER_INPUT_METHOD,
+                interaction,
+                {"cmd": "interaction", "id": "secret-1", "action": "handoff", "value": "handoff"},
+            ),
+        )
+
+    def test_tool_user_input_options_match_device_capacity(self) -> None:
+        interaction = request_interaction(
+            TOOL_REQUEST_USER_INPUT_METHOD,
+            "many-options",
+            {
+                "questions": [
+                    {
+                        "header": "Pick",
+                        "id": "choice",
+                        "question": "Pick one",
+                        "options": [{"label": f"Option {index}"} for index in range(MAX_INTERACTION_OPTIONS + 3)],
+                    }
+                ]
+            },
+        )
+        self.assertFalse(interaction["handoff"])
+        self.assertEqual(MAX_INTERACTION_OPTIONS, len(interaction["options"]))
+        self.assertEqual(f"Option {MAX_INTERACTION_OPTIONS - 1}", interaction["options"][-1]["label"])
 
     def test_rate_limits_normalize_5h_and_7d_windows(self) -> None:
         normalized = normalize_rate_limits(
