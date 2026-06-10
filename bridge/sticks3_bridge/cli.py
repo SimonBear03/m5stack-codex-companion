@@ -42,7 +42,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Do not use BLE; log snapshots and auto-answer approval prompts.",
     )
-    app_server.add_argument("--auto-decision", choices=["once", "deny"], default="deny")
+    app_server.add_argument("--auto-decision", choices=["once", "session", "deny", "cancel"], default="deny")
 
     return parser
 

@@ -3,6 +3,7 @@ from typing import Any
 
 from sticks3_bridge.app_server import AppServerTransport, CodexAppServerBridge
 from sticks3_bridge.device import FakeStickS3Device
+from sticks3_bridge.protocol import COMMAND_APPROVAL_METHOD, TOOL_REQUEST_USER_INPUT_METHOD
 
 
 class DummyTransport(AppServerTransport):
@@ -16,7 +17,66 @@ class DummyTransport(AppServerTransport):
         return None
 
 
+class RecordingTransport(DummyTransport):
+    def __init__(self) -> None:
+        self.sent: list[dict[str, Any]] = []
+
+    async def send(self, message: dict[str, Any]) -> None:
+        self.sent.append(message)
+
+
 class AppServerBridgeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_command_approval_request_uses_interaction_snapshot(self) -> None:
+        device = FakeStickS3Device(auto_decision="session")
+        transport = RecordingTransport()
+        bridge = CodexAppServerBridge(transport=transport, device=device)
+
+        await bridge.handle_server_request(
+            {
+                "id": "req-1",
+                "method": COMMAND_APPROVAL_METHOD,
+                "params": {"command": "git status", "threadId": "thread-1", "turnId": "turn-1"},
+            }
+        )
+
+        prompt_wire = device.snapshots[0].to_wire()
+        self.assertEqual("approval", prompt_wire["interaction"]["kind"])
+        self.assertEqual(["once", "session", "deny", "cancel"], [option["id"] for option in prompt_wire["interaction"]["options"]])
+        self.assertEqual({"decision": "acceptForSession"}, transport.sent[-1]["result"])
+
+    async def test_tool_user_input_request_uses_choice_interaction(self) -> None:
+        device = FakeStickS3Device(auto_decision="once")
+        transport = RecordingTransport()
+        bridge = CodexAppServerBridge(transport=transport, device=device)
+
+        await bridge.handle_server_request(
+            {
+                "id": "choice-1",
+                "method": TOOL_REQUEST_USER_INPUT_METHOD,
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "itemId": "item-1",
+                    "questions": [
+                        {
+                            "header": "Mode",
+                            "id": "mode",
+                            "question": "Pick one",
+                            "options": [
+                                {"label": "Fast", "description": "Move quickly"},
+                                {"label": "Careful", "description": "Move carefully"},
+                            ],
+                        }
+                    ],
+                },
+            }
+        )
+
+        prompt_wire = device.snapshots[0].to_wire()
+        self.assertEqual("choice", prompt_wire["interaction"]["kind"])
+        self.assertEqual("mode", prompt_wire["interaction"]["question_id"])
+        self.assertEqual({"answers": {"mode": {"answers": ["once"]}}}, transport.sent[-1]["result"])
+
     async def test_plan_and_goal_notifications_reach_snapshot(self) -> None:
         device = FakeStickS3Device()
         bridge = CodexAppServerBridge(transport=DummyTransport(), device=device)

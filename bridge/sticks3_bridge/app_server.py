@@ -11,15 +11,16 @@ from typing import Any
 
 from .device import StickS3Device
 from .protocol import (
-    SUPPORTED_APPROVAL_METHODS,
+    SUPPORTED_INTERACTION_METHODS,
     Snapshot,
-    approval_prompt,
-    approval_response,
+    interaction_response,
     item_summary,
     latest_entries,
     normalize_goal,
     normalize_plan_update,
     normalize_rate_limits,
+    request_interaction,
+    TOOL_REQUEST_USER_INPUT_METHOD,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -143,10 +144,16 @@ class AppState:
     plan: dict[str, Any] | None = None
     goal: dict[str, Any] | None = None
     last_message: str = "Connected to Codex app"
+    active_thread_id: str | None = None
+    active_turn_id: str | None = None
 
-    def snapshot(self, prompt: dict[str, str] | None = None) -> Snapshot:
+    def snapshot(
+        self,
+        prompt: dict[str, str] | None = None,
+        interaction: dict[str, Any] | None = None,
+    ) -> Snapshot:
         running = sum(1 for status in self.statuses.values() if status == "active")
-        waiting = len(self.waiting_threads) + (1 if prompt else 0)
+        waiting = len(self.waiting_threads) + (1 if interaction or prompt else 0)
         return Snapshot(
             total=len(self.statuses),
             running=running,
@@ -158,6 +165,7 @@ class AppState:
             plan=self.plan,
             goal=self.goal,
             prompt=prompt,
+            interaction=interaction,
         )
 
 
@@ -205,6 +213,7 @@ class CodexAppServerBridge:
         await self.initialize()
         await self.refresh_rate_limits()
         await self.device.send_snapshot(self.state.snapshot())
+        asyncio.create_task(self.handle_device_controls())
 
         while True:
             message = await self.transport.receive()
@@ -288,7 +297,7 @@ class CodexAppServerBridge:
         method = message.get("method")
         request_id = message["id"]
 
-        if method not in SUPPORTED_APPROVAL_METHODS:
+        if method not in SUPPORTED_INTERACTION_METHODS:
             await self.transport.send(
                 {
                     "id": request_id,
@@ -301,25 +310,83 @@ class CodexAppServerBridge:
             return
 
         params = message.get("params") or {}
-        prompt = approval_prompt(str(method), request_id, params)
-        self.state.last_message = prompt["hint"]
-        await self.device.send_snapshot(self.state.snapshot(prompt=prompt))
+        self.update_active_context(params)
+        interaction = request_interaction(str(method), request_id, params)
+        prompt = None
+        if interaction.get("kind") == "approval":
+            prompt = {
+                "id": str(interaction["id"]),
+                "tool": str(interaction.get("title") or "Codex"),
+                "hint": str(interaction.get("body") or "Approval requested"),
+            }
+        self.state.last_message = str(interaction.get("body") or interaction.get("title") or "Codex request")
+        await self.device.send_snapshot(self.state.snapshot(prompt=prompt, interaction=interaction))
 
         try:
-            decision = await self.device.wait_for_permission(prompt["id"], timeout=self.approval_timeout)
-            result = approval_response(str(method), decision)
+            response = await self.device.wait_for_interaction(str(interaction["id"]), timeout=self.approval_timeout)
+            result = interaction_response(str(method), interaction, response)
         except TimeoutError:
-            LOGGER.warning("Timed out waiting for StickS3 approval for request %s", request_id)
-            decision = "deny"
-            result = approval_response(str(method), decision)
+            LOGGER.warning("Timed out waiting for StickS3 interaction for request %s", request_id)
+            response = {"action": "cancel", "value": "cancel"}
+            result = interaction_response(str(method), interaction, response)
 
         await self.transport.send({"id": request_id, "result": result})
-        self.state.last_message = "Approved once" if decision == "once" else "Declined"
+        self.state.last_message = self.response_summary(str(method), response)
+        await self.device.send_snapshot(self.state.snapshot())
+
+    def response_summary(self, method: str, response: dict[str, Any]) -> str:
+        action = str(response.get("action") or "submit")
+        value = str(response.get("value") or "")
+        if action == "cancel" or value == "cancel":
+            return "Cancelled"
+        if method == TOOL_REQUEST_USER_INPUT_METHOD:
+            return "Choice sent"
+        if value == "session":
+            return "Approved session"
+        if value == "once":
+            return "Approved once"
+        if value == "deny":
+            return "Declined"
+        return "Response sent"
+
+    def update_active_context(self, params: dict[str, Any]) -> None:
+        thread_id = params.get("threadId")
+        turn_id = params.get("turnId")
+        if thread_id:
+            self.state.active_thread_id = str(thread_id)
+        if turn_id:
+            self.state.active_turn_id = str(turn_id)
+
+    async def handle_device_controls(self) -> None:
+        while True:
+            message = await self.device.wait_for_control()
+            action = message.get("action")
+            if action == "interrupt":
+                await self.interrupt_active_turn()
+
+    async def interrupt_active_turn(self) -> None:
+        if not self.state.active_thread_id or not self.state.active_turn_id:
+            LOGGER.info("Ignoring StickS3 interrupt; no active turn id is known")
+            return
+        request_id = self._request_id()
+        await self.transport.send(
+            {
+                "id": request_id,
+                "method": "turn/interrupt",
+                "params": {
+                    "threadId": self.state.active_thread_id,
+                    "turnId": self.state.active_turn_id,
+                },
+            }
+        )
+        self.state.last_message = "Interrupt sent"
         await self.device.send_snapshot(self.state.snapshot())
 
     async def handle_notification(self, message: dict[str, Any]) -> None:
         method = message.get("method")
         params = message.get("params") or {}
+        if isinstance(params, dict):
+            self.update_active_context(params)
 
         if method == "thread/status/changed":
             thread_id = params.get("threadId")
@@ -385,6 +452,18 @@ class CodexAppServerBridge:
         elif method == "error":
             error = params.get("error") or {}
             self.state.last_message = str(error.get("message") or "Codex error")
+
+        elif method == "turn/started":
+            turn = params.get("turn") if isinstance(params, dict) else None
+            if isinstance(turn, dict):
+                turn_id = turn.get("id")
+                if turn_id:
+                    self.state.active_turn_id = str(turn_id)
+            self.state.last_message = "Turn started"
+
+        elif method == "turn/completed":
+            self.state.last_message = "Turn completed"
+            self.state.active_turn_id = None
 
         await self.device.send_snapshot(self.state.snapshot())
 

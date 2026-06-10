@@ -2,6 +2,7 @@
 #include <ArduinoJson.h>
 #include <M5Unified.h>
 #include <NimBLEDevice.h>
+#include <Preferences.h>
 
 namespace {
 
@@ -11,22 +12,83 @@ constexpr const char* NUS_TX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
 
 constexpr uint32_t STALE_AFTER_MS = 30000;
 constexpr uint32_t BLE_NOTIFY_CHUNK_DELAY_MS = 8;
+constexpr uint32_t PET_TICK_MS = 10000;
+constexpr uint32_t PET_SAVE_MS = 60000;
+constexpr uint32_t PET_ANIM_MS = 650;
+constexpr uint32_t LONG_PRESS_MS = 650;
+constexpr uint32_t DOUBLE_PRESS_MS = 280;
+constexpr uint32_t COMBO_HOLD_MS = 850;
 constexpr size_t ENTRY_COUNT = 3;
+constexpr size_t OPTION_COUNT = 6;
 constexpr size_t BLE_NOTIFY_CHUNK_SIZE = 20;
-constexpr uint8_t PAGE_COUNT = 6;
+constexpr uint8_t PET_SCHEMA_VERSION = 1;
+
+enum Page : uint8_t {
+  PAGE_PET = 0,
+  PAGE_CODEX,
+  PAGE_LIMITS,
+  PAGE_CARE,
+  PAGE_SYSTEM,
+  PAGE_COUNT
+};
+
+enum InputEvent : uint8_t {
+  INPUT_NONE = 0,
+  INPUT_A_SINGLE,
+  INPUT_B_SINGLE,
+  INPUT_A_DOUBLE,
+  INPUT_B_DOUBLE,
+  INPUT_A_LONG,
+  INPUT_B_LONG,
+  INPUT_AB_HOLD
+};
 
 NimBLECharacteristic* txCharacteristic = nullptr;
+Preferences prefs;
 bool bleConnected = false;
 bool needsRedraw = true;
-uint8_t page = 0;
+uint8_t page = PAGE_PET;
 String rxBuffer;
 String lastRenderedStatus;
+
+struct ButtonTracker {
+  bool down = false;
+  bool longSent = false;
+  bool pendingSingle = false;
+  uint32_t pressMs = 0;
+  uint32_t lastReleaseMs = 0;
+};
+
+ButtonTracker buttonA;
+ButtonTracker buttonB;
+bool comboSent = false;
 
 struct PromptState {
   bool active = false;
   String id;
   String tool;
   String hint;
+};
+
+struct InteractionOption {
+  String id;
+  String label;
+  bool selected = false;
+};
+
+struct InteractionState {
+  bool active = false;
+  bool multi = false;
+  bool handoff = false;
+  bool details = false;
+  String id;
+  String kind;
+  String title;
+  String body;
+  String questionId;
+  InteractionOption options[OPTION_COUNT];
+  uint8_t optionCount = 0;
+  uint8_t selected = 0;
 };
 
 struct RateLimitWindowState {
@@ -57,6 +119,26 @@ struct GoalState {
   bool hasTokenBudget = false;
 };
 
+struct PetState {
+  uint8_t mood = 72;
+  uint8_t energy = 76;
+  uint8_t hunger = 68;
+  uint8_t cleanliness = 74;
+  uint8_t bond = 12;
+  uint8_t focus = 50;
+  uint32_t interactions = 0;
+  uint32_t playCount = 0;
+  uint32_t createdSec = 0;
+  uint32_t lastTickMs = 0;
+  uint32_t lastSaveMs = 0;
+  uint32_t lastAnimMs = 0;
+  uint8_t animFrame = 0;
+  uint8_t careIndex = 0;
+  bool sleeping = false;
+  bool dirty = false;
+  String reaction = "Ready";
+};
+
 struct AppState {
   String deviceName;
   String owner = "Simon";
@@ -75,6 +157,8 @@ struct AppState {
   PlanState plan;
   GoalState goal;
   PromptState prompt;
+  InteractionState interaction;
+  PetState pet;
   uint32_t lastSnapshotMs = 0;
   uint32_t approvals = 0;
   uint32_t denials = 0;
@@ -97,6 +181,14 @@ String fitText(String text, size_t limit) {
     return text;
   }
   return text.substring(0, limit > 3 ? limit - 3 : limit) + "...";
+}
+
+uint8_t clampStat(int value) {
+  return static_cast<uint8_t>(constrain(value, 0, 100));
+}
+
+void markPetDirty() {
+  app.pet.dirty = true;
 }
 
 int batteryPercent() {
@@ -144,6 +236,47 @@ void sendAck(const char* command, bool ok, const char* error = nullptr) {
   sendJson(doc);
 }
 
+void savePet(bool force = false) {
+  if (!force && (!app.pet.dirty || millis() - app.pet.lastSaveMs < PET_SAVE_MS)) {
+    return;
+  }
+  prefs.putUChar("schema", PET_SCHEMA_VERSION);
+  prefs.putUChar("mood", app.pet.mood);
+  prefs.putUChar("energy", app.pet.energy);
+  prefs.putUChar("hunger", app.pet.hunger);
+  prefs.putUChar("clean", app.pet.cleanliness);
+  prefs.putUChar("bond", app.pet.bond);
+  prefs.putUChar("focus", app.pet.focus);
+  prefs.putUInt("interact", app.pet.interactions);
+  prefs.putUInt("plays", app.pet.playCount);
+  prefs.putUInt("created", app.pet.createdSec);
+  prefs.putBool("sleeping", app.pet.sleeping);
+  app.pet.lastSaveMs = millis();
+  app.pet.dirty = false;
+}
+
+void loadPet() {
+  const uint8_t schema = prefs.getUChar("schema", 0);
+  if (schema != PET_SCHEMA_VERSION) {
+    app.pet.createdSec = millis() / 1000;
+    app.pet.reaction = "Born";
+    markPetDirty();
+    savePet(true);
+    return;
+  }
+  app.pet.mood = prefs.getUChar("mood", app.pet.mood);
+  app.pet.energy = prefs.getUChar("energy", app.pet.energy);
+  app.pet.hunger = prefs.getUChar("hunger", app.pet.hunger);
+  app.pet.cleanliness = prefs.getUChar("clean", app.pet.cleanliness);
+  app.pet.bond = prefs.getUChar("bond", app.pet.bond);
+  app.pet.focus = prefs.getUChar("focus", app.pet.focus);
+  app.pet.interactions = prefs.getUInt("interact", 0);
+  app.pet.playCount = prefs.getUInt("plays", 0);
+  app.pet.createdSec = prefs.getUInt("created", millis() / 1000);
+  app.pet.sleeping = prefs.getBool("sleeping", false);
+  app.pet.reaction = app.pet.sleeping ? "Sleeping" : "Ready";
+}
+
 void sendStatusAck() {
   JsonDocument doc;
   doc["ack"] = "status";
@@ -168,29 +301,105 @@ void sendStatusAck() {
   stats["appr"] = app.approvals;
   stats["deny"] = app.denials;
 
+  JsonObject pet = data["pet"].to<JsonObject>();
+  pet["mood"] = app.pet.mood;
+  pet["energy"] = app.pet.energy;
+  pet["bond"] = app.pet.bond;
+  pet["focus"] = app.pet.focus;
+  pet["sleeping"] = app.pet.sleeping;
+
   sendJson(doc);
 }
 
-void sendPermissionDecision(const char* decision) {
-  if (!app.prompt.active || app.prompt.id.isEmpty()) {
+void clearInteraction() {
+  app.interaction.active = false;
+  app.interaction.multi = false;
+  app.interaction.handoff = false;
+  app.interaction.details = false;
+  app.interaction.id = "";
+  app.interaction.kind = "";
+  app.interaction.title = "";
+  app.interaction.body = "";
+  app.interaction.questionId = "";
+  app.interaction.optionCount = 0;
+  app.interaction.selected = 0;
+  for (size_t i = 0; i < OPTION_COUNT; ++i) {
+    app.interaction.options[i].id = "";
+    app.interaction.options[i].label = "";
+    app.interaction.options[i].selected = false;
+  }
+}
+
+void sendInteraction(const char* action, const String& value = "") {
+  if (!app.interaction.active || app.interaction.id.isEmpty()) {
     return;
   }
 
   JsonDocument doc;
-  doc["cmd"] = "permission";
-  doc["id"] = app.prompt.id;
-  doc["decision"] = decision;
-  sendJson(doc);
-
-  if (String(decision) == "once") {
-    app.approvals += 1;
-    app.msg = "Approved once";
-  } else {
-    app.denials += 1;
-    app.msg = "Denied";
+  doc["cmd"] = "interaction";
+  doc["id"] = app.interaction.id;
+  doc["action"] = action;
+  if (!value.isEmpty()) {
+    doc["value"] = value;
   }
-  app.prompt.active = false;
+  sendJson(doc);
+}
+
+void finishInteraction(const String& message, bool positive, bool countDecision = false) {
+  if (positive) {
+    app.pet.mood = clampStat(app.pet.mood + 4);
+    app.pet.bond = clampStat(app.pet.bond + 2);
+    if (countDecision) {
+      app.approvals += 1;
+    }
+  } else {
+    app.pet.focus = clampStat(app.pet.focus - 3);
+    if (countDecision) {
+      app.denials += 1;
+    }
+  }
+  app.msg = message;
+  app.pet.reaction = message;
+  clearInteraction();
+  markPetDirty();
   needsRedraw = true;
+}
+
+void submitApproval(const char* decision) {
+  sendInteraction("submit", decision);
+  const String value(decision);
+  if (value == "once") {
+    finishInteraction("Approved once", true, true);
+  } else if (value == "session") {
+    finishInteraction("Approved session", true, true);
+  } else if (value == "cancel") {
+    finishInteraction("Cancelled", false, true);
+  } else {
+    finishInteraction("Declined", false, true);
+  }
+}
+
+void submitChoice() {
+  if (!app.interaction.active || app.interaction.optionCount == 0) {
+    return;
+  }
+  if (app.interaction.handoff) {
+    sendInteraction("handoff", "handoff");
+    finishInteraction("Open on Mac", false);
+    return;
+  }
+  const InteractionOption& option = app.interaction.options[app.interaction.selected];
+  sendInteraction("submit", option.id);
+  app.pet.mood = clampStat(app.pet.mood + 2);
+  app.pet.focus = clampStat(app.pet.focus + 1);
+  finishInteraction("Choice sent", true);
+}
+
+void sendControl(const char* action) {
+  JsonDocument doc;
+  doc["cmd"] = "control";
+  doc["action"] = action;
+  sendJson(doc);
 }
 
 void updateEntries(JsonArray entries) {
@@ -346,6 +555,78 @@ void updateGoal(JsonObject source) {
   }
 }
 
+void setInteractionOption(uint8_t index, const String& id, const String& label) {
+  if (index >= OPTION_COUNT) {
+    return;
+  }
+  app.interaction.options[index].id = fitText(id, 24);
+  app.interaction.options[index].label = fitText(label, 18);
+  app.interaction.options[index].selected = false;
+}
+
+void setDefaultApprovalOptions() {
+  app.interaction.optionCount = 4;
+  setInteractionOption(0, "once", "Once");
+  setInteractionOption(1, "session", "Session");
+  setInteractionOption(2, "deny", "Deny");
+  setInteractionOption(3, "cancel", "Cancel");
+}
+
+void updateInteraction(JsonObject source) {
+  clearInteraction();
+  app.interaction.id = source["id"].as<String>();
+  app.interaction.kind = fitText(source["kind"].as<String>(), 16);
+  app.interaction.title = fitText(source["title"].as<String>(), 24);
+  app.interaction.body = fitText(source["body"].as<String>(), 96);
+  app.interaction.questionId = fitText(source["question_id"].as<String>(), 24);
+  app.interaction.multi = source["multi"] | false;
+  app.interaction.handoff = source["handoff"] | false;
+  app.interaction.selected = static_cast<uint8_t>(constrain(source["selected"] | 0, 0, OPTION_COUNT - 1));
+
+  if (source["options"].is<JsonArray>()) {
+    JsonArray options = source["options"].as<JsonArray>();
+    uint8_t index = 0;
+    for (JsonVariant value : options) {
+      if (index >= OPTION_COUNT || !value.is<JsonObject>()) {
+        break;
+      }
+      JsonObject option = value.as<JsonObject>();
+      const String id = option["id"].is<const char*>() ? option["id"].as<String>() : option["label"].as<String>();
+      const String label = option["label"].is<const char*>() ? option["label"].as<String>() : id;
+      setInteractionOption(index, id, label);
+      index += 1;
+    }
+    app.interaction.optionCount = index;
+  }
+
+  if (app.interaction.kind == "approval" && app.interaction.optionCount == 0) {
+    setDefaultApprovalOptions();
+  }
+  if (app.interaction.optionCount > 0 && app.interaction.selected >= app.interaction.optionCount) {
+    app.interaction.selected = 0;
+  }
+  app.interaction.active = !app.interaction.id.isEmpty();
+}
+
+void updateLegacyPrompt(JsonObject prompt) {
+  app.prompt.id = prompt["id"].as<String>();
+  app.prompt.tool = prompt["tool"].as<String>();
+  app.prompt.hint = fitText(prompt["hint"].as<String>(), 80);
+  app.prompt.active = !app.prompt.id.isEmpty();
+  if (!app.prompt.active) {
+    clearInteraction();
+    return;
+  }
+
+  clearInteraction();
+  app.interaction.active = true;
+  app.interaction.id = app.prompt.id;
+  app.interaction.kind = "approval";
+  app.interaction.title = fitText(app.prompt.tool, 24);
+  app.interaction.body = fitText(app.prompt.hint, 96);
+  setDefaultApprovalOptions();
+}
+
 void handleSnapshot(JsonDocument& doc) {
   app.total = doc["total"] | app.total;
   app.running = doc["running"] | 0;
@@ -387,14 +668,14 @@ void handleSnapshot(JsonDocument& doc) {
     updateGoal(doc["goal"].as<JsonObject>());
   }
 
-  if (doc["prompt"].is<JsonObject>()) {
-    JsonObject prompt = doc["prompt"].as<JsonObject>();
-    app.prompt.id = prompt["id"].as<String>();
-    app.prompt.tool = prompt["tool"].as<String>();
-    app.prompt.hint = fitText(prompt["hint"].as<String>(), 80);
-    app.prompt.active = !app.prompt.id.isEmpty();
+  if (doc["interaction"].is<JsonObject>()) {
+    updateInteraction(doc["interaction"].as<JsonObject>());
+    app.prompt.active = false;
+  } else if (doc["prompt"].is<JsonObject>()) {
+    updateLegacyPrompt(doc["prompt"].as<JsonObject>());
   } else if (app.waiting == 0) {
     app.prompt.active = false;
+    clearInteraction();
   }
 
   app.lastSnapshotMs = millis();
@@ -478,6 +759,7 @@ class ServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer*) override {
     bleConnected = true;
     app.msg = "Connected";
+    app.pet.reaction = "Linked";
     needsRedraw = true;
   }
 
@@ -489,7 +771,9 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     clearPlan();
     clearGoal();
     app.prompt.active = false;
+    clearInteraction();
     app.msg = "Disconnected";
+    app.pet.reaction = "Offline";
     NimBLEDevice::startAdvertising();
     needsRedraw = true;
   }
@@ -530,26 +814,26 @@ void setupBle() {
 
 const char* statusText() {
   if (!bleConnected) {
-    return "DISCONNECTED";
+    return "OFFLINE";
   }
   if (app.lastSnapshotMs > 0 && millis() - app.lastSnapshotMs > STALE_AFTER_MS) {
     return "STALE";
   }
-  if (app.prompt.active || app.waiting > 0) {
-    return "WAITING";
+  if (app.interaction.active || app.waiting > 0) {
+    return "WAIT";
   }
   if (app.running > 0) {
-    return "RUNNING";
+    return "WORK";
   }
   return "IDLE";
 }
 
 uint16_t statusColor() {
   const char* status = statusText();
-  if (strcmp(status, "RUNNING") == 0) {
+  if (strcmp(status, "WORK") == 0) {
     return TFT_CYAN;
   }
-  if (strcmp(status, "WAITING") == 0) {
+  if (strcmp(status, "WAIT") == 0) {
     return TFT_ORANGE;
   }
   if (strcmp(status, "IDLE") == 0) {
@@ -561,25 +845,63 @@ uint16_t statusColor() {
   return TFT_RED;
 }
 
-void drawHeader() {
-  M5.Display.fillRect(0, 0, M5.Display.width(), 18, statusColor());
-  M5.Display.setTextColor(TFT_BLACK, statusColor());
-  M5.Display.setCursor(4, 5);
-  M5.Display.print(statusText());
-  M5.Display.setCursor(M5.Display.width() - 28, 5);
-  M5.Display.printf("P%u", page + 1);
+const char* pageName() {
+  switch (page) {
+    case PAGE_PET:
+      return "Blob";
+    case PAGE_CODEX:
+      return "Codex";
+    case PAGE_LIMITS:
+      return "Limits";
+    case PAGE_CARE:
+      return "Care";
+    default:
+      return "System";
+  }
 }
 
-void drawFooter() {
-  M5.Display.setTextColor(TFT_DARKGREY, TFT_BLACK);
-  M5.Display.setCursor(4, M5.Display.height() - 10);
-  M5.Display.print("A ok/next  B no/next");
+uint16_t limitColor(int remainingPct) {
+  if (remainingPct < 0) {
+    return TFT_DARKGREY;
+  }
+  if (remainingPct < 15) {
+    return TFT_RED;
+  }
+  if (remainingPct < 35) {
+    return TFT_ORANGE;
+  }
+  if (remainingPct < 60) {
+    return TFT_YELLOW;
+  }
+  return TFT_GREEN;
+}
+
+void drawHeader() {
+  M5.Display.fillRect(0, 0, M5.Display.width(), 16, statusColor());
+  M5.Display.setTextColor(TFT_BLACK, statusColor());
+  M5.Display.setCursor(4, 4);
+  M5.Display.print(statusText());
+  M5.Display.setCursor(58, 4);
+  M5.Display.print(pageName());
+  M5.Display.setCursor(M5.Display.width() - 18, 4);
+  M5.Display.printf("%u", page + 1);
 }
 
 void drawLine(int y, const String& text, uint16_t color = TFT_WHITE) {
   M5.Display.setTextColor(color, TFT_BLACK);
   M5.Display.setCursor(4, y);
   M5.Display.print(fitText(text, 21));
+}
+
+void drawBar(int x, int y, int w, int h, int value, uint16_t color, const String& label) {
+  M5.Display.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
+  M5.Display.setCursor(x, y - 10);
+  M5.Display.print(fitText(label, 7));
+  M5.Display.drawRect(x + 26, y - 1, w, h + 2, TFT_DARKGREY);
+  if (value >= 0) {
+    const int fill = map(constrain(value, 0, 100), 0, 100, 0, w - 2);
+    M5.Display.fillRect(x + 27, y, fill, h, color);
+  }
 }
 
 String elapsedLabel(uint32_t seconds) {
@@ -614,94 +936,205 @@ String tokensLabel() {
   return app.hasTokens ? String(app.tokens) : "n/a";
 }
 
-void drawDashboard() {
-  drawLine(24, "Codex " + app.owner, TFT_WHITE);
-  drawLine(38, "T:" + String(app.total) + " R:" + String(app.running) + " W:" + String(app.waiting), TFT_LIGHTGREY);
-  drawLine(54, app.msg, app.prompt.active ? TFT_ORANGE : TFT_WHITE);
+String blobMoodLabel() {
+  if (app.pet.sleeping) {
+    return "Sleeping";
+  }
+  if (app.interaction.active) {
+    return "Listening";
+  }
+  if (!bleConnected) {
+    return "Offline";
+  }
+  if (app.running > 0) {
+    return "Working";
+  }
+  if (app.pet.energy < 25) {
+    return "Sleepy";
+  }
+  if (app.pet.hunger < 25) {
+    return "Hungry";
+  }
+  if (app.pet.cleanliness < 25) {
+    return "Messy";
+  }
+  if (app.pet.mood > 75) {
+    return "Happy";
+  }
+  return "Ready";
+}
 
-  if (app.prompt.active) {
-    drawLine(72, app.prompt.tool, TFT_ORANGE);
-    drawLine(86, app.prompt.hint, TFT_WHITE);
+uint16_t blobColor() {
+  if (app.pet.sleeping) {
+    return TFT_DARKCYAN;
+  }
+  if (app.interaction.active) {
+    return TFT_ORANGE;
+  }
+  if (app.running > 0) {
+    return TFT_CYAN;
+  }
+  if (!bleConnected) {
+    return TFT_PURPLE;
+  }
+  if (app.pet.energy < 25 || app.pet.hunger < 25 || app.pet.cleanliness < 25) {
+    return TFT_YELLOW;
+  }
+  return TFT_GREEN;
+}
+
+void drawBlob(int cx, int cy, uint8_t scale = 1) {
+  const int bob = app.pet.sleeping ? 0 : (app.pet.animFrame % 2 == 0 ? 0 : -2);
+  const uint16_t color = blobColor();
+  const int r = 22 * scale;
+  M5.Display.fillCircle(cx, cy + bob, r, color);
+  M5.Display.fillRect(cx - r, cy + bob, r * 2, 18 * scale, color);
+  M5.Display.fillCircle(cx - r, cy + 18 * scale + bob, 5 * scale, color);
+  M5.Display.fillCircle(cx + r, cy + 18 * scale + bob, 5 * scale, color);
+
+  const bool blink = !app.pet.sleeping && app.pet.animFrame % 5 == 4;
+  M5.Display.fillCircle(cx - 8 * scale, cy - 2 * scale + bob, 3 * scale, TFT_BLACK);
+  M5.Display.fillCircle(cx + 8 * scale, cy - 2 * scale + bob, 3 * scale, TFT_BLACK);
+  if (blink) {
+    M5.Display.drawLine(cx - 11 * scale, cy - 2 * scale + bob, cx - 5 * scale, cy - 2 * scale + bob, TFT_BLACK);
+    M5.Display.drawLine(cx + 5 * scale, cy - 2 * scale + bob, cx + 11 * scale, cy - 2 * scale + bob, TFT_BLACK);
+  }
+  if (app.pet.sleeping) {
+    M5.Display.drawLine(cx - 10 * scale, cy + 10 * scale + bob, cx + 10 * scale, cy + 10 * scale + bob, TFT_BLACK);
+  } else if (app.interaction.active || app.pet.mood < 35) {
+    M5.Display.drawCircle(cx, cy + 10 * scale + bob, 4 * scale, TFT_BLACK);
   } else {
-    drawLine(72, app.entries[0], TFT_LIGHTGREY);
-    drawLine(86, app.entries[1], TFT_DARKGREY);
+    M5.Display.drawLine(cx - 8 * scale, cy + 8 * scale + bob, cx - 2 * scale, cy + 12 * scale + bob, TFT_BLACK);
+    M5.Display.drawLine(cx - 2 * scale, cy + 12 * scale + bob, cx + 8 * scale, cy + 8 * scale + bob, TFT_BLACK);
   }
 }
 
-void drawEntries() {
-  drawLine(24, "Recent", TFT_WHITE);
-  for (size_t i = 0; i < ENTRY_COUNT; ++i) {
-    drawLine(42 + static_cast<int>(i) * 16, String(i + 1) + " " + app.entries[i], TFT_LIGHTGREY);
-  }
-}
-
-void drawUsage() {
-  drawLine(24, "Limits", TFT_WHITE);
-
-  if (app.primaryLimit.available || app.secondaryLimit.available) {
-    if (app.primaryLimit.available) {
-      const uint16_t color = app.primaryLimit.remainingPct < 20 ? TFT_ORANGE : TFT_GREEN;
-      drawLine(42, app.primaryLimit.label + " left: " + String(app.primaryLimit.remainingPct) + "%", color);
-    }
-    if (app.secondaryLimit.available) {
-      const uint16_t color = app.secondaryLimit.remainingPct < 20 ? TFT_ORANGE : TFT_GREEN;
-      drawLine(58, app.secondaryLimit.label + " left: " + String(app.secondaryLimit.remainingPct) + "%", color);
-    }
-    drawLine(74, "Tok: " + tokensLabel(), TFT_DARKGREY);
-    drawLine(90, "Host rate limits", TFT_DARKGREY);
-  } else if (app.remainingPct >= 0) {
-    drawLine(42, "Remain: " + String(app.remainingPct) + "%", app.remainingPct < 20 ? TFT_ORANGE : TFT_GREEN);
-    drawLine(58, "Tok: " + tokensLabel(), TFT_LIGHTGREY);
+void drawLimitBars(int y, bool large) {
+  const int width = large ? 86 : 62;
+  const int height = large ? 8 : 5;
+  if (app.primaryLimit.available) {
+    drawBar(8, y, width, height, app.primaryLimit.remainingPct, limitColor(app.primaryLimit.remainingPct), app.primaryLimit.label);
   } else {
-    drawLine(42, "5h left: host n/a", TFT_DARKGREY);
-    drawLine(58, "7d left: host n/a", TFT_DARKGREY);
-    drawLine(74, "Tok: " + tokensLabel(), TFT_DARKGREY);
+    drawBar(8, y, width, height, -1, TFT_DARKGREY, "5h");
   }
-}
-
-void drawPlan() {
-  drawLine(24, "Plan", TFT_WHITE);
-
-  if (!app.plan.available) {
-    drawLine(42, "Plan: host n/a", TFT_DARKGREY);
-    drawLine(58, "Waiting for update", TFT_DARKGREY);
-    return;
-  }
-
-  const String progress = String(app.plan.completed) + "/" + String(app.plan.total) + " " + app.plan.status;
-  drawLine(42, progress, statusTextColor(app.plan.status));
-  drawLine(58, app.plan.step, TFT_WHITE);
-  drawLine(74, app.msg, TFT_DARKGREY);
-}
-
-void drawGoal() {
-  drawLine(24, "Goal", TFT_WHITE);
-
-  if (!app.goal.available) {
-    drawLine(42, "Goal: host n/a", TFT_DARKGREY);
-    drawLine(58, "No active goal", TFT_DARKGREY);
-    return;
-  }
-
-  drawLine(42, app.goal.status, statusTextColor(app.goal.status));
-  drawLine(58, app.goal.objective, TFT_WHITE);
-  drawLine(74, "Time: " + elapsedLabel(app.goal.timeUsedSec), TFT_LIGHTGREY);
-  if (app.goal.hasTokensUsed && app.goal.hasTokenBudget) {
-    drawLine(90, "Tok: " + String(app.goal.tokensUsed) + "/" + String(app.goal.tokenBudget), TFT_DARKGREY);
-  } else if (app.goal.hasTokensUsed) {
-    drawLine(90, "Tok: " + String(app.goal.tokensUsed), TFT_DARKGREY);
+  if (app.secondaryLimit.available) {
+    drawBar(8, y + (large ? 24 : 16), width, height, app.secondaryLimit.remainingPct, limitColor(app.secondaryLimit.remainingPct), app.secondaryLimit.label);
   } else {
-    drawLine(90, "Tok: n/a", TFT_DARKGREY);
+    drawBar(8, y + (large ? 24 : 16), width, height, -1, TFT_DARKGREY, "7d");
   }
+}
+
+void drawPetHome() {
+  drawLine(20, "Agent Blob", TFT_WHITE);
+  drawBlob(M5.Display.width() / 2, 58);
+  drawLine(90, blobMoodLabel(), TFT_LIGHTGREY);
+  drawLimitBars(112, false);
+}
+
+void drawCodex() {
+  drawLine(20, "Codex " + app.owner, TFT_WHITE);
+  drawLine(34, "T:" + String(app.total) + " R:" + String(app.running) + " W:" + String(app.waiting), TFT_LIGHTGREY);
+  drawLine(48, app.msg, app.interaction.active ? TFT_ORANGE : TFT_WHITE);
+  if (app.plan.available) {
+    drawLine(64, String(app.plan.completed) + "/" + String(app.plan.total) + " " + app.plan.status, statusTextColor(app.plan.status));
+    drawLine(78, app.plan.step, TFT_WHITE);
+  } else {
+    drawLine(64, app.entries[0], TFT_LIGHTGREY);
+    drawLine(78, app.entries[1], TFT_DARKGREY);
+  }
+  if (app.goal.available) {
+    drawLine(94, "Goal: " + app.goal.status, statusTextColor(app.goal.status));
+  } else {
+    drawLine(94, "Tok: " + tokensLabel(), TFT_DARKGREY);
+  }
+}
+
+void drawLimits() {
+  drawLine(20, "Codex limits", TFT_WHITE);
+  drawLimitBars(48, true);
+  drawLine(98, "Tok: " + tokensLabel(), TFT_DARKGREY);
+  drawLine(112, "Bars show remaining", TFT_DARKGREY);
+}
+
+void drawStatBar(int y, const String& label, uint8_t value, uint16_t color) {
+  drawBar(4, y, 86, 6, value, color, label);
+}
+
+void drawCare() {
+  static const char* actions[] = {"Feed", "Clean", "Nap", "Focus"};
+  drawLine(20, "Care: " + String(actions[app.pet.careIndex]), TFT_WHITE);
+  drawStatBar(42, "Mood", app.pet.mood, TFT_GREEN);
+  drawStatBar(56, "Energy", app.pet.energy, TFT_CYAN);
+  drawStatBar(70, "Food", app.pet.hunger, TFT_YELLOW);
+  drawStatBar(84, "Clean", app.pet.cleanliness, TFT_BLUE);
+  drawStatBar(98, "Bond", app.pet.bond, TFT_MAGENTA);
+  drawStatBar(112, "Focus", app.pet.focus, TFT_ORANGE);
 }
 
 void drawSystem() {
   const int pct = batteryPercent();
-  drawLine(24, app.deviceName, TFT_WHITE);
-  drawLine(42, "BLE: " + String(bleConnected ? "on" : "off"), bleConnected ? TFT_GREEN : TFT_RED);
-  drawLine(58, "Batt: " + String(pct >= 0 ? String(pct) + "%" : "n/a"), TFT_LIGHTGREY);
-  drawLine(74, "USB: " + String(isUsbPowered() ? "yes" : "no"), TFT_LIGHTGREY);
-  drawLine(90, "Heap: " + String(ESP.getFreeHeap()), TFT_DARKGREY);
+  drawLine(20, app.deviceName, TFT_WHITE);
+  drawLine(36, "BLE: " + String(bleConnected ? "on" : "off"), bleConnected ? TFT_GREEN : TFT_RED);
+  drawLine(52, "Batt: " + String(pct >= 0 ? String(pct) + "%" : "n/a"), TFT_LIGHTGREY);
+  drawLine(68, "USB: " + String(isUsbPowered() ? "yes" : "no"), TFT_LIGHTGREY);
+  drawLine(84, "Heap: " + String(ESP.getFreeHeap()), TFT_DARKGREY);
+  drawLine(100, "Pet saves: NVS", TFT_DARKGREY);
+}
+
+void drawFooter() {
+  M5.Display.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  M5.Display.setCursor(4, M5.Display.height() - 8);
+  if (app.interaction.active) {
+    if (app.interaction.kind == "approval") {
+      M5.Display.print("A once A+ sess B deny");
+    } else if (app.interaction.handoff) {
+      M5.Display.print("A handoff B cancel");
+    } else {
+      M5.Display.print("A select B next");
+    }
+    return;
+  }
+  if (page == PAGE_PET) {
+    M5.Display.print("A pet  B next");
+  } else if (page == PAGE_CARE) {
+    M5.Display.print("A do  B action");
+  } else {
+    M5.Display.print("A refresh  B next");
+  }
+}
+
+void drawInteractionOverlay() {
+  if (!app.interaction.active) {
+    return;
+  }
+
+  M5.Display.fillRect(2, 18, M5.Display.width() - 4, 94, TFT_BLACK);
+  M5.Display.drawRect(2, 18, M5.Display.width() - 4, 94, app.interaction.handoff ? TFT_YELLOW : TFT_ORANGE);
+  drawBlob(24, 47);
+  drawLine(22, app.interaction.title, TFT_ORANGE);
+  drawLine(36, app.interaction.details ? app.interaction.body : fitText(app.interaction.body, 42), TFT_WHITE);
+
+  if (app.interaction.kind == "approval") {
+    drawLine(58, "A Once", TFT_GREEN);
+    drawLine(72, "A long Session", TFT_CYAN);
+    drawLine(86, "B Deny", TFT_ORANGE);
+    drawLine(100, "B long Cancel", TFT_RED);
+    return;
+  }
+
+  if (app.interaction.handoff) {
+    drawLine(62, "Needs Mac", TFT_YELLOW);
+    drawLine(78, "A: handoff", TFT_LIGHTGREY);
+    drawLine(92, "B: cancel", TFT_LIGHTGREY);
+    return;
+  }
+
+  for (uint8_t i = 0; i < min<uint8_t>(app.interaction.optionCount, 3); ++i) {
+    const uint8_t optionIndex = (app.interaction.selected + i) % app.interaction.optionCount;
+    const uint16_t color = i == 0 ? TFT_GREEN : TFT_LIGHTGREY;
+    const String prefix = i == 0 ? "> " : "  ";
+    drawLine(62 + i * 14, prefix + app.interaction.options[optionIndex].label, color);
+  }
 }
 
 void redraw() {
@@ -710,48 +1143,357 @@ void redraw() {
   drawHeader();
 
   switch (page) {
-    case 0:
-      drawUsage();
+    case PAGE_PET:
+      drawPetHome();
       break;
-    case 1:
-      drawDashboard();
+    case PAGE_CODEX:
+      drawCodex();
       break;
-    case 2:
-      drawPlan();
+    case PAGE_LIMITS:
+      drawLimits();
       break;
-    case 3:
-      drawGoal();
-      break;
-    case 4:
-      drawEntries();
+    case PAGE_CARE:
+      drawCare();
       break;
     default:
       drawSystem();
       break;
   }
 
+  drawInteractionOverlay();
   drawFooter();
   lastRenderedStatus = statusText();
   needsRedraw = false;
 }
 
-void handleButtons() {
-  if (M5.BtnA.wasPressed()) {
-    if (app.prompt.active) {
-      sendPermissionDecision("once");
+void nextPage() {
+  page = (page + 1) % PAGE_COUNT;
+  needsRedraw = true;
+}
+
+void prevPage() {
+  page = page == 0 ? PAGE_COUNT - 1 : page - 1;
+  needsRedraw = true;
+}
+
+void petTouch() {
+  app.pet.interactions += 1;
+  app.pet.mood = clampStat(app.pet.mood + 4);
+  app.pet.bond = clampStat(app.pet.bond + 1);
+  app.pet.energy = clampStat(app.pet.energy - 1);
+  app.pet.reaction = "Bloop";
+  markPetDirty();
+  needsRedraw = true;
+}
+
+void petPlay() {
+  app.pet.interactions += 1;
+  app.pet.playCount += 1;
+  app.pet.mood = clampStat(app.pet.mood + 8);
+  app.pet.bond = clampStat(app.pet.bond + 2);
+  app.pet.energy = clampStat(app.pet.energy - 6);
+  app.pet.hunger = clampStat(app.pet.hunger - 3);
+  app.pet.cleanliness = clampStat(app.pet.cleanliness - 2);
+  app.pet.reaction = "Bounce";
+  markPetDirty();
+  needsRedraw = true;
+}
+
+void toggleSleep() {
+  app.pet.sleeping = !app.pet.sleeping;
+  app.pet.reaction = app.pet.sleeping ? "Sleeping" : "Awake";
+  markPetDirty();
+  needsRedraw = true;
+}
+
+void applyCareAction() {
+  static const char* actions[] = {"Fed", "Clean", "Nap", "Focus"};
+  switch (app.pet.careIndex) {
+    case 0:
+      app.pet.hunger = clampStat(app.pet.hunger + 18);
+      app.pet.mood = clampStat(app.pet.mood + 2);
+      break;
+    case 1:
+      app.pet.cleanliness = clampStat(app.pet.cleanliness + 20);
+      app.pet.mood = clampStat(app.pet.mood + 2);
+      break;
+    case 2:
+      app.pet.energy = clampStat(app.pet.energy + 18);
+      app.pet.sleeping = true;
+      break;
+    default:
+      app.pet.focus = clampStat(app.pet.focus + 15);
+      app.pet.energy = clampStat(app.pet.energy - 3);
+      break;
+  }
+  app.pet.interactions += 1;
+  app.pet.reaction = actions[app.pet.careIndex];
+  markPetDirty();
+  needsRedraw = true;
+}
+
+void refreshStatus() {
+  JsonDocument doc;
+  doc["cmd"] = "status";
+  sendJson(doc);
+  app.msg = "Refresh sent";
+  needsRedraw = true;
+}
+
+void dispatchInteraction(InputEvent event) {
+  if (!app.interaction.active) {
+    return;
+  }
+
+  if (event == INPUT_AB_HOLD) {
+    sendControl("interrupt");
+    if (app.interaction.kind == "approval") {
+      submitApproval("cancel");
     } else {
-      page = (page + 1) % PAGE_COUNT;
-      needsRedraw = true;
+      sendInteraction("cancel", "cancel");
+      finishInteraction("Cancelled", false);
+    }
+    return;
+  }
+
+  if (app.interaction.kind == "approval") {
+    switch (event) {
+      case INPUT_A_SINGLE:
+        submitApproval("once");
+        break;
+      case INPUT_A_LONG:
+        submitApproval("session");
+        break;
+      case INPUT_B_SINGLE:
+        submitApproval("deny");
+        break;
+      case INPUT_B_LONG:
+        submitApproval("cancel");
+        break;
+      case INPUT_A_DOUBLE:
+      case INPUT_B_DOUBLE:
+        app.interaction.details = !app.interaction.details;
+        needsRedraw = true;
+        break;
+      default:
+        break;
+    }
+    return;
+  }
+
+  switch (event) {
+    case INPUT_A_SINGLE:
+      if (app.interaction.handoff) {
+        sendInteraction("handoff", "handoff");
+        finishInteraction("Open on Mac", false);
+      } else if (app.interaction.optionCount > 0) {
+        app.interaction.options[app.interaction.selected].selected = !app.interaction.options[app.interaction.selected].selected;
+        app.msg = "Selected " + app.interaction.options[app.interaction.selected].label;
+        needsRedraw = true;
+      }
+      break;
+    case INPUT_A_DOUBLE:
+    case INPUT_A_LONG:
+      submitChoice();
+      break;
+    case INPUT_B_SINGLE:
+      if (app.interaction.optionCount > 0) {
+        app.interaction.selected = (app.interaction.selected + 1) % app.interaction.optionCount;
+        needsRedraw = true;
+      }
+      break;
+    case INPUT_B_DOUBLE:
+      if (app.interaction.optionCount > 0) {
+        app.interaction.selected = app.interaction.selected == 0 ? app.interaction.optionCount - 1 : app.interaction.selected - 1;
+        needsRedraw = true;
+      }
+      break;
+    case INPUT_B_LONG:
+      sendInteraction("cancel", "cancel");
+      finishInteraction("Cancelled", false);
+      break;
+    default:
+      break;
+  }
+}
+
+void dispatchInput(InputEvent event) {
+  if (event == INPUT_NONE) {
+    return;
+  }
+  if (app.interaction.active) {
+    dispatchInteraction(event);
+    return;
+  }
+  if (event == INPUT_AB_HOLD) {
+    if (bleConnected) {
+      sendControl("interrupt");
+      app.msg = "Interrupt sent";
+    } else {
+      page = PAGE_SYSTEM;
+    }
+    needsRedraw = true;
+    return;
+  }
+
+  switch (page) {
+    case PAGE_PET:
+      if (event == INPUT_A_SINGLE) {
+        petTouch();
+      } else if (event == INPUT_A_DOUBLE) {
+        petPlay();
+      } else if (event == INPUT_A_LONG) {
+        page = PAGE_CARE;
+        needsRedraw = true;
+      } else if (event == INPUT_B_SINGLE) {
+        nextPage();
+      } else if (event == INPUT_B_DOUBLE) {
+        prevPage();
+      } else if (event == INPUT_B_LONG) {
+        toggleSleep();
+      }
+      break;
+    case PAGE_CARE:
+      if (event == INPUT_A_SINGLE || event == INPUT_A_LONG) {
+        applyCareAction();
+      } else if (event == INPUT_A_DOUBLE) {
+        petPlay();
+      } else if (event == INPUT_B_SINGLE) {
+        app.pet.careIndex = (app.pet.careIndex + 1) % 4;
+        needsRedraw = true;
+      } else if (event == INPUT_B_DOUBLE) {
+        app.pet.careIndex = app.pet.careIndex == 0 ? 3 : app.pet.careIndex - 1;
+        needsRedraw = true;
+      } else if (event == INPUT_B_LONG) {
+        page = PAGE_PET;
+        needsRedraw = true;
+      }
+      break;
+    case PAGE_CODEX:
+    case PAGE_LIMITS:
+    case PAGE_SYSTEM:
+      if (event == INPUT_A_SINGLE || event == INPUT_A_LONG) {
+        refreshStatus();
+      } else if (event == INPUT_A_DOUBLE) {
+        page = PAGE_CODEX;
+        needsRedraw = true;
+      } else if (event == INPUT_B_SINGLE) {
+        nextPage();
+      } else if (event == INPUT_B_DOUBLE) {
+        prevPage();
+      } else if (event == INPUT_B_LONG) {
+        page = PAGE_PET;
+        needsRedraw = true;
+      }
+      break;
+  }
+}
+
+void updateButtonTracker(ButtonTracker& tracker, bool pressed, InputEvent singleEvent, InputEvent doubleEvent, InputEvent longEvent) {
+  const uint32_t now = millis();
+  if (pressed && !tracker.down) {
+    tracker.down = true;
+    tracker.longSent = false;
+    tracker.pressMs = now;
+  }
+
+  if (pressed && tracker.down && !tracker.longSent && now - tracker.pressMs >= LONG_PRESS_MS && !comboSent) {
+    tracker.longSent = true;
+    tracker.pendingSingle = false;
+    dispatchInput(longEvent);
+  }
+
+  if (!pressed && tracker.down) {
+    tracker.down = false;
+    if (!tracker.longSent && !comboSent) {
+      if (tracker.pendingSingle && now - tracker.lastReleaseMs <= DOUBLE_PRESS_MS) {
+        tracker.pendingSingle = false;
+        dispatchInput(doubleEvent);
+      } else {
+        tracker.pendingSingle = true;
+        tracker.lastReleaseMs = now;
+      }
     }
   }
 
-  if (M5.BtnB.wasPressed()) {
-    if (app.prompt.active) {
-      sendPermissionDecision("deny");
-    } else {
-      page = (page + 1) % PAGE_COUNT;
-      needsRedraw = true;
+  if (tracker.pendingSingle && now - tracker.lastReleaseMs > DOUBLE_PRESS_MS) {
+    tracker.pendingSingle = false;
+    dispatchInput(singleEvent);
+  }
+}
+
+void handleButtons() {
+  const bool aPressed = M5.BtnA.isPressed();
+  const bool bPressed = M5.BtnB.isPressed();
+  const uint32_t now = millis();
+
+  if (aPressed && bPressed && !comboSent) {
+    const uint32_t aHeld = buttonA.down ? now - buttonA.pressMs : 0;
+    const uint32_t bHeld = buttonB.down ? now - buttonB.pressMs : 0;
+    if (max(aHeld, bHeld) >= COMBO_HOLD_MS) {
+      comboSent = true;
+      buttonA.pendingSingle = false;
+      buttonB.pendingSingle = false;
+      dispatchInput(INPUT_AB_HOLD);
     }
+  }
+
+  updateButtonTracker(buttonA, aPressed, INPUT_A_SINGLE, INPUT_A_DOUBLE, INPUT_A_LONG);
+  updateButtonTracker(buttonB, bPressed, INPUT_B_SINGLE, INPUT_B_DOUBLE, INPUT_B_LONG);
+
+  if (!aPressed && !bPressed) {
+    comboSent = false;
+  }
+}
+
+void updatePet() {
+  const uint32_t now = millis();
+  if (app.pet.lastTickMs == 0) {
+    app.pet.lastTickMs = now;
+    return;
+  }
+  if (now - app.pet.lastTickMs < PET_TICK_MS) {
+    return;
+  }
+
+  const uint32_t ticks = (now - app.pet.lastTickMs) / PET_TICK_MS;
+  app.pet.lastTickMs += ticks * PET_TICK_MS;
+  for (uint32_t i = 0; i < ticks; ++i) {
+    if (app.pet.sleeping) {
+      app.pet.energy = clampStat(app.pet.energy + 2);
+      app.pet.mood = clampStat(app.pet.mood + 1);
+      if (app.pet.energy > 92) {
+        app.pet.sleeping = false;
+      }
+    } else {
+      app.pet.energy = clampStat(app.pet.energy - 1);
+      app.pet.hunger = clampStat(app.pet.hunger - 1);
+      if (i % 3 == 0) {
+        app.pet.cleanliness = clampStat(app.pet.cleanliness - 1);
+      }
+    }
+    if (app.running > 0) {
+      app.pet.focus = clampStat(app.pet.focus + 1);
+      app.pet.energy = clampStat(app.pet.energy - 1);
+    } else if (app.pet.focus > 45) {
+      app.pet.focus = clampStat(app.pet.focus - 1);
+    }
+    if (app.pet.energy < 20 || app.pet.hunger < 20 || app.pet.cleanliness < 20) {
+      app.pet.mood = clampStat(app.pet.mood - 1);
+    }
+  }
+  markPetDirty();
+  needsRedraw = true;
+}
+
+void updateAnimation() {
+  if (millis() - app.pet.lastAnimMs < PET_ANIM_MS) {
+    return;
+  }
+  app.pet.lastAnimMs = millis();
+  app.pet.animFrame = (app.pet.animFrame + 1) % 8;
+  if (page == PAGE_PET || app.interaction.active) {
+    needsRedraw = true;
   }
 }
 
@@ -767,6 +1509,9 @@ void setup() {
   M5.Display.setTextSize(1);
   M5.Display.setBrightness(160);
 
+  prefs.begin("agentblob", false);
+  loadPet();
+
   app.deviceName = "Codex-S3-" + chipSuffix();
   setupBle();
 
@@ -777,6 +1522,9 @@ void setup() {
 void loop() {
   M5.update();
   handleButtons();
+  updatePet();
+  updateAnimation();
+  savePet();
 
   if (lastRenderedStatus != statusText()) {
     needsRedraw = true;

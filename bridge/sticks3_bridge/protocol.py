@@ -13,7 +13,15 @@ DEFAULT_BLE_CHUNK_SIZE = 20
 
 COMMAND_APPROVAL_METHOD = "item/commandExecution/requestApproval"
 FILE_APPROVAL_METHOD = "item/fileChange/requestApproval"
+TOOL_REQUEST_USER_INPUT_METHOD = "item/tool/requestUserInput"
+MCP_ELICITATION_REQUEST_METHOD = "mcpServer/elicitation/request"
 SUPPORTED_APPROVAL_METHODS = {COMMAND_APPROVAL_METHOD, FILE_APPROVAL_METHOD}
+SUPPORTED_INTERACTION_METHODS = {
+    COMMAND_APPROVAL_METHOD,
+    FILE_APPROVAL_METHOD,
+    TOOL_REQUEST_USER_INPUT_METHOD,
+    MCP_ELICITATION_REQUEST_METHOD,
+}
 
 
 def compact_json(data: dict[str, Any]) -> str:
@@ -67,6 +75,7 @@ class Snapshot:
     plan: dict[str, Any] | None = None
     goal: dict[str, Any] | None = None
     prompt: dict[str, str] | None = None
+    interaction: dict[str, Any] | None = None
 
     def to_wire(self) -> dict[str, Any]:
         data: dict[str, Any] = {
@@ -90,6 +99,8 @@ class Snapshot:
             data["goal"] = self.goal
         if self.prompt:
             data["prompt"] = self.prompt
+        if self.interaction:
+            data["interaction"] = self.interaction
         return data
 
 
@@ -137,13 +148,173 @@ def approval_prompt(method: str, request_id: Any, params: dict[str, Any]) -> dic
     return {"id": prompt_id, "tool": "Codex", "hint": "Approval requested"}
 
 
+def approval_interaction(method: str, request_id: Any, params: dict[str, Any]) -> dict[str, Any]:
+    prompt = approval_prompt(method, request_id, params)
+    return {
+        "id": prompt["id"],
+        "kind": "approval",
+        "title": prompt["tool"],
+        "body": prompt["hint"],
+        "options": [
+            {"id": "once", "label": "Once"},
+            {"id": "session", "label": "Session"},
+            {"id": "deny", "label": "Deny"},
+            {"id": "cancel", "label": "Cancel"},
+        ],
+        "selected": 0,
+        "multi": False,
+        "handoff": False,
+    }
+
+
+def handoff_interaction(request_id: Any, title: str, body: Any) -> dict[str, Any]:
+    return {
+        "id": str(request_id),
+        "kind": "handoff",
+        "title": short_text(title, 18),
+        "body": short_text(body, 80),
+        "options": [{"id": "handoff", "label": "Open Mac"}],
+        "selected": 0,
+        "multi": False,
+        "handoff": True,
+    }
+
+
+def tool_user_input_interaction(request_id: Any, params: dict[str, Any]) -> dict[str, Any]:
+    questions = params.get("questions")
+    if not isinstance(questions, list) or len(questions) != 1:
+        return handoff_interaction(request_id, "Codex Choice", "Open on Mac")
+
+    question = questions[0]
+    if not isinstance(question, dict):
+        return handoff_interaction(request_id, "Codex Choice", "Open on Mac")
+    if question.get("isSecret") or question.get("isOther"):
+        return handoff_interaction(request_id, question.get("header") or "Codex Choice", question.get("question"))
+
+    options = question.get("options")
+    if not isinstance(options, list) or not options:
+        return handoff_interaction(request_id, question.get("header") or "Codex Choice", question.get("question"))
+
+    normalized_options: list[dict[str, str]] = []
+    for index, option in enumerate(options[:8]):
+        if not isinstance(option, dict):
+            continue
+        label = short_text(option.get("label"), 18)
+        if label:
+            normalized_options.append({"id": label, "label": label})
+
+    if not normalized_options:
+        return handoff_interaction(request_id, question.get("header") or "Codex Choice", question.get("question"))
+
+    return {
+        "id": str(request_id),
+        "kind": "choice",
+        "title": short_text(question.get("header") or "Codex Choice", 18),
+        "body": short_text(question.get("question"), 80),
+        "question_id": str(question.get("id") or "answer"),
+        "options": normalized_options,
+        "selected": 0,
+        "multi": False,
+        "handoff": False,
+    }
+
+
+def mcp_elicitation_interaction(request_id: Any, params: dict[str, Any]) -> dict[str, Any]:
+    mode = params.get("mode")
+    if mode != "form":
+        return handoff_interaction(request_id, "MCP Request", params.get("message") or "Open on Mac")
+
+    schema = params.get("requestedSchema")
+    properties = schema.get("properties") if isinstance(schema, dict) else None
+    required = schema.get("required") if isinstance(schema, dict) else None
+    if not isinstance(properties, dict) or len(properties) != 1:
+        return handoff_interaction(request_id, "MCP Request", params.get("message") or "Open on Mac")
+
+    field_id, field_schema = next(iter(properties.items()))
+    if not isinstance(field_schema, dict):
+        return handoff_interaction(request_id, "MCP Request", params.get("message") or "Open on Mac")
+
+    enum_values = field_schema.get("enum")
+    enum_names = field_schema.get("enumNames")
+    if not isinstance(enum_values, list) or not enum_values:
+        return handoff_interaction(request_id, field_schema.get("title") or "MCP Request", params.get("message"))
+
+    normalized_options: list[dict[str, str]] = []
+    for index, value in enumerate(enum_values[:8]):
+        label = enum_names[index] if isinstance(enum_names, list) and index < len(enum_names) else value
+        normalized_options.append({"id": str(value), "label": short_text(label, 18)})
+
+    return {
+        "id": str(request_id),
+        "kind": "mcp_choice",
+        "title": short_text(field_schema.get("title") or "MCP Request", 18),
+        "body": short_text(params.get("message"), 80),
+        "question_id": str(field_id),
+        "options": normalized_options,
+        "selected": 0,
+        "multi": False,
+        "handoff": bool(isinstance(required, list) and len(required) > 1),
+    }
+
+
+def request_interaction(method: str, request_id: Any, params: dict[str, Any]) -> dict[str, Any]:
+    if method in SUPPORTED_APPROVAL_METHODS:
+        return approval_interaction(method, request_id, params)
+    if method == TOOL_REQUEST_USER_INPUT_METHOD:
+        return tool_user_input_interaction(request_id, params)
+    if method == MCP_ELICITATION_REQUEST_METHOD:
+        return mcp_elicitation_interaction(request_id, params)
+    return handoff_interaction(request_id, "Codex", "Open on Mac")
+
+
 def approval_response(method: str, decision: str) -> dict[str, Any]:
-    approved = decision == "once"
+    decisions = {
+        "once": "accept",
+        "session": "acceptForSession",
+        "deny": "decline",
+        "cancel": "cancel",
+    }
+    mapped = decisions.get(decision)
+    if mapped is None:
+        raise ValueError(f"unsupported approval decision: {decision}")
     if method == COMMAND_APPROVAL_METHOD:
-        return {"decision": "accept" if approved else "decline"}
+        return {"decision": mapped}
     if method == FILE_APPROVAL_METHOD:
-        return {"decision": "accept" if approved else "decline"}
+        return {"decision": mapped}
     raise ValueError(f"unsupported approval method: {method}")
+
+
+def tool_user_input_response(interaction: dict[str, Any], value: Any) -> dict[str, Any]:
+    question_id = str(interaction.get("question_id") or "answer")
+    if isinstance(value, list):
+        answers = [str(item) for item in value]
+    else:
+        answers = [str(value)]
+    return {"answers": {question_id: {"answers": answers}}}
+
+
+def mcp_elicitation_response(interaction: dict[str, Any], value: Any) -> dict[str, Any]:
+    question_id = str(interaction.get("question_id") or "answer")
+    return {"action": "accept", "content": {question_id: value}}
+
+
+def interaction_response(method: str, interaction: dict[str, Any], message: dict[str, Any]) -> dict[str, Any]:
+    action = str(message.get("action") or "submit")
+    if action in {"cancel", "handoff"}:
+        if method == MCP_ELICITATION_REQUEST_METHOD:
+            return {"action": "cancel"}
+        if method in SUPPORTED_APPROVAL_METHODS:
+            return approval_response(method, "cancel")
+        return tool_user_input_response(interaction, "Open on Mac")
+
+    value = message.get("value")
+    if method in SUPPORTED_APPROVAL_METHODS:
+        return approval_response(method, str(value or "once"))
+    if method == TOOL_REQUEST_USER_INPUT_METHOD:
+        return tool_user_input_response(interaction, value)
+    if method == MCP_ELICITATION_REQUEST_METHOD:
+        return mcp_elicitation_response(interaction, value)
+    raise ValueError(f"unsupported interaction method: {method}")
 
 
 def item_summary(item: dict[str, Any]) -> str | None:

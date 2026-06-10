@@ -1,6 +1,6 @@
 # Protocol
 
-This firmware implements a small bridge protocol for the StickS3 Codex companion.
+This firmware implements a small bridge protocol for Agent Blob, the StickS3 Codex companion e-pet.
 
 The BLE side is intentionally device-local and simple. It is not an official OpenAI BLE protocol. The Mac bridge maps between this protocol and the documented Codex App Server JSON-RPC approval/event protocol.
 
@@ -65,10 +65,20 @@ The device accepts snapshots like:
     "tokens_used": 12345,
     "token_budget": 20000
   },
-  "prompt": {
+  "interaction": {
     "id": "req_abc123",
-    "tool": "Bash",
-    "hint": "rm -rf /tmp/foo"
+    "kind": "approval",
+    "title": "Command",
+    "body": "rm -rf /tmp/foo",
+    "options": [
+      {"id": "once", "label": "Once"},
+      {"id": "session", "label": "Session"},
+      {"id": "deny", "label": "Deny"},
+      {"id": "cancel", "label": "Cancel"}
+    ],
+    "selected": 0,
+    "multi": false,
+    "handoff": false
   }
 }
 ```
@@ -101,7 +111,7 @@ or:
 
 ## Permission Response
 
-When `prompt.id` is present:
+Legacy firmware/host pairs may use `prompt` and `permission`:
 
 ```json
 {"cmd":"permission","id":"req_abc123","decision":"once"}
@@ -113,7 +123,61 @@ or:
 {"cmd":"permission","id":"req_abc123","decision":"deny"}
 ```
 
-The bridge maps `once` to Codex App Server `accept` and `deny` to `decline` for command and file-change approvals.
+The current Agent Blob firmware uses the normalized interaction response:
+
+```json
+{"cmd":"interaction","id":"req_abc123","action":"submit","value":"once"}
+```
+
+Approval values:
+
+- `once` -> Codex App Server `accept`
+- `session` -> Codex App Server `acceptForSession`
+- `deny` -> Codex App Server `decline`
+- `cancel` -> Codex App Server `cancel`
+
+The bridge still accepts legacy `permission` packets and normalizes them internally.
+
+## Choice Response
+
+For simple Codex option-list prompts, the bridge sends:
+
+```json
+{
+  "interaction": {
+    "id": "choice_1",
+    "kind": "choice",
+    "title": "Mode",
+    "body": "Pick one",
+    "question_id": "mode",
+    "options": [
+      {"id": "Fast", "label": "Fast"},
+      {"id": "Careful", "label": "Careful"}
+    ],
+    "selected": 0,
+    "multi": false,
+    "handoff": false
+  }
+}
+```
+
+The device replies:
+
+```json
+{"cmd":"interaction","id":"choice_1","action":"submit","value":"Careful"}
+```
+
+The bridge maps this back to App Server `item/tool/requestUserInput` answers. Free-form, secret, multi-question, or complex form prompts become handoff interactions and should be completed on the Mac.
+
+## Control Command
+
+The device can send host controls:
+
+```json
+{"cmd":"control","action":"interrupt"}
+```
+
+The bridge maps this to App Server `turn/interrupt` when it knows the active `threadId` and `turnId`.
 
 ## Rate Limits
 
@@ -122,7 +186,7 @@ Codex App Server exposes rolling Codex rate-limit windows through `account/rateL
 - primary window: 300 minutes, displayed as `5h`
 - secondary window: 10080 minutes, displayed as `7d`
 
-The StickS3 limits page displays remaining percentage for those two windows. App Server sends `usedPercent`; the bridge converts it to `remaining_percent`.
+Agent Blob displays those windows as bars, not percentage text, on the normal UI. App Server sends `usedPercent`; the bridge converts it to `remaining_percent`.
 
 ## Plan and Goal
 
@@ -177,8 +241,10 @@ The Mac bridge consumes these app-server requests:
 
 - `item/commandExecution/requestApproval`
 - `item/fileChange/requestApproval`
+- `item/tool/requestUserInput`
+- `mcpServer/elicitation/request`
 
-It renders the request as a StickS3 `prompt`, waits for Button A/B, and replies to the app-server request with the documented decision payload.
+It renders the request as an Agent Blob `interaction`, waits for a device response, and replies to the app-server request with the documented payload. Command/file approvals also include a legacy `prompt` object for compatibility.
 
 The bridge also listens for status and item notifications and renders them as snapshots:
 
@@ -191,5 +257,7 @@ The bridge also listens for status and item notifications and renders them as sn
 - `item/completed`
 - `thread/tokenUsage/updated`
 - `serverRequest/resolved`
+- `turn/completed`
+- `turn/started`
 
 `thread/tokenUsage/updated` is best-effort. The bridge accepts common total-token shapes such as `tokenUsage.total.totalTokens`, `usage.total.totalTokens`, and top-level `totalTokens`, but App Server sessions do not always emit token updates before real work occurs in that session.

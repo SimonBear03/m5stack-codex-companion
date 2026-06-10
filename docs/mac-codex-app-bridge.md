@@ -10,7 +10,7 @@ Public OpenAI docs describe Codex App Server as the protocol used for rich clien
 Codex app / App Server endpoint
   <-> JSON-RPC app-server bridge
   <-> BLE Nordic UART Service JSONL
-  <-> StickS3 display and A/B buttons
+  <-> Agent Blob display, overlays, and buttons
 ```
 
 The bridge can attach to a running App Server endpoint:
@@ -70,10 +70,27 @@ The `stdio` path starts its own App Server process. It is useful for development
 
 - App Server `item/commandExecution/requestApproval` -> StickS3 prompt with tool `Command` or `Network`.
 - App Server `item/fileChange/requestApproval` -> StickS3 prompt with tool `Files`.
-- Button A sends `{"cmd":"permission","decision":"once"}` -> App Server `{"decision":"accept"}`.
-- Button B sends `{"cmd":"permission","decision":"deny"}` -> App Server `{"decision":"decline"}`.
+- Button A sends interaction value `once` -> App Server `{"decision":"accept"}`.
+- Long Button A sends interaction value `session` -> App Server `{"decision":"acceptForSession"}`.
+- Button B sends interaction value `deny` -> App Server `{"decision":"decline"}`.
+- Long Button B sends interaction value `cancel` -> App Server `{"decision":"cancel"}`.
 
-V1 does not implement persistent approval choices such as `acceptForSession`, exec-policy amendments, or network-policy amendments from the hardware buttons.
+The bridge does not yet expose exec-policy amendments or network-policy amendments from the hardware buttons.
+
+## Choice Mapping
+
+The bridge handles App Server `item/tool/requestUserInput` when the request is a single option-list question. The StickS3 shows it as an Agent Blob choice overlay:
+
+- Button B cycles options.
+- Button A marks the highlighted option.
+- Double/long Button A submits.
+- Long Button B cancels.
+
+Free-form answers, secret answers, multi-question prompts, and complex MCP forms are shown as handoff interactions and should be answered on the Mac.
+
+## Control Mapping
+
+Agent Blob can send `{"cmd":"control","action":"interrupt"}`. The bridge maps that to App Server `turn/interrupt` when it has observed an active `threadId` and `turnId`.
 
 ## Usage Mapping
 
@@ -84,7 +101,7 @@ The current observed App Server payload uses:
 - `primary.windowDurationMins = 300`, displayed as `5h`
 - `secondary.windowDurationMins = 10080`, displayed as `7d`
 
-App Server reports `usedPercent`; the bridge sends both used and remaining percentages, and the StickS3 limits page displays remaining percentage.
+App Server reports `usedPercent`; the bridge sends both used and remaining percentages, and Agent Blob displays the remaining windows as bars rather than raw percentages.
 
 Token totals are optional. The bridge listens for `thread/tokenUsage/updated` and forwards totals when the App Server emits them, but the device displays `Tok: n/a` until that event is available.
 
@@ -102,14 +119,15 @@ The bridge intentionally ignores `item/plan/delta` for the device UI because the
 
 ## Device Pages
 
-The firmware cycles through six pages:
+The firmware cycles through five screens:
 
-1. Limits
-2. Status
-3. Plan
-4. Goal
-5. Recent
-6. System
+1. Blob home
+2. Codex detail
+3. Limits
+4. Care
+5. System
+
+Approval and choice requests appear as overlays above the current screen.
 
 ## Security Notes
 

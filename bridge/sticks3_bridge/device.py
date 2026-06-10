@@ -33,7 +33,11 @@ class StickS3Device(abc.ABC):
         raise NotImplementedError
 
     @abc.abstractmethod
-    async def wait_for_permission(self, prompt_id: str, timeout: float) -> str:
+    async def wait_for_interaction(self, interaction_id: str, timeout: float) -> dict[str, Any]:
+        raise NotImplementedError
+
+    @abc.abstractmethod
+    async def wait_for_control(self) -> dict[str, Any]:
         raise NotImplementedError
 
 
@@ -52,7 +56,8 @@ class BleStickS3Device(StickS3Device):
         self.chunk_size = chunk_size
         self._client: Any | None = None
         self._decoder = JsonLineDecoder()
-        self._permission_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        self._interaction_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        self._control_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
 
     async def connect(self) -> None:
         try:
@@ -99,29 +104,37 @@ class BleStickS3Device(StickS3Device):
             await self._client.write_gatt_char(NUS_RX_UUID, chunk, response=False)
             await asyncio.sleep(0.008)
 
-    async def wait_for_permission(self, prompt_id: str, timeout: float) -> str:
+    async def wait_for_interaction(self, interaction_id: str, timeout: float) -> dict[str, Any]:
         while True:
-            message = await asyncio.wait_for(self._permission_queue.get(), timeout=timeout)
-            if message.get("cmd") != "permission":
+            message = await asyncio.wait_for(self._interaction_queue.get(), timeout=timeout)
+            if message.get("cmd") not in {"permission", "interaction"}:
                 continue
-            if str(message.get("id")) != prompt_id:
-                LOGGER.debug("Ignoring permission for stale prompt id %s", message.get("id"))
+            if str(message.get("id")) != interaction_id:
+                LOGGER.debug("Ignoring interaction for stale id %s", message.get("id"))
                 continue
-            decision = message.get("decision")
-            if decision in {"once", "deny"}:
-                return str(decision)
+            if message.get("cmd") == "permission":
+                decision = message.get("decision")
+                if decision in {"once", "session", "deny", "cancel"}:
+                    return {"cmd": "interaction", "id": interaction_id, "action": "submit", "value": str(decision)}
+                continue
+            return message
+
+    async def wait_for_control(self) -> dict[str, Any]:
+        return await self._control_queue.get()
 
     def _handle_notification(self, _: int, data: bytearray) -> None:
         for message in self._decoder.feed(bytes(data)):
             LOGGER.debug("StickS3 -> host: %s", message)
-            if message.get("cmd") == "permission":
-                self._permission_queue.put_nowait(message)
+            if message.get("cmd") in {"permission", "interaction"}:
+                self._interaction_queue.put_nowait(message)
+            elif message.get("cmd") == "control":
+                self._control_queue.put_nowait(message)
 
 
 class FakeStickS3Device(StickS3Device):
     def __init__(self, *, auto_decision: str = "deny") -> None:
-        if auto_decision not in {"once", "deny"}:
-            raise ValueError("auto_decision must be 'once' or 'deny'")
+        if auto_decision not in {"once", "session", "deny", "cancel"}:
+            raise ValueError("auto_decision must be one of: once, session, deny, cancel")
         self.auto_decision = auto_decision
         self.snapshots: list[Snapshot] = []
 
@@ -135,7 +148,11 @@ class FakeStickS3Device(StickS3Device):
         self.snapshots.append(snapshot)
         LOGGER.info("Snapshot: %s", snapshot.to_wire())
 
-    async def wait_for_permission(self, prompt_id: str, timeout: float) -> str:
+    async def wait_for_interaction(self, interaction_id: str, timeout: float) -> dict[str, Any]:
         await asyncio.sleep(0)
-        LOGGER.info("Auto-answering prompt %s with %s", prompt_id, self.auto_decision)
-        return self.auto_decision
+        LOGGER.info("Auto-answering interaction %s with %s", interaction_id, self.auto_decision)
+        return {"cmd": "interaction", "id": interaction_id, "action": "submit", "value": self.auto_decision}
+
+    async def wait_for_control(self) -> dict[str, Any]:
+        future: asyncio.Future[dict[str, Any]] = asyncio.Future()
+        return await future

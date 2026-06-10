@@ -1,31 +1,37 @@
 # StickS3 Codex Companion
 
-Custom M5Stack StickS3 firmware for showing Codex work status on a physical device.
+Custom M5Stack StickS3 firmware for Agent Blob, an offline slime e-pet that also acts as a Codex companion device.
 
-The target is the Codex app on Mac. The StickS3 acts as a small BLE display/approval device, and a local Mac bridge connects it to a Codex App-compatible app-server endpoint. Public Codex docs do not currently document native desktop-app BLE pairing, so the bridge is the supported path.
+The target is the Codex app on Mac. The StickS3 acts as a small BLE display/approval/control device, and a local Mac bridge connects it to a Codex App-compatible app-server endpoint. Public Codex docs do not currently document native desktop-app BLE pairing, so the bridge is the supported path.
 
 ## Current Scope
 
-- Show Codex status: disconnected, idle, running, waiting, stale.
+- Boot into Agent Blob, an offline-first slime e-pet that works without Codex.
+- Persist Agent Blob care stats in ESP32 NVS:
+  - mood
+  - energy
+  - hunger
+  - cleanliness
+  - bond
+  - focus
+- Show Codex status as a small HUD: offline, idle, working, waiting, stale.
 - Show latest status message and recent activity entries.
-- Show pending approval prompt when provided by the host.
-- Send approval decisions:
-  - Button A: approve once when a prompt is active.
-  - Button B: deny when a prompt is active.
-- Show a six-page device UI:
-  - Limits: 5-hour and 7-day Codex usage remaining.
-  - Status: running/waiting threads and active approval prompt.
-  - Plan: current Codex plan step.
-  - Goal: current Codex thread goal.
-  - Recent: latest Codex activity entries.
-  - System: BLE, battery, and heap status.
+- Show pending approval and choice prompts as Agent Blob overlays.
+- Send approval decisions: approve once, approve for session, deny, or cancel.
+- Send simple option-list answers for Codex user-input prompts.
+- Show a five-screen device UI:
+  - Blob: Agent Blob home with Codex HUD and 5h/7d limit bars.
+  - Codex: status, current plan step, goal state, and recent activity.
+  - Limits: large 5-hour and 7-day remaining bars.
+  - Care: Agent Blob care stat bars and care actions.
+  - System: BLE, battery, heap, and device status.
 - Show Codex rolling usage windows when sent by the host:
-  - 5-hour remaining percentage
-  - 7-day remaining percentage
+  - 5-hour remaining bar
+  - 7-day remaining bar
   - optional total tokens, shown as `Tok: n/a` when the host has not emitted token usage
 - Reply to host `status`, `owner`, `name`, and `unpair` commands.
 
-The Mac bridge reads Codex App Server `account/rateLimits/read` and forwards the primary and secondary rolling windows to the StickS3. In the current App Server payload, those windows are 300 minutes and 10080 minutes, displayed as `5h` and `7d`. The bridge also listens for App Server plan and goal notifications and renders the current step/goal on their own pages.
+The Mac bridge reads Codex App Server `account/rateLimits/read` and forwards the primary and secondary rolling windows to the StickS3. In the current App Server payload, those windows are 300 minutes and 10080 minutes, displayed as `5h` and `7d` bars. The bridge also listens for App Server plan and goal notifications and renders compact summaries on the Codex screen.
 
 ## Implementation Status
 
@@ -37,10 +43,55 @@ As of 2026-06-10:
 - The Mac bridge connects over BLE and initializes a Codex App Server `stdio` session.
 - Python bridge protocol tests pass.
 - Fake-device App Server smoke test initializes and receives Codex `5h` / `7d` rate-limit data.
-- The firmware now uses NimBLE instead of ESP32 BLE Arduino, reducing the app binary from about 1.1 MB to about 756 KB.
+- The firmware now uses NimBLE instead of ESP32 BLE Arduino; the Agent Blob build is about 767 KB.
 - The display no longer does a full-screen redraw every 500 ms; redraws happen on state/page/status changes.
 - M5Launcher WebUI upload was unreliable on StickS3 without SD; direct USB flash is the current working install path.
+- Agent Blob home, care stats, approval overlays, choice overlays, and bar-based limits are implemented in firmware.
 - Live approval round-trip against a real Codex Desktop prompt is still pending.
+
+## Next Machine Handoff
+
+On the machine with the physical StickS3:
+
+```bash
+git clone https://github.com/SimonBear03/sticks3-codex-companion.git
+cd sticks3-codex-companion
+```
+
+Build and upload the firmware:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -U pip platformio
+pio run
+pio run --target upload --upload-port /dev/cu.usbmodem101
+```
+
+If the serial port differs, replace `/dev/cu.usbmodem101` with the port shown by `pio device list`. If upload cannot connect, put StickS3 into download mode by holding the side reset/power button until the internal green LED blinks, then retry upload.
+
+Set up the bridge separately with Python 3.11 or newer:
+
+```bash
+python3.11 -m venv .bridge-venv
+source .bridge-venv/bin/activate
+python -m pip install -U pip
+python -m pip install -e .
+sticks3-bridge --log-level INFO app-server --transport stdio --scan-timeout 15
+```
+
+First hardware checks after flashing:
+
+- Device boots into **Agent Blob**.
+- Home screen shows Agent Blob plus `5h` and `7d` bars, not raw percentages.
+- Button A pets Blob, Button B changes screens, long A opens Care, long B sleeps/wakes Blob.
+- BLE advertises as `Codex-S3-XXXX`.
+- Bridge connects and sends rate-limit snapshots.
+- A real Codex approval prompt shows the approval overlay:
+  - A: approve once
+  - long A: approve for session
+  - B: decline
+  - long B: cancel
 
 ## Repository Shape
 
@@ -152,12 +203,34 @@ See `docs/mac-codex-app-bridge.md` for the Mac-side flow and limitations.
 
 ## Controls
 
-- Button A:
-  - If approval prompt is active: approve once.
-  - Otherwise: next screen.
-- Button B:
-  - If approval prompt is active: deny.
-  - Otherwise: next screen.
+Agent Blob routes input by priority: safety combo, active Codex overlay, then the current screen.
+
+Default Pet Home controls:
+
+- Button A: pet Agent Blob.
+- Button B: next screen.
+- Double A: play.
+- Double B: previous screen.
+- Long A: open Care.
+- Long B: sleep/wake Agent Blob.
+- Hold A+B: send Codex interrupt when connected.
+
+Approval overlay controls:
+
+- Button A: approve once.
+- Long A: approve for session.
+- Button B: deny.
+- Long B: cancel.
+- Double A/B: toggle details.
+- Hold A+B: cancel and interrupt.
+
+Choice overlay controls:
+
+- Button A: select highlighted option.
+- Double A or long A: submit selected option.
+- Button B: next option.
+- Double B: previous option.
+- Long B: cancel.
 
 ## References
 
