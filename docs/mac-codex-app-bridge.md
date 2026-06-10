@@ -8,8 +8,8 @@ Public OpenAI docs describe Codex App Server as the protocol used for rich clien
 
 There are two bridge modes:
 
-- `desktop-observer`: read-only status mirroring for the actual Codex Desktop app. It follows local rollout JSONL files under `~/.codex/sessions`, prefers non-subagent Desktop threads, and forwards active/idle state, recent activity, token totals, and rate limits when those events are present.
-- `app-server`: JSON-RPC control path for an App Server endpoint. It can handle approvals, option-list prompts, interrupts, rate limits, plan updates, and goals, but only for the App Server session it is connected to.
+- `desktop-observer`: read-only status mirroring for the actual Codex Desktop app. It follows local rollout JSONL files under `~/.codex/sessions`, prefers non-subagent Desktop threads, and forwards active/idle state, speaker-labeled activity, token totals, and rate limits when those events are present.
+- `app-server`: JSON-RPC validation path for an App Server endpoint. It can still exercise approval and choice mapping in the Python bridge, but the current dashboard firmware is read-only.
 
 True control of an already-open Codex Desktop app thread is currently blocked by product surface, not by StickS3 firmware. On Simon's Mac, Codex Desktop is running private `stdio://` app-server processes and the default app-server control socket `/Users/simon/.codex/app-server-control/app-server-control.sock` is not present. Public docs describe how to expose an App Server transport, but not how third-party hardware can attach to an existing Desktop thread.
 
@@ -19,7 +19,7 @@ True control of an already-open Codex Desktop app thread is currently blocked by
 Codex Desktop rollout logs OR App Server endpoint
   <-> Mac bridge
   <-> BLE Nordic UART Service JSONL
-  <-> Agent Blob display, overlays, and buttons
+  <-> StickS3 minimal dashboard
 ```
 
 For the Desktop app experience Simon asked for, run:
@@ -35,7 +35,7 @@ sticks3-bridge desktop-observer --thread-id <thread-id>
 sticks3-bridge desktop-observer --rollout ~/.codex/sessions/.../rollout-....jsonl
 ```
 
-Observer mode is intentionally read-only. Button approvals, choice answers, and interrupts require `app-server` mode.
+Observer mode is intentionally read-only. It mirrors status, activity, usage bars, and token totals. It cannot approve prompts, answer prompts, or interrupt turns in the Codex Desktop UI.
 
 The bridge can attach to a running App Server endpoint:
 
@@ -49,9 +49,10 @@ It can also use a Unix-socket WebSocket endpoint:
 sticks3-bridge app-server --transport ws --target unix:///tmp/codex-app-server.sock
 ```
 
-For local validation without the desktop app or BLE hardware, spawn the public app-server implementation over stdio and use a fake device:
+For local validation without the desktop app or BLE hardware:
 
 ```bash
+sticks3-bridge desktop-observer --fake-device
 sticks3-bridge app-server --transport stdio --fake-device --auto-decision deny
 ```
 
@@ -70,53 +71,42 @@ python -m pip install -e .
 
 Keep this separate from the PlatformIO `.venv/` if that environment was created with Python 3.9.
 
-## Current Validation Status
+## Dashboard Mapping
 
-Validated on 2026-06-10:
+The bridge sends:
 
-- The bridge initializes `codex app-server --stdio` with a fake StickS3 device.
-- The bridge reads `account/rateLimits/read`.
-- The fake device receives `rate_limits.primary.label = 5h` and `rate_limits.secondary.label = 7d`.
-- Python tests cover approval mapping, rate-limit normalization, plan summaries, goal summaries, token usage forwarding, and cleared goals.
-- Python tests cover Desktop observer rollout selection and snapshot parsing.
-- Simon's physical StickS3 advertises as `Codex-S3-0470` over BLE.
-- A direct BLE status request receives a valid `{"ack":"status","ok":true}` response with battery, heap, and approval counters.
-- The bridge connects to the physical StickS3 over BLE and initializes a Codex App Server `stdio` session.
+- `status`: pinned newest action with `speaker`, `kind`, and `text`.
+- `activity`: scrollable body entries with stable `seq` IDs for dedupe.
+- `tokens`: optional compact token total.
+- `rate_limits`: primary `5h` and secondary `7d` usage windows.
 
-Still to validate:
+Desktop observer event handling:
 
-- Run `desktop-observer` against the physical StickS3 while this Codex Desktop app thread is active.
-- Button A/B approval decisions round-trip into a live App Server approval prompt.
-- Whether future Codex Desktop builds expose a supported attach/control endpoint for third-party local clients.
+- `task_started` -> current status `Codex: Working`
+- `task_complete` -> current status `Codex: Turn completed`, with the final assistant message in body text
+- `agent_message` -> `Codex` body text
+- `user_message` -> `User` body text
+- function/custom tool calls -> `Tool` body text with a cleaned tool name
+- function output -> concise `Tool: output ready`
+- `token_count` -> usage fields only; it does not overwrite the current action line
+- `patch_apply_end` -> `Tool: Patch applied` or `Tool: Patch failed`
 
-The `stdio` path starts its own App Server process. It is useful for development and validates the hardware control path, but it should not be treated as a passive observer of every existing Codex Desktop conversation.
+## Device Controls
 
-## Approval Mapping
+Main dashboard:
 
-- App Server `item/commandExecution/requestApproval` -> StickS3 prompt with tool `Command` or `Network`.
-- App Server `item/fileChange/requestApproval` -> StickS3 prompt with tool `Files`.
-- Button A sends interaction value `once` -> App Server `{"decision":"accept"}`.
-- Long Button A sends interaction value `session` -> App Server `{"decision":"acceptForSession"}`.
-- Button B sends interaction value `deny` -> App Server `{"decision":"decline"}`.
-- Long Button B sends interaction value `cancel` -> App Server `{"decision":"cancel"}`.
+- Button A: newer/down through body text.
+- Button B: older/up through body text.
+- Long A: open settings.
+- Long B: jump to newest when reading older text and `NEW` is shown.
+- A+B: no-op in the current dashboard firmware.
 
-The bridge does not yet expose exec-policy amendments or network-policy amendments from the hardware buttons.
+Settings menu:
 
-## Choice Mapping
-
-The bridge handles App Server `item/tool/requestUserInput` when the request is a single option-list question. The StickS3 shows it as an Agent Blob choice overlay:
-
-- Button B cycles options.
-- Button A marks the highlighted option.
-- Double/long Button A submits.
-- Long Button B cancels.
-- The bridge sends at most eight options, matching the current firmware capacity.
-
-Free-form answers, secret answers, multi-question prompts, and complex MCP forms are shown as handoff interactions. The bridge does not submit placeholder text for those cases; handoff/cancel returns an empty/no-device-answer payload so the request fails closed instead of inventing user input. `mcpServer/elicitation/request` handling is defensive until it is observed in a real App Server session.
-
-## Control Mapping
-
-Agent Blob can send `{"cmd":"control","action":"interrupt"}`. The bridge maps that to App Server `turn/interrupt` when it has observed an active `threadId` and `turnId`.
+- Button B: next option.
+- Button A: rotate/toggle selected value.
+- Long A: close settings.
+- Auto-closes after 12 seconds of no input.
 
 ## Usage Mapping
 
@@ -127,35 +117,27 @@ The current observed App Server payload uses:
 - `primary.windowDurationMins = 300`, displayed as `5h`
 - `secondary.windowDurationMins = 10080`, displayed as `7d`
 
-App Server reports `usedPercent`; the bridge sends both used and remaining percentages, and Agent Blob displays the remaining windows as bars rather than raw percentages.
+App Server reports `usedPercent`; the bridge sends both used and remaining percentages, and the device displays remaining percentages with compact bars.
 
-Token totals are optional. The bridge listens for `thread/tokenUsage/updated` and forwards totals when the App Server emits them, but the device displays `Tok: n/a` until that event is available.
+Token totals are optional. The bridge listens for `thread/tokenUsage/updated` and forwards totals when the App Server emits them, but the device displays `TOK n/a` until that event is available.
 
 In `desktop-observer` mode, the bridge reads `event_msg` `token_count` events from rollout JSONL. Those events use `used_percent` and `window_minutes`; the observer normalizes them to the same device payload used by App Server mode.
 
-## Plan and Goal Mapping
+## Current Validation Status
 
-The bridge listens for:
+Validated on 2026-06-10:
 
-- `turn/plan/updated`
-- `thread/goal/updated`
-- `thread/goal/cleared`
+- Python tests cover protocol serialization, approval mapping in the bridge, rate-limit normalization, plan summaries, goal summaries, token usage forwarding, cleared goals, Desktop observer rollout selection, and structured snapshot parsing.
+- Firmware builds with PlatformIO.
+- Simon's physical StickS3 advertises as `Codex-S3-0470` over BLE.
+- Direct USB flash works.
+- The bridge can connect to the physical StickS3 over BLE.
+- `desktop-observer` can mirror the current Codex Desktop rollout into dashboard snapshots.
 
-Plan updates are summarized to one current step for the StickS3 page: in-progress first, then pending, then the latest completed step. Goal updates include objective, status, elapsed seconds, used tokens, and optional token budget.
+Still to validate after the dashboard redesign:
 
-The bridge intentionally ignores `item/plan/delta` for the device UI because the App Server schema marks those deltas experimental and says concatenated deltas are not authoritative.
-
-## Device Pages
-
-The firmware cycles through five screens:
-
-1. Blob home
-2. Codex detail
-3. Limits
-4. Care
-5. System
-
-Approval and choice requests appear as overlays above the current screen.
+- Flash the redesigned firmware to the physical StickS3.
+- Confirm the one-screen layout, wrapped body text, settings menu, `NEW` behavior, and soft sounds on hardware.
 
 ## Security Notes
 

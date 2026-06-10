@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from .device import StickS3Device
-from .protocol import Snapshot, latest_entries, normalize_rate_limits, short_text
+from .protocol import Snapshot, normalize_rate_limits, short_text
 
 LOGGER = logging.getLogger(__name__)
 
@@ -112,6 +112,13 @@ def latest_user_rollout(sessions_dir: Path) -> Path | None:
     return files[0] if files else None
 
 
+def clean_tool_name(value: Any) -> str:
+    text = short_text(value or "tool", 40)
+    if "." in text:
+        text = text.rsplit(".", 1)[-1]
+    return text or "tool"
+
+
 @dataclass
 class DesktopObserverState:
     thread_id: str | None = None
@@ -120,7 +127,11 @@ class DesktopObserverState:
     active_turn_id: str | None = None
     active: bool = False
     last_message: str = "Desktop observer connected"
-    entries: deque[str] = field(default_factory=lambda: deque(maxlen=3))
+    status: dict[str, Any] = field(
+        default_factory=lambda: {"speaker": "System", "kind": "connected", "text": "Desktop observer connected"}
+    )
+    activity: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=8))
+    next_seq: int = 1
     tokens_total: int | None = None
     rate_limits: dict[str, dict[str, Any]] | None = None
     last_event_ts: float | None = None
@@ -130,12 +141,18 @@ class DesktopObserverState:
         msg = self.last_message
         if not self.active and self.thread_id and msg == "Desktop observer connected":
             msg = short_text(f"Idle: {label}", 80)
+        entries = tuple(
+            short_text(f"{item.get('speaker', 'Codex')}: {item.get('text', '')}", 48)
+            for item in self.activity
+        )
         return Snapshot(
             total=1 if self.thread_id else 0,
             running=1 if self.active else 0,
             waiting=0,
             msg=msg,
-            entries=latest_entries(self.entries),
+            entries=entries[:3],
+            status=self.status,
+            activity=tuple(self.activity),
             tokens=self.tokens_total,
             rate_limits=self.rate_limits,
         )
@@ -180,6 +197,7 @@ class DesktopObserverBridge:
         if path is None:
             if self.state.last_message != "No Codex Desktop rollout found":
                 self.state.last_message = "No Codex Desktop rollout found"
+                self.set_status("System", "disconnected", "No Codex Desktop rollout found")
                 return True
             return False
 
@@ -249,6 +267,7 @@ class DesktopObserverBridge:
                 self.state.thread_name = self.state.thread_name or str(thread_id)[:8]
             self.state.cwd = str(payload.get("cwd") or "") or None
             self.state.last_message = "Desktop observer connected"
+            self.set_status("System", "connected", "Desktop observer connected")
             return True
 
         if event_type == "turn_context":
@@ -268,11 +287,13 @@ class DesktopObserverBridge:
     def apply_response_item(self, payload: dict[str, Any]) -> bool:
         payload_type = payload.get("type")
         if payload_type in {"function_call", "custom_tool_call"}:
-            name = payload.get("name") or "tool"
-            self.add_entry(f"Tool: {name}")
+            name = clean_tool_name(payload.get("name"))
+            self.set_status("Tool", "started", name)
+            self.add_activity("Tool", "started", name)
             return True
         if payload_type == "function_call_output":
-            self.add_entry("Tool output")
+            self.set_status("Tool", "output", "output ready")
+            self.add_activity("Tool", "output", "output ready")
             return True
         return False
 
@@ -284,30 +305,34 @@ class DesktopObserverBridge:
             if turn_id:
                 self.state.active_turn_id = str(turn_id)
             self.state.active = True
-            self.add_entry("Turn started")
             self.state.last_message = "Codex working"
+            self.set_status("Codex", "working", "Working")
+            self.add_activity("System", "started", "Turn started")
             return True
 
         if payload_type == "task_complete":
             self.state.active = False
             self.state.active_turn_id = None
             summary = payload.get("last_agent_message") or "Turn completed"
-            self.add_entry(summary)
             self.state.last_message = "Turn completed"
+            self.set_status("Codex", "completed", "Turn completed")
+            self.add_activity("Codex", "completed", summary)
             return True
 
         if payload_type == "agent_message":
             message = payload.get("message")
             if isinstance(message, str) and message.strip():
-                self.add_entry(message)
                 self.state.last_message = short_text(message, 80)
+                self.set_status("Codex", "message", message)
+                self.add_activity("Codex", "message", message)
                 return True
             return False
 
         if payload_type == "user_message":
             message = payload.get("message")
-            self.add_entry(f"User: {message}" if message else "User message")
             self.state.last_message = "User message"
+            self.set_status("User", "message", message or "User message")
+            self.add_activity("User", "message", message or "User message")
             return True
 
         if payload_type == "token_count":
@@ -317,21 +342,39 @@ class DesktopObserverBridge:
                 if isinstance(usage, dict) and isinstance(usage.get("total_tokens"), int):
                     self.state.tokens_total = max(0, int(usage["total_tokens"]))
             self.state.rate_limits = compact_desktop_rate_limits(payload.get("rate_limits")) or self.state.rate_limits
-            self.state.last_message = "Usage updated"
             return True
 
         if payload_type == "patch_apply_end":
             success = payload.get("success")
-            self.add_entry("Patch applied" if success else "Patch failed")
             self.state.last_message = "Patch applied" if success else "Patch failed"
+            text = "Patch applied" if success else "Patch failed"
+            self.set_status("Tool", "patch", text)
+            self.add_activity("Tool", "patch", text)
             return True
 
         return False
 
-    def add_entry(self, value: Any) -> None:
-        text = short_text(value, 48)
+    def set_status(self, speaker: str, kind: str, text: Any) -> None:
+        clean = short_text(text, 96)
+        self.state.status = {
+            "speaker": short_text(speaker or "Codex", 16),
+            "kind": short_text(kind or "status", 24),
+            "text": clean,
+        }
+        self.state.last_message = clean
+
+    def add_activity(self, speaker: str, kind: str, value: Any) -> None:
+        text = short_text(value, 220)
         if text:
-            self.state.entries.appendleft(text)
+            self.state.activity.appendleft(
+                {
+                    "seq": f"d{self.state.next_seq}",
+                    "speaker": short_text(speaker or "Codex", 16),
+                    "kind": short_text(kind or "message", 24),
+                    "text": text,
+                }
+            )
+            self.state.next_seq += 1
 
     async def send_snapshot(self) -> None:
         async with self._snapshot_lock:

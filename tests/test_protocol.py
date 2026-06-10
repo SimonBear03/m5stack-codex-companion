@@ -208,6 +208,15 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual({"available": False}, wire["plan"])
         self.assertEqual({"available": False}, wire["goal"])
 
+    def test_snapshot_serializes_dashboard_status_and_activity(self) -> None:
+        status = {"speaker": "Codex", "kind": "message", "text": "Running tests"}
+        activity = ({"seq": "d1", "speaker": "Tool", "kind": "started", "text": "exec_command"},)
+        wire = Snapshot(status=status, activity=activity).to_wire()
+        self.assertEqual(status, wire["status"])
+        self.assertEqual(list(activity), wire["activity"])
+        self.assertIn("msg", wire)
+        self.assertIn("entries", wire)
+
     def test_snapshot_serializes_interaction(self) -> None:
         interaction = {"id": "req_1", "kind": "approval", "title": "Command"}
         self.assertEqual(interaction, Snapshot(interaction=interaction).to_wire()["interaction"])

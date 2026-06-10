@@ -83,6 +83,15 @@ class DesktopObserverTests(unittest.IsolatedAsyncioTestCase):
                     event_line(
                         {
                             "timestamp": "2026-06-10T14:21:01.000Z",
+                            "type": "response_item",
+                            "payload": {"type": "function_call", "name": "functions.exec_command"},
+                        }
+                    )
+                )
+                handle.write(
+                    event_line(
+                        {
+                            "timestamp": "2026-06-10T14:21:02.000Z",
                             "type": "event_msg",
                             "payload": {
                                 "type": "token_count",
@@ -97,7 +106,7 @@ class DesktopObserverTests(unittest.IsolatedAsyncioTestCase):
                 handle.write(
                     event_line(
                         {
-                            "timestamp": "2026-06-10T14:21:02.000Z",
+                            "timestamp": "2026-06-10T14:21:03.000Z",
                             "type": "event_msg",
                             "payload": {
                                 "type": "task_complete",
@@ -118,6 +127,11 @@ class DesktopObserverTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual("Turn completed", wire["msg"])
             self.assertEqual(1234, wire["tokens"])
             self.assertEqual("5h", wire["rate_limits"]["primary"]["label"])
+            self.assertEqual({"speaker": "Codex", "kind": "completed", "text": "Turn completed"}, wire["status"])
+            self.assertEqual("Codex", wire["activity"][0]["speaker"])
+            self.assertEqual("completed", wire["activity"][0]["kind"])
+            self.assertIn("Finished observer update", wire["activity"][0]["text"])
+            self.assertTrue(any(item["speaker"] == "Tool" and item["text"] == "exec_command" for item in wire["activity"]))
             self.assertIn("Finished observer update", wire["entries"][0])
 
 

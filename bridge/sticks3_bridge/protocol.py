@@ -69,6 +69,8 @@ class Snapshot:
     waiting: int = 0
     msg: str = "Connected to Codex app"
     entries: tuple[str, ...] = ()
+    status: dict[str, Any] | None = None
+    activity: tuple[dict[str, Any], ...] = ()
     tokens: int | None = None
     tokens_today: int | None = None
     remaining_pct: int | None = None
@@ -86,6 +88,10 @@ class Snapshot:
             "msg": self.msg,
             "entries": list(self.entries[:3]),
         }
+        if self.status:
+            data["status"] = self.status
+        if self.activity:
+            data["activity"] = list(self.activity)
         if self.tokens is not None:
             data["tokens"] = self.tokens
         if self.tokens_today is not None:

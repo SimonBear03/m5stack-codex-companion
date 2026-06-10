@@ -1,14 +1,14 @@
 # Protocol
 
-This firmware implements a small bridge protocol for Agent Blob, the StickS3 Codex companion e-pet.
+This firmware implements a small bridge protocol for the StickS3 Codex dashboard.
 
-The BLE side is intentionally device-local and simple. It is not an official OpenAI BLE protocol. The Mac bridge maps between this protocol and the documented Codex App Server JSON-RPC approval/event protocol.
+The BLE side is intentionally device-local and simple. It is not an official OpenAI BLE protocol. The Mac bridge maps Codex Desktop rollout events or Codex App Server events into compact dashboard snapshots.
 
 ## BLE
 
 Advertise a name starting with `Codex-` over Nordic UART Service.
 
-The current firmware implements this with NimBLE-Arduino to keep the app binary small enough for the StickS3 workflow. That is an implementation detail; the on-wire protocol remains Nordic UART Service JSONL.
+The current firmware implements this with NimBLE-Arduino to keep the app binary small enough for the StickS3 workflow. The on-wire protocol remains Nordic UART Service JSONL.
 
 | Direction | UUID |
 | --- | --- |
@@ -22,185 +22,79 @@ BLE notifications and writes are chunked. Use 20-byte chunks unless the host and
 
 The validated physical device currently advertises as `Codex-S3-0470`, but host software should only depend on the `Codex-` prefix and NUS service UUID.
 
-## Status Snapshot
+## Dashboard Snapshot
 
 The device accepts snapshots like:
 
 ```json
 {
-  "total": 3,
+  "total": 1,
   "running": 1,
-  "waiting": 1,
-  "msg": "approve: Bash",
-  "entries": ["10:42 git push", "10:41 yarn test"],
-  "tokens": 184502,
+  "waiting": 0,
+  "msg": "Codex working",
+  "entries": ["Codex: Editing firmware", "Tool: pio run"],
+  "status": {
+    "speaker": "Codex",
+    "kind": "message",
+    "text": "Editing firmware"
+  },
+  "activity": [
+    {
+      "seq": "d42",
+      "speaker": "Tool",
+      "kind": "started",
+      "text": "pio run"
+    },
+    {
+      "seq": "d41",
+      "speaker": "Codex",
+      "kind": "message",
+      "text": "Editing firmware"
+    }
+  ],
+  "tokens": 57560861,
   "rate_limits": {
     "primary": {
       "label": "5h",
-      "used_percent": 8,
-      "remaining_percent": 92,
+      "used_percent": 32,
+      "remaining_percent": 68,
       "window_mins": 300,
-      "resets_at": 1781034181
+      "resets_at": 1781109888
     },
     "secondary": {
       "label": "7d",
-      "used_percent": 31,
-      "remaining_percent": 69,
+      "used_percent": 40,
+      "remaining_percent": 60,
       "window_mins": 10080,
-      "resets_at": 1781140479
+      "resets_at": 1781140478
     }
-  },
-  "plan": {
-    "available": true,
-    "step": "Patch the firmware",
-    "status": "inProgress",
-    "completed": 1,
-    "total": 3
-  },
-  "goal": {
-    "available": true,
-    "objective": "Implement the StickS3 Codex companion",
-    "status": "active",
-    "time_used_sec": 3661,
-    "tokens_used": 12345,
-    "token_budget": 20000
-  },
-  "interaction": {
-    "id": "req_abc123",
-    "kind": "approval",
-    "title": "Command",
-    "body": "rm -rf /tmp/foo",
-    "options": [
-      {"id": "once", "label": "Once"},
-      {"id": "session", "label": "Session"},
-      {"id": "deny", "label": "Deny"},
-      {"id": "cancel", "label": "Cancel"}
-    ],
-    "selected": 0,
-    "multi": false,
-    "handoff": false
   }
 }
 ```
 
-`tokens` and `tokens_today` are optional. When they are absent, the firmware displays `Tok: n/a` rather than treating the missing value as zero.
+`status` is the pinned newest action line. `activity` is the scrollable body input. Each activity item should include a stable `seq`; the firmware dedupes recently seen sequence IDs so heartbeat snapshots do not duplicate body text.
+
+The firmware still accepts legacy `msg` and `entries`. When structured `activity` is absent, it uses those fields as a fallback body source.
+
+`tokens` is optional. When absent, the firmware displays `TOK n/a` rather than treating missing data as zero. Token totals are shown with compact units on-device.
 
 Legacy usage fields accepted by this firmware:
 
 ```json
-{
-  "rate_limit_remaining_percent": 72
-}
+{"rate_limit_remaining_percent": 72}
 ```
 
 or:
 
 ```json
-{
-  "remaining_pct": 72
-}
+{"remaining_pct": 72}
 ```
 
 or:
 
 ```json
-{
-  "remaining": 72
-}
+{"remaining": 72}
 ```
-
-## Permission Response
-
-Legacy firmware/host pairs may use `prompt` and `permission`:
-
-```json
-{"cmd":"permission","id":"req_abc123","decision":"once"}
-```
-
-or:
-
-```json
-{"cmd":"permission","id":"req_abc123","decision":"deny"}
-```
-
-The current Agent Blob firmware uses the normalized interaction response:
-
-```json
-{"cmd":"interaction","id":"req_abc123","action":"submit","value":"once"}
-```
-
-Approval values:
-
-- `once` -> Codex App Server `accept`
-- `session` -> Codex App Server `acceptForSession`
-- `deny` -> Codex App Server `decline`
-- `cancel` -> Codex App Server `cancel`
-
-The bridge still accepts legacy `permission` packets and normalizes them internally.
-
-## Choice Response
-
-For simple Codex option-list prompts, the bridge sends up to eight options:
-
-```json
-{
-  "interaction": {
-    "id": "choice_1",
-    "kind": "choice",
-    "title": "Mode",
-    "body": "Pick one",
-    "question_id": "mode",
-    "options": [
-      {"id": "Fast", "label": "Fast"},
-      {"id": "Careful", "label": "Careful"}
-    ],
-    "selected": 0,
-    "multi": false,
-    "handoff": false
-  }
-}
-```
-
-The device replies:
-
-```json
-{"cmd":"interaction","id":"choice_1","action":"submit","value":"Careful"}
-```
-
-The bridge maps this back to App Server `item/tool/requestUserInput` answers. Free-form, secret, multi-question, or complex form prompts become handoff interactions. Handoff responses do not submit placeholder text such as `Open on Mac`; the bridge returns an empty/no-device-answer payload so the request fails closed instead of inventing user input.
-
-## Control Command
-
-The device can send host controls:
-
-```json
-{"cmd":"control","action":"interrupt"}
-```
-
-The bridge maps this to App Server `turn/interrupt` when it knows the active `threadId` and `turnId`.
-
-## Rate Limits
-
-Codex App Server exposes rolling Codex rate-limit windows through `account/rateLimits/read` and `account/rateLimits/updated`. The current observed Codex bucket uses:
-
-- primary window: 300 minutes, displayed as `5h`
-- secondary window: 10080 minutes, displayed as `7d`
-
-Agent Blob displays those windows as bars, not percentage text, on the normal UI. App Server sends `usedPercent`; the bridge converts it to `remaining_percent`.
-
-## Plan and Goal
-
-The bridge forwards App Server `turn/plan/updated` as a compact `plan` object. It selects the in-progress step first, then the next pending step, then the latest completed step.
-
-The bridge forwards App Server `thread/goal/updated` as a compact `goal` object. When App Server sends `thread/goal/cleared`, the bridge sends:
-
-```json
-{"goal":{"available":false}}
-```
-
-The firmware keeps old plan/goal state only when those fields are absent. An explicit `available:false` clears the corresponding page.
-
-Goal token fields are optional. If `tokens_used` is missing, the goal page displays `Tok: n/a`; if `token_budget` is missing, the page displays only the used token count.
 
 ## Status Command
 
@@ -228,36 +122,47 @@ The device replies:
       "heap": 120000
     },
     "stats": {
-      "appr": 2,
-      "deny": 1
+      "appr": 0,
+      "deny": 0
+    },
+    "settings": {
+      "brightness": 1,
+      "sound": 1,
+      "nav": 0,
+      "text": 0,
+      "auto_newest": true
     }
   }
 }
 ```
 
-## Codex App Server Mapping
+The firmware also accepts `owner`, `name`, and `unpair` commands for compatibility with existing bridge tooling.
 
-The Mac bridge consumes these app-server requests:
+## Rate Limits
 
-- `item/commandExecution/requestApproval`
-- `item/fileChange/requestApproval`
-- `item/tool/requestUserInput`
-- `mcpServer/elicitation/request`
+Codex App Server exposes rolling Codex rate-limit windows through `account/rateLimits/read` and `account/rateLimits/updated`. Codex Desktop rollout logs can also include the same window shape in `token_count` events.
 
-It renders the request as an Agent Blob `interaction`, waits for a device response, and replies to the app-server request with the documented payload. Command/file approvals also include a legacy `prompt` object for compatibility. `mcpServer/elicitation/request` support is defensive and experimental until validated against a real App Server session.
+The current observed Codex bucket uses:
 
-The bridge also listens for status and item notifications and renders them as snapshots:
+- primary window: 300 minutes, displayed as `5h`
+- secondary window: 10080 minutes, displayed as `7d`
 
-- `account/rateLimits/updated`
-- `thread/status/changed`
-- `turn/plan/updated`
-- `thread/goal/updated`
-- `thread/goal/cleared`
-- `item/started`
-- `item/completed`
-- `thread/tokenUsage/updated`
-- `serverRequest/resolved`
-- `turn/completed`
-- `turn/started`
+The device displays remaining percentages beside compact bars, for example `5h 68%`.
 
-`thread/tokenUsage/updated` is best-effort. The bridge accepts common total-token shapes such as `tokenUsage.total.totalTokens`, `usage.total.totalTokens`, and top-level `totalTokens`, but App Server sessions do not always emit token updates before real work occurs in that session.
+## Desktop Observer Mapping
+
+`desktop-observer` reads local Codex rollout JSONL and emits structured dashboard snapshots:
+
+- `task_started` -> `Codex: Working`
+- `task_complete` -> `Codex: Turn completed` plus the last agent message in activity
+- `agent_message` -> `Codex` activity
+- `user_message` -> `User` activity
+- `response_item` function calls -> `Tool` activity with a cleaned tool name
+- `token_count` -> token total and rate-limit windows without replacing the current action line
+- `patch_apply_end` -> `Tool: Patch applied` or `Tool: Patch failed`
+
+## App Server Compatibility
+
+The Python bridge still contains App Server mappings for command/file approvals, simple option-list prompts, interrupts, plan updates, goals, and token usage. The current dashboard firmware is read-only and does not expose approval or choice controls, so App Server interaction payloads are not part of the active device UX.
+
+The public App Server protocol gives a client stream for the endpoint it is connected to. It does not document a passive control interface for every already-open Codex desktop-app panel. `desktop-observer` is the current workaround for status display.
