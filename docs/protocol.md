@@ -74,7 +74,7 @@ The device accepts snapshots like:
 
 `status` is the pinned newest action line. `activity` is the scrollable body input and should be ordered oldest-to-newest so the newest message lands at the bottom of the terminal window. Each activity item should include a stable `seq`; the firmware dedupes recently seen sequence IDs so heartbeat snapshots do not duplicate body text.
 
-The firmware renders each activity item as a compact message block, not a raw line stream: a header such as `[Codex]` or `[Tool started]`, followed by indented wrapped body lines.
+The firmware renders each activity item as a compact message block, not a raw line stream: a colored header such as `[Codex]` or `[Tool started]`, followed by indented wrapped body lines and a blank separator line before the next message.
 
 The firmware still accepts legacy `msg` and `entries`. When structured `activity` is absent, it uses those fields as a fallback body source.
 

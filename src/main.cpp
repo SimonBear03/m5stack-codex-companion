@@ -170,18 +170,18 @@ uint16_t rgb(uint8_t r, uint8_t g, uint8_t b) {
 
 uint16_t statusColor() {
   if (!bleConnected) {
-    return rgb(92, 36, 36);
+    return rgb(145, 43, 58);
   }
   if (app.lastSnapshotMs > 0 && millis() - app.lastSnapshotMs > STALE_AFTER_MS) {
-    return rgb(91, 71, 36);
+    return rgb(142, 103, 42);
   }
   if (app.waiting > 0) {
-    return rgb(94, 65, 35);
+    return rgb(165, 92, 45);
   }
   if (app.running > 0) {
-    return rgb(35, 75, 86);
+    return rgb(30, 108, 150);
   }
-  return rgb(38, 77, 53);
+  return rgb(42, 126, 82);
 }
 
 String modeLabel() {
@@ -480,6 +480,8 @@ uint8_t appendActivityBlock(const String& speaker, const String& kind, String te
   appendBodyLine(activityHeader(speaker, kind));
   added += 1;
   added += appendWrappedText("  ", "  ", text);
+  appendBodyLine("");
+  added += 1;
   return added;
 }
 
@@ -800,6 +802,33 @@ void drawTextAt(int x, int y, const String& text, uint16_t color = TFT_WHITE, ui
   canvas.print(text);
 }
 
+uint16_t speakerColor(const String& speaker) {
+  if (speaker.indexOf("Tool") >= 0) {
+    return rgb(214, 158, 74);
+  }
+  if (speaker.indexOf("User") >= 0) {
+    return rgb(112, 190, 122);
+  }
+  if (speaker.indexOf("System") >= 0) {
+    return rgb(150, 135, 210);
+  }
+  if (speaker.indexOf("Subagent") >= 0) {
+    return rgb(197, 126, 191);
+  }
+  return rgb(91, 190, 216);
+}
+
+bool isHeaderLine(const String& line) {
+  return line.startsWith("[") && line.indexOf("]") > 0;
+}
+
+uint16_t bodyLineColor(const String& line) {
+  if (!isHeaderLine(line)) {
+    return rgb(176, 176, 168);
+  }
+  return speakerColor(line);
+}
+
 void drawBar(int x, int y, int w, int h, int value, uint16_t color) {
   canvas.drawRect(x, y, w, h, rgb(45, 45, 45));
   if (value >= 0) {
@@ -823,6 +852,9 @@ void drawTopBar() {
   canvas.setCursor(4, 4);
   canvas.print(modeLabel());
   if (app.hasNew) {
+    const uint16_t newBg = rgb(230, 186, 69);
+    canvas.fillRoundRect(40, 2, 24, 11, 2, newBg);
+    canvas.setTextColor(TFT_BLACK, newBg);
     canvas.setCursor(43, 4);
     canvas.print("NEW");
   }
@@ -848,7 +880,7 @@ void drawDashboard() {
   drawTextAt(4, 49, "TOK " + tokenLabel(), TFT_LIGHTGREY);
 
   const String current = fitText(app.statusSpeaker + ": " + app.statusText, 21);
-  drawTextAt(4, 64, current, app.running > 0 ? rgb(120, 190, 190) : TFT_WHITE);
+  drawTextAt(4, 64, current, speakerColor(app.statusSpeaker));
   canvas.drawFastHLine(4, 77, canvas.width() - 8, rgb(42, 42, 42));
 
   const uint8_t visible = visibleBodyLines();
@@ -862,7 +894,11 @@ void drawDashboard() {
     if (lineIndex >= app.bodyCount) {
       break;
     }
-    drawTextAt(4, y, fitText(bodyLineAt(lineIndex), maxBodyChars()), TFT_LIGHTGREY);
+    const String line = bodyLineAt(lineIndex);
+    if (isHeaderLine(line)) {
+      canvas.fillRect(0, y - 1, canvas.width(), bodyLineHeight(), rgb(17, 21, 24));
+    }
+    drawTextAt(4, y, fitText(line, maxBodyChars()), bodyLineColor(line), isHeaderLine(line) ? rgb(17, 21, 24) : TFT_BLACK);
     y += bodyLineHeight();
   }
 
