@@ -8,6 +8,8 @@ The BLE side is intentionally device-local and simple. It is not an official Ope
 
 Advertise a name starting with `Codex-` over Nordic UART Service.
 
+The current firmware implements this with NimBLE-Arduino to keep the app binary small enough for the StickS3 workflow. That is an implementation detail; the on-wire protocol remains Nordic UART Service JSONL.
+
 | Direction | UUID |
 | --- | --- |
 | Service | `6e400001-b5a3-f393-e0a9-e50e24dcca9e` |
@@ -17,6 +19,8 @@ Advertise a name starting with `Codex-` over Nordic UART Service.
 Messages are UTF-8 JSON objects, one per line, terminated with `\n`.
 
 BLE notifications and writes are chunked. Use 20-byte chunks unless the host and device negotiate and test a larger MTU.
+
+The validated physical device currently advertises as `Codex-S3-0470`, but host software should only depend on the `Codex-` prefix and NUS service UUID.
 
 ## Status Snapshot
 
@@ -68,6 +72,8 @@ The device accepts snapshots like:
   }
 }
 ```
+
+`tokens` and `tokens_today` are optional. When they are absent, the firmware displays `Tok: n/a` rather than treating the missing value as zero.
 
 Legacy usage fields accepted by this firmware:
 
@@ -130,6 +136,8 @@ The bridge forwards App Server `thread/goal/updated` as a compact `goal` object.
 
 The firmware keeps old plan/goal state only when those fields are absent. An explicit `available:false` clears the corresponding page.
 
+Goal token fields are optional. If `tokens_used` is missing, the goal page displays `Tok: n/a`; if `token_budget` is missing, the page displays only the used token count.
+
 ## Status Command
 
 When host sends:
@@ -145,7 +153,7 @@ The device replies:
   "ack": "status",
   "ok": true,
   "data": {
-    "name": "Codex-S3-2411",
+    "name": "Codex-S3-0470",
     "sec": false,
     "bat": {
       "pct": 85,
@@ -183,3 +191,5 @@ The bridge also listens for status and item notifications and renders them as sn
 - `item/completed`
 - `thread/tokenUsage/updated`
 - `serverRequest/resolved`
+
+`thread/tokenUsage/updated` is best-effort. The bridge accepts common total-token shapes such as `tokenUsage.total.totalTokens`, `usage.total.totalTokens`, and top-level `totalTokens`, but App Server sessions do not always emit token updates before real work occurs in that session.

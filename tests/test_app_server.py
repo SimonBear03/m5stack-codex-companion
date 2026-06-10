@@ -65,6 +65,22 @@ class AppServerBridgeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual({"available": False}, device.snapshots[-1].to_wire()["goal"])
 
+    async def test_token_usage_notification_reaches_snapshot(self) -> None:
+        device = FakeStickS3Device()
+        bridge = CodexAppServerBridge(transport=DummyTransport(), device=device)
+
+        await bridge.handle_notification(
+            {
+                "method": "thread/tokenUsage/updated",
+                "params": {
+                    "threadId": "thread-1",
+                    "usage": {"total": {"totalTokens": 1234}},
+                },
+            }
+        )
+
+        self.assertEqual(1234, device.snapshots[-1].to_wire()["tokens"])
+
 
 if __name__ == "__main__":
     unittest.main()

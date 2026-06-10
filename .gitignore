@@ -1,6 +1,7 @@
 .pio/
 .platformio/
 .venv/
+.bridge-venv/
 .vscode/
 *.bin
 *.elf

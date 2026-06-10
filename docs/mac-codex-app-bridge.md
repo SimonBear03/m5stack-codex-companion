@@ -33,20 +33,38 @@ sticks3-bridge app-server --transport stdio --fake-device --auto-decision deny
 
 The stdio path is a validation harness. The intended product path is a Mac Codex app/app-server endpoint.
 
+## Mac Setup
+
+Use a Python 3.11+ environment for the bridge:
+
+```bash
+python3.11 -m venv .bridge-venv
+source .bridge-venv/bin/activate
+python -m pip install -U pip
+python -m pip install -e .
+```
+
+Keep this separate from the PlatformIO `.venv/` if that environment was created with Python 3.9.
+
 ## Current Validation Status
 
-Validated on 2026-06-10 in the VPS workspace:
+Validated on 2026-06-10:
 
 - The bridge initializes `codex app-server --stdio` with a fake StickS3 device.
 - The bridge reads `account/rateLimits/read`.
 - The fake device receives `rate_limits.primary.label = 5h` and `rate_limits.secondary.label = 7d`.
-- Python tests cover approval mapping, rate-limit normalization, plan summaries, goal summaries, and cleared goals.
+- Python tests cover approval mapping, rate-limit normalization, plan summaries, goal summaries, token usage forwarding, and cleared goals.
+- Simon's physical StickS3 advertises as `Codex-S3-0470` over BLE.
+- A direct BLE status request receives a valid `{"ack":"status","ok":true}` response with battery, heap, and approval counters.
+- The bridge connects to the physical StickS3 over BLE and initializes a Codex App Server `stdio` session.
 
-Still to validate on Simon's Mac:
+Still to validate:
 
 - The Codex app exposes or can be paired with an App Server endpoint suitable for this bridge.
-- BLE scanning connects to the flashed StickS3.
 - Button A/B approval decisions round-trip into a live Codex app approval prompt.
+- Whether a WebSocket/socket endpoint can passively mirror already-open Codex Desktop app threads.
+
+The `stdio` path starts its own App Server process. It is useful for development and validates the hardware bridge path, but it should not be treated as a passive observer of every existing Codex Desktop conversation.
 
 ## Approval Mapping
 
@@ -67,6 +85,8 @@ The current observed App Server payload uses:
 - `secondary.windowDurationMins = 10080`, displayed as `7d`
 
 App Server reports `usedPercent`; the bridge sends both used and remaining percentages, and the StickS3 limits page displays remaining percentage.
+
+Token totals are optional. The bridge listens for `thread/tokenUsage/updated` and forwards totals when the App Server emits them, but the device displays `Tok: n/a` until that event is available.
 
 ## Plan and Goal Mapping
 

@@ -1,10 +1,7 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
-#include <BLE2902.h>
-#include <BLEDevice.h>
-#include <BLEServer.h>
-#include <BLEUtils.h>
 #include <M5Unified.h>
+#include <NimBLEDevice.h>
 
 namespace {
 
@@ -13,17 +10,17 @@ constexpr const char* NUS_RX_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
 constexpr const char* NUS_TX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
 
 constexpr uint32_t STALE_AFTER_MS = 30000;
-constexpr uint32_t REDRAW_EVERY_MS = 500;
 constexpr uint32_t BLE_NOTIFY_CHUNK_DELAY_MS = 8;
 constexpr size_t ENTRY_COUNT = 3;
 constexpr size_t BLE_NOTIFY_CHUNK_SIZE = 20;
 constexpr uint8_t PAGE_COUNT = 6;
 
-BLECharacteristic* txCharacteristic = nullptr;
+NimBLECharacteristic* txCharacteristic = nullptr;
 bool bleConnected = false;
 bool needsRedraw = true;
 uint8_t page = 0;
 String rxBuffer;
+String lastRenderedStatus;
 
 struct PromptState {
   bool active = false;
@@ -56,6 +53,7 @@ struct GoalState {
   uint32_t timeUsedSec = 0;
   uint32_t tokensUsed = 0;
   uint32_t tokenBudget = 0;
+  bool hasTokensUsed = false;
   bool hasTokenBudget = false;
 };
 
@@ -69,6 +67,8 @@ struct AppState {
   String entries[ENTRY_COUNT];
   uint32_t tokens = 0;
   uint32_t tokensToday = 0;
+  bool hasTokens = false;
+  bool hasTokensToday = false;
   int remainingPct = -1;
   RateLimitWindowState primaryLimit;
   RateLimitWindowState secondaryLimit;
@@ -306,6 +306,7 @@ void clearGoal() {
   app.goal.timeUsedSec = 0;
   app.goal.tokensUsed = 0;
   app.goal.tokenBudget = 0;
+  app.goal.hasTokensUsed = false;
   app.goal.hasTokenBudget = false;
 }
 
@@ -316,6 +317,7 @@ void updateGoal(JsonObject source) {
   }
 
   app.goal.available = true;
+  app.goal.hasTokensUsed = false;
   app.goal.hasTokenBudget = false;
   if (source["objective"].is<const char*>()) {
     app.goal.objective = fitText(source["objective"].as<String>(), 96);
@@ -330,8 +332,10 @@ void updateGoal(JsonObject source) {
   }
   if (source["tokens_used"].is<uint32_t>()) {
     app.goal.tokensUsed = source["tokens_used"].as<uint32_t>();
+    app.goal.hasTokensUsed = true;
   } else if (source["tokensUsed"].is<uint32_t>()) {
     app.goal.tokensUsed = source["tokensUsed"].as<uint32_t>();
+    app.goal.hasTokensUsed = true;
   }
   if (source["token_budget"].is<uint32_t>()) {
     app.goal.tokenBudget = source["token_budget"].as<uint32_t>();
@@ -346,8 +350,14 @@ void handleSnapshot(JsonDocument& doc) {
   app.total = doc["total"] | app.total;
   app.running = doc["running"] | 0;
   app.waiting = doc["waiting"] | 0;
-  app.tokens = doc["tokens"] | app.tokens;
-  app.tokensToday = doc["tokens_today"] | app.tokensToday;
+  if (doc["tokens"].is<uint32_t>()) {
+    app.tokens = doc["tokens"].as<uint32_t>();
+    app.hasTokens = true;
+  }
+  if (doc["tokens_today"].is<uint32_t>()) {
+    app.tokensToday = doc["tokens_today"].as<uint32_t>();
+    app.hasTokensToday = true;
+  }
 
   if (doc["msg"].is<const char*>()) {
     app.msg = fitText(doc["msg"].as<String>(), 64);
@@ -464,14 +474,14 @@ void handleIncomingBytes(const std::string& value) {
   }
 }
 
-class ServerCallbacks : public BLEServerCallbacks {
-  void onConnect(BLEServer*) override {
+class ServerCallbacks : public NimBLEServerCallbacks {
+  void onConnect(NimBLEServer*) override {
     bleConnected = true;
     app.msg = "Connected";
     needsRedraw = true;
   }
 
-  void onDisconnect(BLEServer*) override {
+  void onDisconnect(NimBLEServer*) override {
     bleConnected = false;
     app.total = 0;
     app.running = 0;
@@ -480,43 +490,42 @@ class ServerCallbacks : public BLEServerCallbacks {
     clearGoal();
     app.prompt.active = false;
     app.msg = "Disconnected";
-    BLEDevice::startAdvertising();
+    NimBLEDevice::startAdvertising();
     needsRedraw = true;
   }
 };
 
-class RxCallbacks : public BLECharacteristicCallbacks {
-  void onWrite(BLECharacteristic* characteristic) override {
+class RxCallbacks : public NimBLECharacteristicCallbacks {
+  void onWrite(NimBLECharacteristic* characteristic) override {
     handleIncomingBytes(characteristic->getValue());
   }
 };
 
 void setupBle() {
-  BLEDevice::init(app.deviceName.c_str());
-  BLEServer* server = BLEDevice::createServer();
+  NimBLEDevice::init(app.deviceName.c_str());
+  NimBLEServer* server = NimBLEDevice::createServer();
   server->setCallbacks(new ServerCallbacks());
 
-  BLEService* service = server->createService(NUS_SERVICE_UUID);
+  NimBLEService* service = server->createService(NUS_SERVICE_UUID);
   txCharacteristic = service->createCharacteristic(
     NUS_TX_UUID,
-    BLECharacteristic::PROPERTY_NOTIFY | BLECharacteristic::PROPERTY_READ
+    NIMBLE_PROPERTY::NOTIFY | NIMBLE_PROPERTY::READ
   );
-  txCharacteristic->addDescriptor(new BLE2902());
 
-  BLECharacteristic* rxCharacteristic = service->createCharacteristic(
+  NimBLECharacteristic* rxCharacteristic = service->createCharacteristic(
     NUS_RX_UUID,
-    BLECharacteristic::PROPERTY_WRITE | BLECharacteristic::PROPERTY_WRITE_NR
+    NIMBLE_PROPERTY::WRITE | NIMBLE_PROPERTY::WRITE_NR
   );
   rxCharacteristic->setCallbacks(new RxCallbacks());
 
   service->start();
 
-  BLEAdvertising* advertising = BLEDevice::getAdvertising();
+  NimBLEAdvertising* advertising = NimBLEDevice::getAdvertising();
   advertising->addServiceUUID(NUS_SERVICE_UUID);
   advertising->setScanResponse(true);
   advertising->setMinPreferred(0x06);
   advertising->setMinPreferred(0x12);
-  BLEDevice::startAdvertising();
+  NimBLEDevice::startAdvertising();
 }
 
 const char* statusText() {
@@ -601,6 +610,10 @@ uint16_t statusTextColor(const String& status) {
   return TFT_LIGHTGREY;
 }
 
+String tokensLabel() {
+  return app.hasTokens ? String(app.tokens) : "n/a";
+}
+
 void drawDashboard() {
   drawLine(24, "Codex " + app.owner, TFT_WHITE);
   drawLine(38, "T:" + String(app.total) + " R:" + String(app.running) + " W:" + String(app.waiting), TFT_LIGHTGREY);
@@ -634,15 +647,15 @@ void drawUsage() {
       const uint16_t color = app.secondaryLimit.remainingPct < 20 ? TFT_ORANGE : TFT_GREEN;
       drawLine(58, app.secondaryLimit.label + " left: " + String(app.secondaryLimit.remainingPct) + "%", color);
     }
-    drawLine(74, "Tokens: " + String(app.tokens), TFT_DARKGREY);
+    drawLine(74, "Tok: " + tokensLabel(), TFT_DARKGREY);
     drawLine(90, "Host rate limits", TFT_DARKGREY);
   } else if (app.remainingPct >= 0) {
     drawLine(42, "Remain: " + String(app.remainingPct) + "%", app.remainingPct < 20 ? TFT_ORANGE : TFT_GREEN);
-    drawLine(58, "Tokens: " + String(app.tokens), TFT_LIGHTGREY);
+    drawLine(58, "Tok: " + tokensLabel(), TFT_LIGHTGREY);
   } else {
     drawLine(42, "5h left: host n/a", TFT_DARKGREY);
     drawLine(58, "7d left: host n/a", TFT_DARKGREY);
-    drawLine(74, "Tokens: " + String(app.tokens), TFT_DARKGREY);
+    drawLine(74, "Tok: " + tokensLabel(), TFT_DARKGREY);
   }
 }
 
@@ -673,10 +686,12 @@ void drawGoal() {
   drawLine(42, app.goal.status, statusTextColor(app.goal.status));
   drawLine(58, app.goal.objective, TFT_WHITE);
   drawLine(74, "Time: " + elapsedLabel(app.goal.timeUsedSec), TFT_LIGHTGREY);
-  if (app.goal.hasTokenBudget) {
+  if (app.goal.hasTokensUsed && app.goal.hasTokenBudget) {
     drawLine(90, "Tok: " + String(app.goal.tokensUsed) + "/" + String(app.goal.tokenBudget), TFT_DARKGREY);
-  } else {
+  } else if (app.goal.hasTokensUsed) {
     drawLine(90, "Tok: " + String(app.goal.tokensUsed), TFT_DARKGREY);
+  } else {
+    drawLine(90, "Tok: n/a", TFT_DARKGREY);
   }
 }
 
@@ -716,6 +731,7 @@ void redraw() {
   }
 
   drawFooter();
+  lastRenderedStatus = statusText();
   needsRedraw = false;
 }
 
@@ -759,14 +775,10 @@ void setup() {
 }
 
 void loop() {
-  static uint32_t lastRedrawMs = 0;
-
   M5.update();
   handleButtons();
 
-  const uint32_t now = millis();
-  if (now - lastRedrawMs >= REDRAW_EVERY_MS) {
-    lastRedrawMs = now;
+  if (lastRenderedStatus != statusText()) {
     needsRedraw = true;
   }
 

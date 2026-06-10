@@ -161,6 +161,31 @@ class AppState:
         )
 
 
+def nested_dict_value(data: dict[str, Any], path: tuple[str, ...]) -> Any:
+    current: Any = data
+    for key in path:
+        if not isinstance(current, dict):
+            return None
+        current = current.get(key)
+    return current
+
+
+def extract_total_tokens(params: dict[str, Any]) -> int | None:
+    paths = (
+        ("tokenUsage", "total", "totalTokens"),
+        ("tokenUsage", "totalTokens"),
+        ("usage", "total", "totalTokens"),
+        ("usage", "totalTokens"),
+        ("total", "totalTokens"),
+        ("totalTokens",),
+    )
+    for path in paths:
+        value = nested_dict_value(params, path)
+        if isinstance(value, int):
+            return max(0, value)
+    return None
+
+
 class CodexAppServerBridge:
     def __init__(
         self,
@@ -324,10 +349,8 @@ class CodexAppServerBridge:
                 self.state.last_message = summary
 
         elif method == "thread/tokenUsage/updated":
-            usage = params.get("tokenUsage") or {}
-            total = usage.get("total") or {}
-            total_tokens = total.get("totalTokens")
-            if isinstance(total_tokens, int):
+            total_tokens = extract_total_tokens(params)
+            if total_tokens is not None:
                 self.state.tokens_total = total_tokens
 
         elif method == "turn/plan/updated":
