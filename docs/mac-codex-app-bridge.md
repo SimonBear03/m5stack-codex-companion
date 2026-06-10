@@ -71,6 +71,63 @@ python -m pip install -e .
 
 Keep this separate from the PlatformIO `.venv/` if that environment was created with Python 3.9.
 
+## Menu Bar Supervisor
+
+The macOS helper wraps `desktop-observer` with a PID file, status JSON, and log
+file so it can be controlled from a menu bar app:
+
+```bash
+scripts/sticks3-macos-bridge start
+scripts/sticks3-macos-bridge status
+scripts/sticks3-macos-bridge restart
+scripts/sticks3-macos-bridge stop
+```
+
+Runtime files live in `runtime/` and are ignored by Git:
+
+- `bridge.pid`: the process started by the supervisor
+- `bridge-status.json`: lifecycle, current status, thread, tokens, and rate limits
+- `bridge.log`: bridge stdout/stderr from background starts
+
+The helper does not search for and kill unrelated `sticks3-bridge` processes. If
+you started the observer manually in a terminal, stop that terminal process before
+switching to the supervisor so BLE is not claimed by two processes.
+
+For SwiftBar/xbar, use the included plugin folder:
+
+```text
+/Users/simon/Documents/workspace/repos/sticks3-codex-companion/macos/swiftbar
+```
+
+The plugin calls:
+
+```bash
+scripts/sticks3-macos-bridge swiftbar
+```
+
+The menu title is intentionally compact:
+
+- `S3 Off`: no supervised bridge process
+- `S3 Link`: starting or scanning
+- `S3 Idle`: connected but not actively working
+- `S3 Work`: Codex is active or the latest status is work-like
+- `S3 Err`: bridge error
+
+The Start/Stop/Restart actions in the menu call the same supervisor script.
+
+For launch-at-login, copy the template:
+
+```bash
+cp macos/LaunchAgents/com.simon.sticks3-codex-companion.plist ~/Library/LaunchAgents/
+launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.simon.sticks3-codex-companion.plist
+```
+
+Unload it later with:
+
+```bash
+launchctl bootout "gui/$(id -u)" ~/Library/LaunchAgents/com.simon.sticks3-codex-companion.plist
+```
+
 ## Dashboard Mapping
 
 The bridge sends:
@@ -86,7 +143,7 @@ Desktop observer event handling:
 - `task_complete` -> current status `Codex: Turn completed`, with the final assistant message in body text
 - `agent_message` -> `Codex` body text
 - `user_message` -> `User` body text
-- function/custom tool calls -> `Tool` body text with a cleaned tool name
+- function/custom tool calls -> pinned `Tool` status with a cleaned tool name; not added to body scrollback
 - function output -> concise `Tool: output ready`
 - `token_count` -> usage fields only; it does not overwrite the current action line
 - `patch_apply_end` -> `Tool: Patch applied` or `Tool: Patch failed`
@@ -98,7 +155,7 @@ Main dashboard:
 - Button A: newer/down through body text.
 - Button B: older/up through body text.
 - Long A: open settings.
-- Long B: jump to newest when reading older text and `NEW` is shown.
+- Long B: jump to newest when reading older text and the unread dot is shown; otherwise enter display sleep.
 - A+B: no-op in the current dashboard firmware.
 
 Settings menu:
@@ -107,6 +164,9 @@ Settings menu:
 - Button A: rotate/toggle selected value.
 - Long A: close settings.
 - Auto-closes after 12 seconds of no input.
+- Settings options are brightness, power profile, sound, text navigation, and auto-newest.
+- The display dims and auto-sleeps after about 5 seconds in all modes when there is no unread marker, settings are closed, and you are not reading older text. Shake wake is armed 2.5 seconds after sleep starts, while button input and new Codex BLE activity can wake immediately.
+- Power profiles tune brightness behavior, animation cadence, loop delay, BLE TX/connection parameters, and optional long-idle deep sleep in `Max`.
 
 ## Usage Mapping
 
@@ -123,6 +183,22 @@ Token totals are optional. The bridge listens for `thread/tokenUsage/updated` an
 
 In `desktop-observer` mode, the bridge reads `event_msg` `token_count` events from rollout JSONL. Those events use `used_percent` and `window_minutes`; the observer normalizes them to the same device payload used by App Server mode.
 
+## Battery Behavior
+
+Battery-saving behavior is firmware-local. The Mac bridge does not need to know when the display is asleep; BLE stays connected in normal display sleep and incoming snapshots can wake the screen.
+
+The device now:
+
+- caches battery telemetry and samples it roughly every 30 seconds,
+- reports battery percent, voltage/current when supported, and CPU MHz in `status` acks,
+- lowers LCD brightness levels and defaults to lower settings on battery when no saved preference exists,
+- shuts down the speaker task and AW8737 amplifier after sound cues,
+- stops redraws for unchanged heartbeat snapshots,
+- slows animations and the main loop when idle/asleep, including during `WORK`,
+- lowers BLE transmit power and relaxes advertising/connection intervals according to the selected power profile,
+- enters display sleep after about 5 seconds in all modes when settings are closed, no unread marker is present, and you are not reading older text,
+- optionally enters ESP32 deep sleep in `Max` mode after extended idle, which disconnects BLE until the device is woken and reboots.
+
 ## Current Validation Status
 
 Validated on 2026-06-10:
@@ -137,7 +213,7 @@ Validated on 2026-06-10:
 Still to validate after the dashboard redesign:
 
 - Flash the redesigned firmware to the physical StickS3.
-- Confirm the one-screen layout, wrapped body text, settings menu, `NEW` behavior, and soft sounds on hardware.
+- Confirm the one-screen layout, wrapped body text, settings menu, unread-dot behavior, and soft sounds on hardware.
 
 ## Security Notes
 

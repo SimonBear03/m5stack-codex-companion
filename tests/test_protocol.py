@@ -16,6 +16,7 @@ from sticks3_bridge.protocol import (
     normalize_plan_update,
     normalize_rate_limits,
     request_interaction,
+    short_text,
 )
 
 
@@ -30,6 +31,9 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual([], decoder.feed(payload[:8]))
         messages = decoder.feed(payload[8:])
         self.assertEqual([{"cmd": "permission", "id": "1", "decision": "once"}], messages)
+
+    def test_short_text_normalizes_terminal_punctuation(self) -> None:
+        self.assertEqual('I\'m "ready" - done...', short_text("I\u2019m \u201cready\u201d \u2014 done\u2026"))
 
     def test_command_approval_prompt_and_response(self) -> None:
         prompt = approval_prompt(COMMAND_APPROVAL_METHOD, 7, {"command": "git push", "cwd": "/tmp/repo"})

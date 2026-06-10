@@ -16,6 +16,9 @@ from .protocol import Snapshot, normalize_rate_limits, short_text
 
 LOGGER = logging.getLogger(__name__)
 
+DESKTOP_ACTIVITY_HISTORY = 4
+DESKTOP_ACTIVITY_TEXT_LIMIT = 1000
+
 
 def default_codex_home() -> Path:
     return Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")).expanduser()
@@ -130,7 +133,7 @@ class DesktopObserverState:
     status: dict[str, Any] = field(
         default_factory=lambda: {"speaker": "System", "kind": "connected", "text": "Desktop observer connected"}
     )
-    activity: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=8))
+    activity: deque[dict[str, Any]] = field(default_factory=lambda: deque(maxlen=DESKTOP_ACTIVITY_HISTORY))
     next_seq: int = 1
     tokens_total: int | None = None
     rate_limits: dict[str, dict[str, Any]] | None = None
@@ -169,6 +172,7 @@ class DesktopObserverBridge:
         thread_id: str | None = None,
         poll_interval: float = 2.0,
         heartbeat_interval: float = 10.0,
+        status_file: Path | None = None,
     ) -> None:
         self.device = device
         self.sessions_dir = sessions_dir or (default_codex_home() / "sessions")
@@ -176,6 +180,7 @@ class DesktopObserverBridge:
         self.thread_id = thread_id
         self.poll_interval = poll_interval
         self.heartbeat_interval = heartbeat_interval
+        self.status_file = status_file
         self.state = DesktopObserverState()
         self._offset = 0
         self._last_size = 0
@@ -183,7 +188,9 @@ class DesktopObserverBridge:
         self._snapshot_lock = asyncio.Lock()
 
     async def run(self) -> None:
+        self.write_status("connecting", detail="Scanning for StickS3")
         await self.device.connect()
+        self.write_status("connected", detail="BLE connected")
         asyncio.create_task(self.handle_device_controls())
 
         while True:
@@ -365,7 +372,7 @@ class DesktopObserverBridge:
         self.state.last_message = clean
 
     def add_activity(self, speaker: str, kind: str, value: Any) -> None:
-        text = short_text(value, 220)
+        text = short_text(value, DESKTOP_ACTIVITY_TEXT_LIMIT)
         if text:
             self.state.activity.appendleft(
                 {
@@ -381,6 +388,7 @@ class DesktopObserverBridge:
         async with self._snapshot_lock:
             await self.device.send_snapshot(self.state.snapshot())
             self._last_sent = time.monotonic()
+            self.write_status("connected", detail=self.state.last_message)
 
     async def handle_device_controls(self) -> None:
         while True:
@@ -388,3 +396,31 @@ class DesktopObserverBridge:
             LOGGER.info("Ignoring StickS3 control in desktop-observer mode: %s", message)
             self.state.last_message = "Observer is read-only"
             await self.send_snapshot()
+
+    def write_status(self, state: str, *, detail: str | None = None, error: str | None = None) -> None:
+        if self.status_file is None:
+            return
+
+        payload: dict[str, Any] = {
+            "state": state,
+            "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+            "pid": os.getpid(),
+            "detail": detail,
+            "error": error,
+            "rollout": str(self.rollout_path) if self.rollout_path else None,
+            "thread_id": self.state.thread_id,
+            "thread_name": self.state.thread_name,
+            "active": self.state.active,
+            "last_message": self.state.last_message,
+            "status": self.state.status,
+            "tokens": self.state.tokens_total,
+            "rate_limits": self.state.rate_limits,
+        }
+
+        try:
+            self.status_file.parent.mkdir(parents=True, exist_ok=True)
+            temp_path = self.status_file.with_suffix(self.status_file.suffix + ".tmp")
+            temp_path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+            temp_path.replace(self.status_file)
+        except OSError as exc:
+            LOGGER.debug("Could not write status file %s: %s", self.status_file, exc)

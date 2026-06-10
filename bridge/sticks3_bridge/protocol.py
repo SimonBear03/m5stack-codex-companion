@@ -12,6 +12,23 @@ NUS_TX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
 DEFAULT_BLE_CHUNK_SIZE = 20
 MAX_INTERACTION_OPTIONS = 8
 
+DISPLAY_TEXT_REPLACEMENTS = {
+    "\u00a0": " ",
+    "\u2018": "'",
+    "\u2019": "'",
+    "\u201a": "'",
+    "\u201b": "'",
+    "\u02bc": "'",
+    "\u201c": '"',
+    "\u201d": '"',
+    "\u201e": '"',
+    "\u201f": '"',
+    "\u2013": "-",
+    "\u2014": "-",
+    "\u2212": "-",
+    "\u2026": "...",
+}
+
 COMMAND_APPROVAL_METHOD = "item/commandExecution/requestApproval"
 FILE_APPROVAL_METHOD = "item/fileChange/requestApproval"
 TOOL_REQUEST_USER_INPUT_METHOD = "item/tool/requestUserInput"
@@ -113,6 +130,8 @@ class Snapshot:
 
 def short_text(value: Any, limit: int = 80) -> str:
     text = "" if value is None else str(value)
+    for source, replacement in DISPLAY_TEXT_REPLACEMENTS.items():
+        text = text.replace(source, replacement)
     text = " ".join(text.split())
     if len(text) <= limit:
         return text

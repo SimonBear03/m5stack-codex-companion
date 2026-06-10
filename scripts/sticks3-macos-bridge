@@ -1,0 +1,363 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+
+
+REPO_ROOT = Path(os.environ.get("STICKS3_REPO", Path(__file__).resolve().parents[1])).expanduser().resolve()
+RUNTIME_DIR = Path(os.environ.get("STICKS3_RUNTIME_DIR", REPO_ROOT / "runtime")).expanduser()
+PID_FILE = RUNTIME_DIR / "bridge.pid"
+STATUS_FILE = RUNTIME_DIR / "bridge-status.json"
+LOG_FILE = RUNTIME_DIR / "bridge.log"
+
+
+def now_iso() -> str:
+    return datetime.now().astimezone().isoformat(timespec="seconds")
+
+
+def read_json(path: Path) -> dict[str, Any]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def write_status(state: str, *, detail: str | None = None, error: str | None = None) -> None:
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    existing = read_json(STATUS_FILE)
+    existing.update(
+        {
+            "state": state,
+            "updated_at": now_iso(),
+            "pid": read_pid(),
+            "detail": detail,
+            "error": error,
+        }
+    )
+    temp_path = STATUS_FILE.with_suffix(STATUS_FILE.suffix + ".tmp")
+    temp_path.write_text(json.dumps(existing, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    temp_path.replace(STATUS_FILE)
+
+
+def read_pid() -> int | None:
+    try:
+        text = PID_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    try:
+        pid = int(text)
+    except ValueError:
+        return None
+    return pid if pid > 0 else None
+
+
+def pid_is_running(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def remove_stale_pid() -> None:
+    try:
+        PID_FILE.unlink()
+    except FileNotFoundError:
+        pass
+
+
+def bridge_bin() -> Path:
+    local_bin = REPO_ROOT / ".bridge-venv" / "bin" / "sticks3-bridge"
+    if local_bin.exists():
+        return local_bin
+    resolved = shutil.which("sticks3-bridge")
+    if resolved:
+        return Path(resolved)
+    raise RuntimeError(
+        "sticks3-bridge is not installed. Run: python3.11 -m venv .bridge-venv && "
+        "source .bridge-venv/bin/activate && python -m pip install -e ."
+    )
+
+
+def bridge_command(args: argparse.Namespace) -> list[str]:
+    command = [
+        str(bridge_bin()),
+        "--log-level",
+        args.log_level,
+        "desktop-observer",
+        "--scan-timeout",
+        str(args.scan_timeout),
+        "--poll-interval",
+        str(args.poll_interval),
+        "--heartbeat-interval",
+        str(args.heartbeat_interval),
+        "--status-file",
+        str(STATUS_FILE),
+    ]
+    if args.device_prefix:
+        command.extend(["--device-prefix", args.device_prefix])
+    if args.address:
+        command.extend(["--address", args.address])
+    if args.codex_home:
+        command.extend(["--codex-home", args.codex_home])
+    if args.sessions_dir:
+        command.extend(["--sessions-dir", args.sessions_dir])
+    if args.thread_id:
+        command.extend(["--thread-id", args.thread_id])
+    if args.rollout:
+        command.extend(["--rollout", args.rollout])
+    if args.fake_device:
+        command.append("--fake-device")
+    return command
+
+
+def status_payload() -> dict[str, Any]:
+    pid = read_pid()
+    process_running = bool(pid and pid_is_running(pid))
+    if pid and not process_running:
+        remove_stale_pid()
+        pid = None
+
+    payload = read_json(STATUS_FILE)
+    payload["supervisor_state"] = "running" if process_running else "stopped"
+    payload["supervisor_pid"] = pid
+    payload["runtime_dir"] = str(RUNTIME_DIR)
+    payload["log_file"] = str(LOG_FILE)
+    return payload
+
+
+def command_start(args: argparse.Namespace) -> int:
+    pid = read_pid()
+    if pid and pid_is_running(pid):
+        print(f"bridge already running: pid {pid}")
+        return 0
+    if pid:
+        remove_stale_pid()
+
+    try:
+        command = bridge_command(args)
+    except RuntimeError as exc:
+        write_status("error", error=str(exc))
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    write_status("starting", detail="Starting StickS3 desktop observer")
+    with LOG_FILE.open("ab") as log:
+        log.write(f"\n[{now_iso()}] starting bridge\n".encode("utf-8"))
+        process = subprocess.Popen(
+            command,
+            cwd=str(REPO_ROOT),
+            stdin=subprocess.DEVNULL,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+        )
+    PID_FILE.write_text(f"{process.pid}\n", encoding="utf-8")
+    write_status("starting", detail=f"Started pid {process.pid}")
+    print(f"started bridge: pid {process.pid}")
+    return 0
+
+
+def command_run(args: argparse.Namespace) -> int:
+    try:
+        command = bridge_command(args)
+    except RuntimeError as exc:
+        write_status("error", error=str(exc))
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
+    PID_FILE.write_text(f"{os.getpid()}\n", encoding="utf-8")
+    write_status("starting", detail="Running StickS3 desktop observer")
+    os.chdir(REPO_ROOT)
+    os.execv(command[0], command)
+    return 1
+
+
+def command_stop(_args: argparse.Namespace) -> int:
+    pid = read_pid()
+    if not pid:
+        write_status("stopped", detail="Bridge is not running")
+        print("bridge is not running")
+        return 0
+    if not pid_is_running(pid):
+        remove_stale_pid()
+        write_status("stopped", detail="Removed stale pid file")
+        print("bridge was not running; removed stale pid file")
+        return 0
+
+    os.kill(pid, signal.SIGTERM)
+    deadline = time.monotonic() + 6.0
+    while time.monotonic() < deadline:
+        if not pid_is_running(pid):
+            remove_stale_pid()
+            write_status("stopped", detail=f"Stopped pid {pid}")
+            print(f"stopped bridge: pid {pid}")
+            return 0
+        time.sleep(0.2)
+
+    write_status("error", error=f"Bridge pid {pid} did not exit after SIGTERM")
+    print(f"bridge pid {pid} did not exit after SIGTERM", file=sys.stderr)
+    return 1
+
+
+def command_restart(args: argparse.Namespace) -> int:
+    stop_code = command_stop(args)
+    if stop_code != 0:
+        return stop_code
+    return command_start(args)
+
+
+def command_status(args: argparse.Namespace) -> int:
+    payload = status_payload()
+    if args.json:
+        print(json.dumps(payload, indent=2, sort_keys=True))
+        return 0
+
+    state = payload.get("state") or "unknown"
+    supervisor = payload.get("supervisor_state")
+    pid = payload.get("supervisor_pid")
+    detail = payload.get("detail") or payload.get("last_message") or ""
+    updated = payload.get("updated_at") or "never"
+    print(f"bridge: {supervisor}" + (f" (pid {pid})" if pid else ""))
+    print(f"device: {state}")
+    print(f"updated: {updated}")
+    if detail:
+        print(f"detail: {detail}")
+    if payload.get("error"):
+        print(f"error: {payload['error']}")
+    print(f"log: {LOG_FILE}")
+    return 0
+
+
+def menu_escape(value: Any, *, limit: int = 80) -> str:
+    text = "" if value is None else str(value)
+    text = " ".join(text.replace("|", "/").split())
+    if len(text) > limit:
+        return text[: max(0, limit - 1)] + "..."
+    return text
+
+
+def swiftbar_title(payload: dict[str, Any]) -> tuple[str, str]:
+    supervisor = payload.get("supervisor_state")
+    state = payload.get("state")
+    status = payload.get("status") if isinstance(payload.get("status"), dict) else {}
+    active = bool(payload.get("active"))
+
+    if supervisor != "running":
+        return "S3 Off", "#8a8f98"
+    if state == "error" or payload.get("error"):
+        return "S3 Err", "#d65a4a"
+    if state in {"starting", "connecting"}:
+        return "S3 Link", "#d59b3d"
+    if active or status.get("kind") in {"working", "started"}:
+        return "S3 Work", "#4aa6be"
+    if state == "connected":
+        return "S3 Idle", "#8da38f"
+    return "S3 Wait", "#a287c0"
+
+
+def command_swiftbar(_args: argparse.Namespace) -> int:
+    payload = status_payload()
+    title, color = swiftbar_title(payload)
+    status = payload.get("status") if isinstance(payload.get("status"), dict) else {}
+    detail = payload.get("detail") or payload.get("last_message")
+    speaker = status.get("speaker")
+    status_text = status.get("text")
+    status_line = f"{speaker}: {status_text}" if speaker and status_text else detail
+    script = REPO_ROOT / "scripts" / "sticks3-macos-bridge"
+
+    print(f"{title} | color={color}")
+    print("---")
+    print(f"State: {menu_escape(payload.get('state') or 'unknown')}")
+    if status_line:
+        print(f"Current: {menu_escape(status_line, limit=96)}")
+    if payload.get("tokens") is not None:
+        print(f"Tokens: {payload['tokens']}")
+    if payload.get("thread_name") or payload.get("thread_id"):
+        print(f"Thread: {menu_escape(payload.get('thread_name') or payload.get('thread_id'))}")
+    if payload.get("updated_at"):
+        print(f"Updated: {menu_escape(payload['updated_at'])}")
+    if payload.get("supervisor_pid"):
+        print(f"PID: {payload['supervisor_pid']}")
+    if payload.get("error"):
+        print(f"Error: {menu_escape(payload['error'], limit=96)}")
+    print("---")
+    print(f"Start bridge | bash={script} param1=start terminal=false refresh=true")
+    print(f"Stop bridge | bash={script} param1=stop terminal=false refresh=true")
+    print(f"Restart bridge | bash={script} param1=restart terminal=false refresh=true")
+    print("---")
+    print("Refresh | refresh=true")
+    print(f"Open repo | bash=/usr/bin/open param1={REPO_ROOT} terminal=false")
+    print(f"Open log | bash=/usr/bin/open param1={LOG_FILE} terminal=false")
+    return 0
+
+
+def add_bridge_options(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--log-level", default=os.environ.get("STICKS3_LOG_LEVEL", "INFO"))
+    parser.add_argument("--scan-timeout", type=float, default=float(os.environ.get("STICKS3_SCAN_TIMEOUT", "15")))
+    parser.add_argument("--poll-interval", type=float, default=float(os.environ.get("STICKS3_POLL_INTERVAL", "2")))
+    parser.add_argument(
+        "--heartbeat-interval",
+        type=float,
+        default=float(os.environ.get("STICKS3_HEARTBEAT_INTERVAL", "10")),
+    )
+    parser.add_argument("--device-prefix", default=os.environ.get("STICKS3_DEVICE_PREFIX", "Codex-S3-"))
+    parser.add_argument("--address", default=os.environ.get("STICKS3_ADDRESS"))
+    parser.add_argument("--codex-home", default=os.environ.get("STICKS3_CODEX_HOME"))
+    parser.add_argument("--sessions-dir", default=os.environ.get("STICKS3_SESSIONS_DIR"))
+    parser.add_argument("--thread-id", default=os.environ.get("STICKS3_THREAD_ID"))
+    parser.add_argument("--rollout", default=os.environ.get("STICKS3_ROLLOUT"))
+    parser.add_argument("--fake-device", action="store_true", default=os.environ.get("STICKS3_FAKE_DEVICE") == "1")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description="Manage the StickS3 Codex Desktop observer on macOS.")
+    subcommands = parser.add_subparsers(dest="command", required=True)
+
+    start = subcommands.add_parser("start", help="Start the background bridge process.")
+    add_bridge_options(start)
+    start.set_defaults(func=command_start)
+
+    run = subcommands.add_parser("run", help="Run the bridge in the foreground, for launchd.")
+    add_bridge_options(run)
+    run.set_defaults(func=command_run)
+
+    stop = subcommands.add_parser("stop", help="Stop the bridge process started by this supervisor.")
+    stop.set_defaults(func=command_stop)
+
+    restart = subcommands.add_parser("restart", help="Restart the supervised bridge process.")
+    add_bridge_options(restart)
+    restart.set_defaults(func=command_restart)
+
+    status = subcommands.add_parser("status", help="Print current bridge status.")
+    status.add_argument("--json", action="store_true")
+    status.set_defaults(func=command_status)
+
+    swiftbar = subcommands.add_parser("swiftbar", help="Print SwiftBar/xbar menu output.")
+    swiftbar.set_defaults(func=command_swiftbar)
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    return int(args.func(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

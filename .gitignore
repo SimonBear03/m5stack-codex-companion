@@ -3,6 +3,7 @@
 .venv/
 .bridge-venv/
 .vscode/
+runtime/
 *.bin
 *.elf
 *.map

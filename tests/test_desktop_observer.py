@@ -134,6 +134,36 @@ class DesktopObserverTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(any(item["speaker"] == "Tool" and item["text"] == "exec_command" for item in wire["activity"]))
             self.assertIn("Finished observer update", wire["entries"][0])
 
+    async def test_status_file_is_written_for_menu_bar_helpers(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            rollout = root / "rollout-thread-2.jsonl"
+            status_file = root / "runtime" / "bridge-status.json"
+            write_rollout(rollout, thread_id="thread-2", thread_source="user")
+            with rollout.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    event_line(
+                        {
+                            "timestamp": "2026-06-10T14:21:01.000Z",
+                            "type": "event_msg",
+                            "payload": {"type": "task_started", "turn_id": "turn-2"},
+                        }
+                    )
+                )
+
+            device = FakeStickS3Device()
+            bridge = DesktopObserverBridge(device=device, rollout_path=rollout, status_file=status_file)
+
+            self.assertTrue(await bridge.poll_once())
+            await bridge.send_snapshot()
+
+            status = json.loads(status_file.read_text(encoding="utf-8"))
+            self.assertEqual("connected", status["state"])
+            self.assertEqual("thread-2", status["thread_id"])
+            self.assertTrue(status["active"])
+            self.assertEqual({"speaker": "Codex", "kind": "working", "text": "Working"}, status["status"])
+            self.assertEqual("Working", status["detail"])
+
 
 if __name__ == "__main__":
     unittest.main()

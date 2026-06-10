@@ -85,6 +85,10 @@ def build_parser() -> argparse.ArgumentParser:
     )
     desktop_observer.add_argument("--poll-interval", type=float, default=2.0)
     desktop_observer.add_argument("--heartbeat-interval", type=float, default=10.0)
+    desktop_observer.add_argument(
+        "--status-file",
+        help="Write desktop-observer lifecycle/status JSON to this file for menu bar helpers.",
+    )
 
     return parser
 
@@ -119,10 +123,14 @@ async def run_desktop_observer(args: argparse.Namespace) -> None:
         thread_id=args.thread_id,
         poll_interval=args.poll_interval,
         heartbeat_interval=args.heartbeat_interval,
+        status_file=Path(args.status_file).expanduser() if args.status_file else None,
     )
 
     try:
         await bridge.run()
+    except Exception as exc:
+        bridge.write_status("error", error=str(exc))
+        raise
     finally:
         await device.close()
 

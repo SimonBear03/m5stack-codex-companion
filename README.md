@@ -8,15 +8,17 @@ The StickS3 is a BLE display for Codex activity on Simon's Mac. A local bridge c
 
 - One dense terminal-style dashboard screen.
 - Pinned top/status section:
-  - muted mode color: `RUN`, `IDLE`, `WAIT`, `STALE`, or `OFF`
-  - `NEW` marker when newer body text arrives while reading older text
+  - muted mode color: `WORK`, `IDLE`, `WAIT`, `STALE`, `ERR`, or `OFF`
+  - fixed 3x3 status matrix with mode-specific animation
+  - small amber unread dot when newer body text arrives while reading older text
   - BLE, USB, and battery indicators
 - Usage section:
   - `5h` and `7d` remaining percentages with compact bars
   - compact token totals such as `842`, `12.4K`, `57.6M`, or `1.2B`
 - Pinned current action line with speaker labels such as `Codex`, `User`, `Tool`, and `System`.
 - Scrollable wrapped body text backed by a fixed ring buffer, rendered as compact message blocks with colored speaker headers and blank separators.
-- Settings menu for brightness, sound, text navigation, text size, and auto-newest behavior.
+- Settings menu for brightness, power profile, sound, text navigation, and auto-newest behavior.
+- Battery-saving display behavior: dim first, then sleep after about 5 seconds in all modes when settings are closed and you are not reading older text.
 - Soft buzzer cues for activity, connected, completed, and disconnected/error events.
 - BLE `status`, `owner`, `name`, and `unpair` command handling.
 
@@ -34,7 +36,7 @@ True control of an already-open Codex Desktop app thread is blocked until Codex 
 As of 2026-06-10:
 
 - Firmware builds successfully with PlatformIO on Simon's Mac.
-- Firmware binary is about 790 KB, well within the direct-flash app size.
+- Firmware binary is about 1.09 MB, well within the direct-flash app size.
 - Physical StickS3 USB flashing has been validated.
 - The device advertises over BLE as `Codex-S3-0470` on Simon's StickS3.
 - The bridge connects over BLE and can mirror the current Codex Desktop thread with `desktop-observer`.
@@ -95,6 +97,47 @@ sticks3-bridge desktop-observer --fake-device
 sticks3-bridge app-server --transport stdio --fake-device --auto-decision deny
 ```
 
+## Mac Menu Bar Helper
+
+The repo includes a small macOS supervisor for the Desktop observer. It owns only
+the bridge process that it starts, and writes runtime state under `runtime/`:
+
+- `runtime/bridge.pid`
+- `runtime/bridge-status.json`
+- `runtime/bridge.log`
+
+Start and inspect it from the repo root:
+
+```bash
+scripts/sticks3-macos-bridge start
+scripts/sticks3-macos-bridge status
+scripts/sticks3-macos-bridge stop
+```
+
+The same helper can feed SwiftBar or xbar:
+
+```bash
+scripts/sticks3-macos-bridge swiftbar
+```
+
+To use it in SwiftBar, point SwiftBar's plugin folder at:
+
+```text
+/Users/simon/Documents/workspace/repos/sticks3-codex-companion/macos/swiftbar
+```
+
+The menu shows the bridge state, current Codex status, token count when present,
+and Start/Stop/Restart actions. The included plugin refreshes every 5 seconds.
+
+A LaunchAgent template is available at:
+
+```text
+macos/LaunchAgents/com.simon.sticks3-codex-companion.plist
+```
+
+Copy it to `~/Library/LaunchAgents/` and load it with `launchctl bootstrap` only
+when you want the bridge to start automatically at login.
+
 ## Controls
 
 Main dashboard:
@@ -102,7 +145,7 @@ Main dashboard:
 - Button A: newer/down through body text.
 - Button B: older/up through body text.
 - Long A: open settings.
-- Long B: jump to newest when reading older text and `NEW` is shown.
+- Long B: jump to newest when reading older text and the unread dot is shown; otherwise enter display sleep.
 - A+B: no-op in the dashboard firmware.
 
 Settings menu:
@@ -115,10 +158,21 @@ Settings menu:
 Settings, in order:
 
 - Brightness: `Low`, `Med`, `High`
+- Power: `Balanced`, `Saver`, `Max`
 - Sound: `Off`, `Soft`, `Alerts`
 - Text nav: `Page`, `Line`
-- Text size: `Compact`, `Readable`
 - Auto newest: `On`, `Off`
+
+The display automatically dims and then sleeps after about 5 seconds in all modes when there is no unread marker, settings are closed, and you are not reading older text. BLE remains active, so new Codex status/activity wakes the screen. Shake or button input also wakes it. Shake wake is ignored for the first 2.5 seconds after entering sleep so the device can be set down without immediately waking. `Max` power mode may enter ESP32 deep sleep after extended idle; wake by pressing the power/reset button.
+
+Battery optimizations in the firmware:
+
+- Lower LCD brightness levels tuned for battery use.
+- On-demand speaker: the speaker and AW8737 amplifier are shut down after cues.
+- Reduced redraws: unchanged heartbeat snapshots no longer redraw the screen.
+- Slower status animation and adaptive loop delays, including during `WORK`.
+- Lower BLE TX power, slower advertising intervals, and relaxed BLE connection parameters.
+- Status acknowledgements include battery percent, voltage/current when available, CPU clock, and power timing.
 
 ## Repository Shape
 
@@ -130,6 +184,10 @@ Settings, in order:
 │   └── protocol.md
 ├── bridge/
 │   └── sticks3_bridge/
+├── macos/
+│   ├── LaunchAgents/
+│   └── swiftbar/
+├── scripts/
 ├── src/
 │   └── main.cpp
 ├── tests/

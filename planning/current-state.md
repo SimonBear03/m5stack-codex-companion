@@ -1,7 +1,7 @@
 # Current State
 
 Created: 2026-06-09
-Updated: 2026-06-10
+Updated: 2026-06-11
 
 ## Goal
 
@@ -14,15 +14,17 @@ The target experience is Codex app on Mac first, not Codex CLI compatibility.
 The StickS3 should act as a compact terminal-style status device:
 
 - One main dashboard screen, not a multi-page app.
-- Pinned top/status section with muted mode color, `NEW`, BLE/USB/battery state, `5h` and `7d` remaining bars, compact tokens, and the newest current action.
-- Scrollable wrapped body text for recent Codex activity, rendered as compact message blocks with colored speaker headers and blank separators.
-- Speaker labels in current status and body text: `User`, `Codex`, `Tool`, `System`, and subagent names if exposed later.
+- Pinned top/status section with muted mode color, flat 3x3 status animation matrix, small unread dot, BLE/USB/battery state, `5h` and `7d` remaining bars, compact tokens, and the newest current action.
+- Scrollable wrapped body text for recent conversation activity, rendered as compact message blocks with colored speaker headers and blank separators.
+- Speaker labels in current status and body text: `User`, `Codex`, `System`, and subagent names if exposed later. Tool events stay in the pinned current status and do not enter scrollback.
 - Button A moves newer/down through body text.
 - Button B moves older/up through body text.
 - Long A opens/closes settings.
-- Long B jumps to newest when reading older text and `NEW` is available.
-- Settings include brightness, sound, text navigation, text size, and auto-newest.
+- Long B jumps to newest when reading older text and the unread dot is visible; otherwise it enters display sleep.
+- Settings include brightness, power profile, sound, text navigation, and auto-newest.
+- Display dims and auto-sleeps after about 5 seconds in all modes when no unread marker is present, settings are closed, and the user is not reading older text.
 - Soft, office-safe sound cues for activity and important state changes.
+- Firmware attempts to turn off the PMIC/internal green board status LED at boot.
 - Read-only operation for the current Codex Desktop workflow.
 
 ## Architecture Decision
@@ -53,6 +55,9 @@ The current product path is status mirroring through `desktop-observer`. True co
 - `docs/mac-codex-app-bridge.md` - Mac Codex bridge flow and limitations.
 - `docs/cardputer-references.md` - Cardputer references and design takeaways for small-screen UX.
 - `bridge/sticks3_bridge/` - Python bridge for Desktop observer and App Server JSON-RPC.
+- `scripts/sticks3-macos-bridge` - macOS supervisor for starting, stopping, and reporting Desktop observer state.
+- `macos/swiftbar/sticks3-codex.5s.sh` - SwiftBar/xbar menu plugin that displays bridge state and exposes Start/Stop/Restart.
+- `macos/LaunchAgents/com.simon.sticks3-codex-companion.plist` - launch-at-login template for the supervisor.
 - `tests/` - Python protocol and bridge tests.
 - `platformio.ini` - PlatformIO config targeting ESP32-S3 Arduino with M5Unified, M5PM1, ArduinoJson, and NimBLE-Arduino.
 - `src/main.cpp` - current firmware implementation:
@@ -61,8 +66,17 @@ The current product path is status mirroring through `desktop-observer`. True co
   - JSON line parser.
   - one-screen dashboard renderer.
   - structured `status` and `activity` snapshot handling.
-  - wrapped activity ring buffer with page/line navigation, colored message headers, and blank message separators.
+  - raw activity message cache plus wrapped activity ring buffer with page/line navigation, colored message headers, and blank message separators.
+  - compact text wraps from raw message text using rendered pixel width.
+  - 1000-character desktop observer activity cap with 4 recent activity records per snapshot.
+  - 8192-byte firmware JSON line receive buffer.
+  - smart punctuation normalization before device display.
+  - tool activity filtering so tool events update pinned status without filling scrollback.
   - settings menu and persisted dashboard settings.
+  - display sleep with long-B shortcut, delayed shake wake, BLE wake, and work/new-activity wake.
+  - battery-saving power profiles: Balanced, Saver, Max.
+  - cached battery telemetry with voltage/current status ack fields.
+  - lower brightness levels, auto-dim, on-demand speaker/amp shutdown, reduced redraws, adaptive loop delays, BLE TX/interval tuning, and optional long-idle deep sleep in Max mode.
   - soft buzzer cues.
   - status command ack.
   - owner/name/unpair command ack.
@@ -74,12 +88,15 @@ This repo has completed successful firmware builds on Simon's Mac with repo-loca
 Current validation:
 
 - `.venv/bin/pio run` succeeds on Simon's Mac.
-- `PYTHONPATH=bridge python3 -m unittest discover -s tests` succeeds with 23 tests.
-- Firmware binary is about 790 KB.
-- USB flashing to `/dev/cu.usbmodem101` and `/dev/cu.usbmodem2101` has succeeded previously.
+- `.bridge-venv/bin/python -m unittest discover -s tests` succeeds with 25 tests.
+- Firmware binary is about 1.09 MB.
+- USB flashing to `/dev/cu.usbmodem101` and `/dev/cu.usbmodem2101` has succeeded.
 - BLE status validation has succeeded; Simon's device replies as `Codex-S3-0470`.
 - `desktop-observer` parses local Codex Desktop rollouts, skips newer subagent rollouts by default, normalizes token/rate-limit events, and emits structured `status`/`activity` snapshots.
+- `desktop-observer` can write a status JSON file for the macOS menu bar helper.
+- `scripts/sticks3-macos-bridge` provides supervised start/stop/restart/status and SwiftBar/xbar output without killing manually started bridge processes.
 - The old flicker issue was addressed by drawing to an `M5Canvas` sprite and pushing only on redraw.
+- The battery pass builds and adds 5-second all-mode display sleep, power profiles, telemetry, speaker amp shutdown, redraw throttling, adaptive loop delay, and BLE power tuning.
 
 M5Launcher notes:
 
@@ -95,6 +112,7 @@ Generated local folders are intentionally ignored:
 - `.bridge-venv/`
 - `.pio/`
 - `.platformio/`
+- `runtime/`
 
 They should be recreated on the next machine.
 
@@ -143,6 +161,19 @@ python -m pip install -e .
 sticks3-bridge --log-level INFO desktop-observer --scan-timeout 15
 ```
 
+Menu bar helper setup after the bridge venv exists:
+
+```bash
+scripts/sticks3-macos-bridge start
+scripts/sticks3-macos-bridge status
+```
+
+SwiftBar/xbar can use this plugin folder:
+
+```text
+/Users/simon/Documents/workspace/repos/sticks3-codex-companion/macos/swiftbar
+```
+
 ## Validation Plan
 
 1. Compile firmware without errors.
@@ -155,9 +186,16 @@ sticks3-bridge --log-level INFO desktop-observer --scan-timeout 15
 8. Confirm body text wraps and no longer truncates to one row.
 9. Confirm Button A moves newer/down and Button B moves older/up.
 10. Confirm long A opens settings, Button B cycles options, Button A rotates values, and long A closes settings.
-11. Confirm long B jumps to newest when `NEW` is shown.
-12. Confirm sound modes are quiet and not repetitive.
-13. Confirm no old pet wording, screens, stats, or animations remain.
+11. Confirm long B jumps to newest when the unread dot is shown.
+12. Confirm long B enters display sleep when not reading old text.
+13. Confirm display dims and auto-sleeps after about 5 seconds in WORK, IDLE, WAIT, STALE, ERR, and OFF modes when not reading old text.
+14. Confirm sound modes are quiet and not repetitive.
+15. Confirm no old pet wording, screens, stats, or animations remain.
+16. Confirm `scripts/sticks3-macos-bridge start/status/stop` controls the bridge when no manual observer is already running.
+17. Confirm the SwiftBar/xbar plugin shows `S3 Link`, `S3 Idle`, `S3 Work`, and `S3 Err` states correctly.
+18. Confirm new BLE activity and shake wake the display after auto sleep.
+19. Confirm speaker noise is gone or reduced after cue playback.
+20. Confirm battery telemetry appears in status ack and settings footer.
 
 ## Known Risks
 
@@ -166,8 +204,10 @@ sticks3-bridge --log-level INFO desktop-observer --scan-timeout 15
 - The public Codex App Server protocol does not guarantee passive observation of every already-open desktop-app panel.
 - `desktop-observer` reads local rollout logs and is status-only; it cannot approve, answer prompts, or interrupt the active Desktop UI.
 - Token totals are session/event dependent and may remain unavailable until Codex Desktop writes token events.
+- Chinese display is in test mode: UTF-8 travels through BLE/JSON, dashboard text uses `efontCN_14` for both ASCII and non-ASCII body/current-status text, and wrapping is UTF-8/pixel-width aware. Broader CJK typography and mixed-language polish still need hardware validation.
+- The internal green LED off path uses the M5PM1 PMIC API and still needs hardware validation; boot/download indicator behavior may be hardware-controlled.
 - M5Launcher WebUI install is not currently reliable for this no-SD StickS3 workflow.
 
 ## Immediate Next Engineering Task
 
-Flash the redesigned dashboard firmware to the physical StickS3, start `desktop-observer`, and validate layout, scrolling, settings, `NEW`, and sound behavior on hardware.
+Validate the latest dashboard, battery, and Mac helper pass on hardware: revised top bar mode colors, smoother flat 3x3 status animation matrix, PMIC green LED off attempt, unread marker, 14px CJK-capable dashboard text, longer message scrollback, smart punctuation, tool-status filtering, 5-second all-mode display sleep, new activity/shake wake behavior, audible soft sound cues, speaker noise reduction, battery telemetry, and the SwiftBar/xbar bridge supervisor workflow.
