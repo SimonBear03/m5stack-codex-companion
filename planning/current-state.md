@@ -6,7 +6,7 @@ Created: 2026-06-09
 
 Build Simon's first custom M5Stack StickS3 program: a Codex companion display that can connect over BLE, show what Codex is doing, show completed/recent activity, and eventually surface useful usage information.
 
-The target experience is Codex app compatibility first, not only Codex CLI compatibility.
+The target experience is Codex app on Mac first, not Codex CLI compatibility.
 
 ## Product Intent
 
@@ -18,13 +18,19 @@ The StickS3 should act as a tiny external status surface:
 - Show approval prompts if the host sends them.
 - Use Button A for approve/next.
 - Use Button B for deny/next.
-- Show `tokens_today`, total tokens, and remaining usage percentage if the host sends those fields.
+- Put Codex 5-hour and 7-day remaining usage percentages on the first page.
+- Show the current Codex plan step when the App Server sends plan updates.
+- Show the current Codex thread goal when the App Server sends goal updates.
 
-Exact account-wide usage remaining is not yet a guaranteed data source. The firmware accepts remaining-usage fields, but we still need to prove whether Codex app developer-mode BLE or another host bridge can send the real value.
+The Mac bridge reads App Server `account/rateLimits/read`, where the current Codex bucket exposes primary and secondary rolling windows. The observed durations are 300 minutes and 10080 minutes, displayed on-device as `5h` and `7d`.
+
+The Mac bridge also listens for App Server `turn/plan/updated`, `thread/goal/updated`, and `thread/goal/cleared` notifications. It forwards compact plan and goal summaries to the StickS3.
 
 ## Architecture Decision
 
-Use the CodeBuddy/Codex hardware-buddy BLE protocol shape directly.
+Use a bridge-first architecture.
+
+Public OpenAI docs document Codex App Server as the rich-client protocol for Codex and document command/file approval requests over JSON-RPC. They do not document native Codex desktop BLE hardware pairing. The StickS3 therefore speaks a small JSONL-over-BLE device protocol, while the Mac bridge maps that protocol to a Codex App-compatible App Server endpoint.
 
 The StickS3 advertises a BLE name starting with `Codex-` and exposes Nordic UART Service:
 
@@ -38,6 +44,10 @@ Payloads are newline-delimited JSON objects.
 
 - `README.md` - project overview, build path, controls, pairing path.
 - `docs/protocol.md` - BLE UUIDs and JSON message format.
+- `docs/mac-codex-app-bridge.md` - Mac Codex app bridge flow and limitations.
+- `docs/cardputer-references.md` - Cardputer references and design takeaways for small-screen UX.
+- `bridge/sticks3_bridge/` - Python bridge for App Server JSON-RPC to StickS3 BLE.
+- `tests/` - Python protocol tests.
 - `platformio.ini` - PlatformIO config targeting ESP32-S3 Arduino with M5Unified and ArduinoJson.
 - `src/main.cpp` - initial firmware implementation:
   - BLE advertising as `Codex-S3-XXXX`.
@@ -47,18 +57,20 @@ Payloads are newline-delimited JSON objects.
   - status command ack.
   - owner/name/unpair command ack.
   - approval/deny responses.
-  - four display pages: dashboard, recent entries, usage, system.
+  - six display pages: limits, status, plan, goal, recent entries, system.
 
 ## Current Build State
 
-This repo has not yet completed a successful firmware build on Simon's Mac.
+This repo has completed a successful firmware build in the VPS workspace with repo-local PlatformIO. Simon's Mac should recreate the local toolchain using the setup steps below.
 
 What happened:
 
 - Homebrew `brew install platformio` failed because Homebrew does not support the current pre-release macOS 27 environment.
 - A repo-local Python venv was created at `.venv/`.
-- PlatformIO was installed into `.venv/`.
-- First `pio run` started downloading ESP32 PlatformIO packages into `.platformio/`, but the build was interrupted before completion.
+- PlatformIO was installed into `.venv/` on the VPS.
+- `.venv/bin/pio run` succeeded on the VPS.
+- `.venv/bin/python -m unittest discover -s tests` succeeded with 11 tests.
+- A fake-device App Server smoke test initialized `codex app-server --stdio` and received `5h` / `7d` rate-limit windows from `account/rateLimits/read`.
 
 Generated local folders are intentionally ignored:
 
@@ -103,30 +115,33 @@ pio run --target upload
 
 If upload cannot connect, put StickS3 into download mode by holding the side reset/power button until the internal green LED blinks, then retry upload.
 
+## Next Validation
+
+- Flash the firmware to the physical StickS3.
+- Run the Python bridge on Simon's Mac.
+- Confirm BLE scanning finds the `Codex-S3-XXXX` device.
+- Point the bridge at the Mac Codex app/App Server endpoint.
+- Trigger a command or file approval in Codex and confirm Button A accepts and Button B declines.
+- Confirm the first device page shows `5h` and `7d` remaining values from the host.
+
 ## Validation Plan
 
 1. Compile firmware without errors.
 2. Upload to StickS3.
 3. Confirm screen shows `Advertise Codex-S3-XXXX`.
 4. Scan BLE from Mac/iPhone and verify the device advertises as `Codex-S3-XXXX`.
-5. Enable Codex app developer mode:
-   - Help -> Troubleshooting -> Enable Developer Mode.
-6. Try to pair the Codex app hardware-buddy BLE path to the StickS3.
-7. If direct app pairing works:
-   - Confirm state snapshots render.
-   - Confirm recent activity renders.
-   - Confirm approval prompts and Button A/B responses work.
-8. If direct app pairing does not work:
-   - Build a small Mac bridge using `codex app-server`.
-   - Have the bridge send the same JSON snapshots to the StickS3 over BLE.
+5. Install bridge dependencies on Mac with `python -m pip install -e .`.
+6. Run `sticks3-bridge app-server --transport ws --target <mac-codex-app-server-endpoint>`.
+7. Confirm the bridge sends snapshots to the StickS3.
+8. Trigger command/file approvals through the Codex app/app-server endpoint and confirm Button A accepts and Button B declines.
 
 ## Known Risks
 
-- StickS3 PlatformIO board support may require tuning. Current config uses `esp32-s3-devkitc-1` plus StickS3-relevant flags.
+- StickS3 PlatformIO board support may require tuning. Current config uses M5Stack's documented `esp32-s3-devkitc-1` PlatformIO shape plus StickS3-relevant flags.
 - M5Unified APIs may differ from assumptions in `src/main.cpp`, especially button names, battery APIs, or display setup.
-- Codex app hardware-buddy BLE support is developer-mode and not guaranteed to be stable.
-- Exact account usage remaining may not be available through a stable personal API; firmware can only display it if the host sends it.
+- The public Codex App Server protocol does not guarantee passive observation of every already-open desktop-app panel.
+- Exact account usage remaining depends on the App Server endpoint exposing `account/rateLimits/read` and `account/rateLimits/updated`.
 
 ## Immediate Next Engineering Task
 
-Run `pio run` on a machine with a working PlatformIO setup and fix compile errors in `src/main.cpp` until the firmware builds.
+Run `pio run` on a machine with a working PlatformIO setup and fix compile errors in `src/main.cpp` until the firmware builds. Then validate the bridge against the Mac Codex app/app-server endpoint.

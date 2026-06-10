@@ -1,6 +1,8 @@
 # Protocol
 
-This firmware implements the CodeBuddy/Codex hardware-buddy BLE shape.
+This firmware implements a small bridge protocol for the StickS3 Codex companion.
+
+The BLE side is intentionally device-local and simple. It is not an official OpenAI BLE protocol. The Mac bridge maps between this protocol and the documented Codex App Server JSON-RPC approval/event protocol.
 
 ## BLE
 
@@ -14,6 +16,8 @@ Advertise a name starting with `Codex-` over Nordic UART Service.
 
 Messages are UTF-8 JSON objects, one per line, terminated with `\n`.
 
+BLE notifications and writes are chunked. Use 20-byte chunks unless the host and device negotiate and test a larger MTU.
+
 ## Status Snapshot
 
 The device accepts snapshots like:
@@ -26,7 +30,37 @@ The device accepts snapshots like:
   "msg": "approve: Bash",
   "entries": ["10:42 git push", "10:41 yarn test"],
   "tokens": 184502,
-  "tokens_today": 31200,
+  "rate_limits": {
+    "primary": {
+      "label": "5h",
+      "used_percent": 8,
+      "remaining_percent": 92,
+      "window_mins": 300,
+      "resets_at": 1781034181
+    },
+    "secondary": {
+      "label": "7d",
+      "used_percent": 31,
+      "remaining_percent": 69,
+      "window_mins": 10080,
+      "resets_at": 1781140479
+    }
+  },
+  "plan": {
+    "available": true,
+    "step": "Patch the firmware",
+    "status": "inProgress",
+    "completed": 1,
+    "total": 3
+  },
+  "goal": {
+    "available": true,
+    "objective": "Implement the StickS3 Codex companion",
+    "status": "active",
+    "time_used_sec": 3661,
+    "tokens_used": 12345,
+    "token_budget": 20000
+  },
   "prompt": {
     "id": "req_abc123",
     "tool": "Bash",
@@ -35,7 +69,7 @@ The device accepts snapshots like:
 }
 ```
 
-Optional usage fields accepted by this firmware:
+Legacy usage fields accepted by this firmware:
 
 ```json
 {
@@ -73,6 +107,29 @@ or:
 {"cmd":"permission","id":"req_abc123","decision":"deny"}
 ```
 
+The bridge maps `once` to Codex App Server `accept` and `deny` to `decline` for command and file-change approvals.
+
+## Rate Limits
+
+Codex App Server exposes rolling Codex rate-limit windows through `account/rateLimits/read` and `account/rateLimits/updated`. The current observed Codex bucket uses:
+
+- primary window: 300 minutes, displayed as `5h`
+- secondary window: 10080 minutes, displayed as `7d`
+
+The StickS3 limits page displays remaining percentage for those two windows. App Server sends `usedPercent`; the bridge converts it to `remaining_percent`.
+
+## Plan and Goal
+
+The bridge forwards App Server `turn/plan/updated` as a compact `plan` object. It selects the in-progress step first, then the next pending step, then the latest completed step.
+
+The bridge forwards App Server `thread/goal/updated` as a compact `goal` object. When App Server sends `thread/goal/cleared`, the bridge sends:
+
+```json
+{"goal":{"available":false}}
+```
+
+The firmware keeps old plan/goal state only when those fields are absent. An explicit `available:false` clears the corresponding page.
+
 ## Status Command
 
 When host sends:
@@ -105,3 +162,24 @@ The device replies:
   }
 }
 ```
+
+## Codex App Server Mapping
+
+The Mac bridge consumes these app-server requests:
+
+- `item/commandExecution/requestApproval`
+- `item/fileChange/requestApproval`
+
+It renders the request as a StickS3 `prompt`, waits for Button A/B, and replies to the app-server request with the documented decision payload.
+
+The bridge also listens for status and item notifications and renders them as snapshots:
+
+- `account/rateLimits/updated`
+- `thread/status/changed`
+- `turn/plan/updated`
+- `thread/goal/updated`
+- `thread/goal/cleared`
+- `item/started`
+- `item/completed`
+- `thread/tokenUsage/updated`
+- `serverRequest/resolved`
