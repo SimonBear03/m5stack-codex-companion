@@ -8,7 +8,7 @@ Public OpenAI docs describe Codex App Server as the protocol used for rich clien
 
 There are two bridge modes:
 
-- `desktop-observer`: read-only status mirroring for the actual Codex Desktop app. It follows local rollout JSONL files under `~/.codex/sessions`, prefers non-subagent Desktop threads, and forwards active/idle state, speaker-labeled activity, token totals, and rate limits when those events are present.
+- `desktop-observer`: read-only status mirroring for the actual Codex Desktop app. It follows local rollout JSONL files under `~/.codex/sessions`, prefers non-subagent Desktop threads for activity, and forwards active/idle state, speaker-labeled activity, token totals, and rate limits. Rate-limit rows are seeded from recent `token_count` events across rollout files.
 - `app-server`: JSON-RPC validation path for an App Server endpoint. It can still exercise approval and choice mapping in the Python bridge, but the current dashboard firmware is read-only.
 
 True control of an already-open Codex Desktop app thread is currently blocked by product surface, not by StickS3 firmware. On Simon's Mac, Codex Desktop is running private `stdio://` app-server processes and the default app-server control socket `/Users/simon/.codex/app-server-control/app-server-control.sock` is not present. Public docs describe how to expose an App Server transport, but not how third-party hardware can attach to an existing Desktop thread.
@@ -35,7 +35,7 @@ sticks3-bridge desktop-observer --thread-id <thread-id>
 sticks3-bridge desktop-observer --rollout ~/.codex/sessions/.../rollout-....jsonl
 ```
 
-Observer mode is intentionally read-only. It mirrors status, activity, usage bars, and token totals. It cannot approve prompts, answer prompts, or interrupt turns in the Codex Desktop UI.
+Observer mode is intentionally read-only. It mirrors status, activity, usage bars, and token totals. Activity follows the selected/current thread, while the `5h` and `7d` usage bars are account-level and can be seeded from recent rollout `token_count` events before the current thread starts a new task. The StickS3 `Detail` setting controls how much text the bridge sends: `Full` sends message activity, `Status` suppresses body text, and `Usage` sends generic state plus usage only, without legacy `msg`/`entries` text. Observer mode cannot approve prompts, answer prompts, or interrupt turns in the Codex Desktop UI.
 
 The bridge can attach to a running App Server endpoint:
 
@@ -73,8 +73,8 @@ Keep this separate from the PlatformIO `.venv/` if that environment was created 
 
 ## Menu Bar Supervisor
 
-The macOS helper wraps `desktop-observer` with a PID file, status JSON, and log
-file so it can be controlled from a menu bar app:
+The native `StickS3 Companion.app` wraps `desktop-observer` with a PID file,
+status JSON, and log file so it can be controlled from the macOS menu bar:
 
 ```bash
 scripts/sticks3-macos-bridge start
@@ -88,52 +88,93 @@ Runtime files live in `runtime/` and are ignored by Git:
 - `bridge.pid`: the process started by the supervisor
 - `bridge-status.json`: lifecycle, current status, thread, tokens, rate limits, and latest device telemetry when the StickS3 replies to `status`
 - `bridge.log`: bridge stdout/stderr from background starts
-- `StickS3Bridge.app`: generated macOS app wrapper for Bluetooth permission
+
+The generated Bluetooth-permission wrapper is installed outside the repo at
+`~/Applications/StickS3Bridge.app` so macOS sees one stable app identity across
+menu refreshes and bridge restarts.
+
+The bridge retries BLE scan/connect/write failures by default. Normal device
+sleep, advertising delays, or transient disconnects should move the helper
+through `Codex Wait/Work · S3 Scan` and back to `Codex Idle/Work · S3 BLE`
+without a manual restart. BLE liveness is checked while idle so a closed link is
+noticed before the next long heartbeat, and retry backoff is kept short for
+faster wake/reconnect. Default BLE scans match named `Codex-S3-*` devices only,
+not arbitrary Nordic UART Service peripherals. After a BLE connect, the bridge
+re-polls Codex state, sends a compact first sync packet, sends the latest full
+snapshot, then asks the device for settings/status. The firmware top bar shows
+`SYNC` until that first valid snapshot is parsed.
 
 The helper does not search for and kill unrelated `sticks3-bridge` processes. If
 you started the observer manually in a terminal, stop that terminal process before
 switching to the supervisor so BLE is not claimed by two processes.
 
-SwiftBar must not launch Homebrew Python directly for BLE. New macOS TCC checks
-can kill that Python process because its app bundle lacks
-`NSBluetoothAlwaysUsageDescription`. The supervisor now generates and opens
-`runtime/StickS3Bridge.app`, a local app wrapper with the Bluetooth usage string,
-and runs the bridge inside that app process. If macOS prompts for Bluetooth
-access to `StickS3 Codex Bridge`, allow it.
-
-For SwiftBar/xbar, use the included plugin folder:
-
-```text
-/Users/simon/Documents/workspace/repos/sticks3-codex-companion/macos/swiftbar
-```
-
-The plugin calls:
+Build or update the native menu bar app from the repo root:
 
 ```bash
-scripts/sticks3-macos-bridge swiftbar
+scripts/build-macos-companion
 ```
+
+That installs a locally signed app at `~/Applications/StickS3 Companion.app`.
+Opening it queues `scripts/sticks3-macos-bridge ensure` when the bridge is
+stopped. The app reads `runtime/bridge-status.json` every 2 seconds and exposes
+Start, Stop, Restart, Open Log, Open Repo, Reveal Helper, and Quit actions. No
+paid Apple Developer account is needed for local use; the app is ad-hoc signed.
+
+The supervisor generates a stable local app wrapper at
+`~/Applications/StickS3Bridge.app` with the Bluetooth usage string. Its native
+executable embeds the bridge venv's Python runtime and runs the BLE bridge
+inside the app process, so Bluetooth permission belongs to `StickS3 Codex
+Bridge` instead of `Python.app`. The wrapper is reused and only rebuilt when
+generated contents change; this keeps macOS from seeing a new Bluetooth client
+on every menu refresh. If macOS prompts for Bluetooth access to `StickS3 Codex
+Bridge`, allow it.
+
+Because this repo lives under `~/Documents`, macOS may also ask once for folder
+access when the app reads the bridge code and local Codex rollout logs. That
+should be a one-time Files & Folders permission for `StickS3 Codex Bridge`.
+Repeated prompts usually mean the helper app was regenerated with a new identity,
+launched from a different bundle path, or the previous prompt was denied.
 
 The menu title is intentionally compact:
 
-- `S3 Off`: no supervised bridge process
-- `S3 Link`: starting or scanning
-- `S3 Idle`: connected but not actively working
-- `S3 Work`: Codex is active or the latest status is work-like
-- `S3 Err`: bridge error
+- `Codex Off · S3 Off`: no supervised bridge process
+- `Codex Wait · S3 Scan`: bridge is starting or scanning for the StickS3
+- `Codex Idle · S3 BLE`: Codex observer is current and BLE is connected
+- `Codex Work · S3 BLE`: Codex is active or the latest event is fresh work-like activity
+- `Codex Work · S3 Off/Scan`: Codex is active while the StickS3 is disconnected or reconnecting
+- `Codex Err · S3 Err`: bridge error
+
+`Codex Work` uses the same recent-work window as the StickS3 top bar. Tool
+calls, tool output, patches, task starts, and Codex messages keep the bridge in
+work state briefly even if Codex Desktop batches a later completion event into
+the same poll. Old rollout events are not replayed as live work on startup.
 
 The Start/Stop/Restart actions in the menu call the same supervisor script.
 
-For launch-at-login, copy the template:
+For launch-at-login, install the generated LaunchAgent:
 
 ```bash
-cp macos/LaunchAgents/com.simon.sticks3-codex-companion.plist ~/Library/LaunchAgents/
-launchctl bootstrap "gui/$(id -u)" ~/Library/LaunchAgents/com.simon.sticks3-codex-companion.plist
+scripts/sticks3-macos-bridge install-agent --scan-timeout 60
+scripts/sticks3-macos-bridge agent-status
 ```
 
-Unload it later with:
+The installer writes
+`~/Library/LaunchAgents/com.simon.sticks3-codex-companion.bridge.plist` and
+installs the generated helper app at `~/Applications/StickS3Bridge.app`. The
+bridge itself retries BLE failures forever by default, so normal StickS3 sleep,
+advertising delay, and transient disconnects should not require a restart.
+
+On newer macOS builds, launch-at-login is best-effort until the background item
+is accepted by the user. If `agent-status` reports installed/loaded while the
+bridge supervisor is still stopped, macOS blocked launchd before the bridge
+could start. Check System Settings -> General -> Login Items & Extensions and
+allow the StickS3/zsh background item. The native menu app remains the fallback
+controller when the background item is blocked. The supervisor's `start` command
+falls back to direct app-wrapper launch when LaunchAgent kickstart does not
+produce a PID. Unload and remove the LaunchAgent later with:
 
 ```bash
-launchctl bootout "gui/$(id -u)" ~/Library/LaunchAgents/com.simon.sticks3-codex-companion.plist
+scripts/sticks3-macos-bridge uninstall-agent
 ```
 
 ## Dashboard Mapping
@@ -141,8 +182,8 @@ launchctl bootout "gui/$(id -u)" ~/Library/LaunchAgents/com.simon.sticks3-codex-
 The bridge sends:
 
 - `status`: pinned newest action with `speaker`, `kind`, and `text`.
-- `activity`: scrollable body entries with stable `seq` IDs for dedupe.
-- `tokens`: optional compact token total.
+- `activity`: scrollable body entries with stable `seq` IDs for dedupe, sent only in `Detail Full`.
+- `tokens`: optional compact token total from the latest observed token event.
 - `rate_limits`: primary `5h` and secondary `7d` usage windows.
 
 Desktop observer event handling:
@@ -172,10 +213,11 @@ Settings menu:
 - Button A: rotate/toggle selected value.
 - Long A: close settings.
 - Auto-closes after 12 seconds of no input.
-- Settings options are brightness, power profile, sound, text navigation, and auto-newest.
-- The display auto-sleeps after about 10 seconds in normal modes when there is no unread marker, settings are closed, and you are not reading older text. There is no pre-sleep dimming step. Shake wake is armed 2.5 seconds after sleep starts, while button input and new Codex BLE activity can wake immediately.
-- Power profiles tune brightness behavior, animation cadence, loop delay, BLE TX/connection parameters, and optional long-idle deep sleep in `Max`.
-- `Travel` is an aggressive battery profile. After display sleep and a short idle window on battery, it requests M5PM1 PMIC shutdown. BLE cannot receive new Codex messages while the device is in that state.
+- Settings options are brightness, power profile, detail level, sound, text navigation, auto-newest, and rotation.
+- Detail supports `Full`, `Status`, and `Usage`. `Full` shows scrollable message activity. `Status` keeps generic current status but suppresses body text. `Usage` keeps usage/token/device state and generic work/idle state without transmitting message bodies, tool names, or legacy text fields.
+- Rotation supports `Auto`, `Lock`, `P`, `L`, `P180`, and `L180`; `Auto` uses the StickS3 IMU and reflows wrapped body text when the display switches between portrait and landscape.
+- `Always` keeps the display awake for desk use and is not downgraded by the low-battery auto policy. `Auto` and `Low` auto-sleep the display after about 10 seconds when there is no unread marker, settings are closed, and you are not reading older text. There is no pre-sleep dimming step. Shake wake is armed 2.5 seconds after sleep starts, while button input and new Codex BLE activity can wake immediately.
+- Power profiles tune brightness behavior, automatic display sleep, animation cadence, loop delay, BLE TX/connection parameters, and CPU speed while keeping BLE reachable.
 
 ## Usage Mapping
 
@@ -190,28 +232,29 @@ App Server reports `usedPercent`; the bridge sends both used and remaining perce
 
 Token totals are optional. The bridge listens for `thread/tokenUsage/updated` and forwards totals when the App Server emits them, but the device displays `TOK n/a` until that event is available.
 
-In `desktop-observer` mode, the bridge reads `event_msg` `token_count` events from rollout JSONL. Those events use `used_percent` and `window_minutes`; the observer normalizes them to the same device payload used by App Server mode.
+In `desktop-observer` mode, the bridge reads `event_msg` `token_count` events from rollout JSONL. Those events use `used_percent` and `window_minutes`; the observer normalizes them to the same device payload used by App Server mode. On startup and about every 5 seconds after that, it scans recently changed rollout files with a small file cache for the freshest `token_count` event, so reset/refill updates replace stale low-limit values quickly even if the current observed thread has not emitted its own usage event yet. The forwarded `tokens` value intentionally comes from `info.total_token_usage.total_tokens` in that event.
 
 ## Battery Behavior
 
-Battery-saving behavior is mostly firmware-local. The Mac bridge does not need to know when the display is asleep; BLE stays connected in normal display sleep and incoming snapshots can wake the screen. `Travel` mode is different because it powers the device down and drops BLE until the StickS3 is woken/restarted.
+Battery-saving behavior is mostly firmware-local. The Mac bridge does not need to know when the display is asleep; BLE stays connected in display sleep and incoming snapshots can wake the screen. Power profiles no longer enter ESP32 deep sleep or PMIC shutdown, because those states break the live monitor connection.
 
 The device now:
 
-- caches battery telemetry and samples it roughly every 30 seconds,
+- caches battery telemetry and samples it roughly every 5 seconds,
 - reports battery percent, voltage/current when supported, and CPU MHz in `status` acks,
 - lowers LCD brightness levels and defaults to lower settings on battery when no saved preference exists,
-- temporarily forces effective `Max` behavior at 20% battery or lower while preserving the saved profile,
+- temporarily forces effective `Low` behavior at 20% battery or lower while preserving the saved profile,
 - keeps hardware-validated soft speaker cues enabled through M5Unified's StickS3 speaker path without manually toggling the audio enable path from the unused-rail saver,
-- explicitly keeps PMIC LEDs and external 5V/boost off unless needed,
+- repeatedly turns off PMIC indicator LEDs without disabling speaker or power rails,
 - stops redraws for unchanged heartbeat snapshots,
+- clears partial BLE receive data on connect/disconnect and ignores malformed transport fragments without putting the dashboard into `ERR`,
 - slows animations and the main loop when idle/asleep, including during `WORK`,
 - lowers BLE transmit power and relaxes advertising/connection intervals according to the selected power profile,
-- enters display sleep after about 10 seconds in all modes when settings are closed, no unread marker is present, and you are not reading older text,
-- optionally enters ESP32 deep sleep in `Max` mode after extended idle, which disconnects BLE until the device is woken and reboots,
-- requests M5PM1 PMIC shutdown in `Travel` mode after idle display sleep for longer standby at the cost of BLE wake.
+- leaves automatic display sleep disabled in `Always` for desk use,
+- enters display sleep after about 10 seconds in `Auto` and `Low` when settings are closed, no unread marker is present, and you are not reading older text,
+- keeps BLE reachable in all power profiles; use the physical power button when you want to turn the StickS3 off.
 
-The Desktop observer also reduces battery impact by sending only new activity records after the first snapshot and by using a slower idle heartbeat. Active Codex turns still send immediately when the rollout changes.
+The Desktop observer also reduces battery impact by sending only new activity records after the first snapshot, omitting legacy text fields in lower detail modes, stripping message payloads in lower detail modes, skipping duplicate sanitized snapshots, and using a slower idle heartbeat. BLE JSONL chunks use acknowledged writes for reliability. Active or recently work-like Codex turns still send immediately when the rollout changes.
 
 ## Current Validation Status
 

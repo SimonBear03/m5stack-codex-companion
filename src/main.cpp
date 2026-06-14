@@ -24,13 +24,16 @@ constexpr uint8_t DASHBOARD_LINE_HEIGHT = 15;
 constexpr uint8_t TOP_BAR_HEIGHT = 17;
 constexpr uint32_t STATUS_ANIMATION_MS = 420;
 constexpr uint32_t WORK_ANIMATION_MS = 260;
-constexpr uint32_t POWER_TELEMETRY_MS = 30000;
+constexpr uint32_t POWER_TELEMETRY_MS = 5000;
 constexpr uint32_t SPEAKER_IDLE_OFF_MS = 180;
 constexpr uint32_t BLE_CONN_TUNE_DELAY_MS = 800;
+constexpr uint32_t BLE_ADVERTISING_ENSURE_MS = 10000;
 constexpr uint32_t PERIPHERAL_ENFORCE_MS = 30000;
-constexpr uint32_t MAX_POWER_DEEP_SLEEP_MS = 20UL * 60UL * 1000UL;
-constexpr uint32_t TRAVEL_SHUTDOWN_AFTER_MS = 15000;
-constexpr uint8_t LOW_BATTERY_POWER_MAX_PCT = 20;
+constexpr uint32_t ORIENTATION_CHECK_MS = 250;
+constexpr uint32_t ORIENTATION_STABLE_MS = 700;
+constexpr float ORIENTATION_MIN_G = 0.45f;
+constexpr float ORIENTATION_AXIS_MARGIN = 0.08f;
+constexpr uint8_t LOW_BATTERY_POWER_LOW_PCT = 20;
 constexpr size_t BODY_LINE_COUNT = 190;
 constexpr size_t RAW_ACTIVITY_COUNT = 8;
 constexpr size_t SEEN_SEQ_COUNT = 24;
@@ -56,20 +59,38 @@ enum TextNavMode : uint8_t {
   TEXT_NAV_LINE
 };
 
+enum DetailMode : uint8_t {
+  DETAIL_FULL = 0,
+  DETAIL_STATUS,
+  DETAIL_USAGE,
+  DETAIL_COUNT
+};
+
 enum SettingIndex : uint8_t {
   SETTING_BRIGHTNESS = 0,
   SETTING_POWER,
+  SETTING_DETAIL,
   SETTING_SOUND,
   SETTING_TEXT_NAV,
   SETTING_AUTO_NEWEST,
+  SETTING_ROTATION,
   SETTING_COUNT
 };
 
+enum RotationMode : uint8_t {
+  ROTATION_AUTO = 0,
+  ROTATION_LOCK,
+  ROTATION_PORTRAIT,
+  ROTATION_LANDSCAPE,
+  ROTATION_PORTRAIT_180,
+  ROTATION_LANDSCAPE_180
+};
+
 enum PowerMode : uint8_t {
-  POWER_BALANCED = 0,
-  POWER_SAVER,
-  POWER_MAX,
-  POWER_TRAVEL
+  POWER_ALWAYS = 0,
+  POWER_AUTO,
+  POWER_LOW,
+  POWER_COUNT
 };
 
 enum Cue : uint8_t {
@@ -82,6 +103,7 @@ enum Cue : uint8_t {
 
 enum StatusMode : uint8_t {
   MODE_OFF = 0,
+  MODE_SYNC,
   MODE_IDLE,
   MODE_WORK,
   MODE_WAIT,
@@ -106,10 +128,12 @@ struct RateLimitWindowState {
 
 struct SettingsState {
   uint8_t brightness = 1;
-  PowerMode power = POWER_BALANCED;
+  PowerMode power = POWER_ALWAYS;
+  DetailMode detail = DETAIL_FULL;
   SoundMode sound = SOUND_SOFT;
   TextNavMode textNav = TEXT_NAV_PAGE;
   bool autoNewest = true;
+  RotationMode rotation = ROTATION_AUTO;
   uint8_t selected = 0;
   bool open = false;
   uint32_t lastInputMs = 0;
@@ -124,9 +148,12 @@ struct ActivityRecord {
 struct PowerTelemetry {
   int pct = -1;
   int voltageMv = -1;
+  int vbusMv = -1;
   int currentMa = 0;
   bool hasCurrent = false;
   bool usb = false;
+  bool charging = false;
+  bool chargeKnown = false;
   uint32_t sampledMs = 0;
 };
 
@@ -171,6 +198,7 @@ ButtonTracker buttonB;
 AppState app;
 String rxBuffer;
 bool bleConnected = false;
+bool awaitingSnapshot = false;
 bool needsRedraw = true;
 bool comboActive = false;
 Cue pendingCue = CUE_NONE;
@@ -180,14 +208,18 @@ uint32_t lastShakeCheckMs = 0;
 uint32_t sleepEnteredMs = 0;
 uint32_t speakerOffAtMs = 0;
 uint32_t bleTuneRequestedMs = 0;
+uint32_t lastAdvertisingEnsureMs = 0;
 uint32_t lastPeripheralEnforceMs = 0;
+uint32_t lastOrientationCheckMs = 0;
+uint32_t orientationCandidateSinceMs = 0;
+uint8_t displayRotation = 0;
+uint8_t orientationCandidate = 0;
 bool displaySleeping = false;
 bool displayDimmed = false;
 bool accelPrimed = false;
 bool pmicReady = false;
 bool speakerOutputActive = false;
 bool bleConnParamsPending = false;
-bool travelShutdownStarted = false;
 float lastAx = 0.0f;
 float lastAy = 0.0f;
 float lastAz = 0.0f;
@@ -256,15 +288,51 @@ String fitText(String text, size_t limit) {
   return utf8SubstringChars(text, limit > 3 ? limit - 3 : limit) + "...";
 }
 
-bool readUsbPowered() {
-  const int16_t vbusMv = M5.Power.getVBUSVoltage();
-  return M5.Power.isCharging() == 1 || vbusMv > 4000;
+int batteryPercentFromVoltage(int mv) {
+  if (mv <= 0) {
+    return -1;
+  }
+  if (mv >= 4150) {
+    return 100;
+  }
+  if (mv <= 3300) {
+    return 0;
+  }
+  return constrain(static_cast<int>((mv - 3300) * 100 / 850), 0, 100);
+}
+
+int readBatteryVoltageMv() {
+  const int16_t voltage = M5.Power.getBatteryVoltage();
+  if (voltage > 0) {
+    return voltage;
+  }
+  if (pmicReady) {
+    uint16_t pmicVoltage = 0;
+    if (pm1.readVbat(&pmicVoltage) == M5PM1_OK && pmicVoltage > 0) {
+      return pmicVoltage;
+    }
+  }
+  return -1;
+}
+
+int readVbusVoltageMv() {
+  const int16_t voltage = M5.Power.getVBUSVoltage();
+  if (voltage > 0) {
+    return voltage;
+  }
+  if (pmicReady) {
+    uint16_t pmicVoltage = 0;
+    if (pm1.readVin(&pmicVoltage) == M5PM1_OK && pmicVoltage > 0) {
+      return pmicVoltage;
+    }
+  }
+  return -1;
 }
 
 int readBatteryPercent() {
   const int level = M5.Power.getBatteryLevel();
   if (level < 0 || level > 100) {
-    return -1;
+    return batteryPercentFromVoltage(readBatteryVoltageMv());
   }
   return level;
 }
@@ -277,18 +345,27 @@ bool samplePowerTelemetry(bool force = false) {
 
   const int oldPct = powerTelemetry.pct;
   const bool oldUsb = powerTelemetry.usb;
+  const bool oldCharging = powerTelemetry.charging;
+  const bool oldChargeKnown = powerTelemetry.chargeKnown;
   const int oldVoltage = powerTelemetry.voltageMv;
+  const int oldVbus = powerTelemetry.vbusMv;
 
   powerTelemetry.pct = readBatteryPercent();
-  const int16_t voltage = M5.Power.getBatteryVoltage();
-  powerTelemetry.voltageMv = voltage > 0 ? voltage : -1;
+  powerTelemetry.voltageMv = readBatteryVoltageMv();
+  powerTelemetry.vbusMv = readVbusVoltageMv();
   const int32_t current = M5.Power.getBatteryCurrent();
-  powerTelemetry.hasCurrent = current > -2000 && current < 2000;
+  powerTelemetry.hasCurrent = current != 0 && current > -2000 && current < 2000;
   powerTelemetry.currentMa = powerTelemetry.hasCurrent ? static_cast<int>(current) : 0;
-  powerTelemetry.usb = readUsbPowered();
+  const auto chargeState = M5.Power.isCharging();
+  const bool currentSaysCharging = powerTelemetry.hasCurrent && powerTelemetry.currentMa > 15;
+  powerTelemetry.chargeKnown = chargeState != m5::Power_Class::charge_unknown || powerTelemetry.hasCurrent;
+  powerTelemetry.charging = chargeState == m5::Power_Class::is_charging || currentSaysCharging;
+  powerTelemetry.usb = powerTelemetry.charging || powerTelemetry.vbusMv > 4000;
   powerTelemetry.sampledMs = now;
 
-  return oldPct != powerTelemetry.pct || oldUsb != powerTelemetry.usb || abs(oldVoltage - powerTelemetry.voltageMv) >= 50;
+  return oldPct != powerTelemetry.pct || oldUsb != powerTelemetry.usb || oldCharging != powerTelemetry.charging ||
+         oldChargeKnown != powerTelemetry.chargeKnown || abs(oldVoltage - powerTelemetry.voltageMv) >= 50 ||
+         abs(oldVbus - powerTelemetry.vbusMv) >= 50;
 }
 
 int batteryPercent() {
@@ -303,6 +380,13 @@ bool isUsbPowered() {
     samplePowerTelemetry(true);
   }
   return powerTelemetry.usb;
+}
+
+bool isBatteryCharging() {
+  if (powerTelemetry.sampledMs == 0) {
+    samplePowerTelemetry(true);
+  }
+  return powerTelemetry.chargeKnown && powerTelemetry.charging;
 }
 
 uint16_t rgb(uint8_t r, uint8_t g, uint8_t b) {
@@ -326,6 +410,9 @@ StatusMode currentStatusMode() {
   if (!bleConnected) {
     return MODE_OFF;
   }
+  if (awaitingSnapshot) {
+    return MODE_SYNC;
+  }
   if (app.lastSnapshotMs > 0 && millis() - app.lastSnapshotMs > STALE_AFTER_MS) {
     return MODE_STALE;
   }
@@ -340,18 +427,14 @@ StatusMode currentStatusMode() {
 
 bool lowBatteryPowerSaveActive() {
   const int pct = batteryPercent();
-  return !isUsbPowered() && pct >= 0 && pct <= LOW_BATTERY_POWER_MAX_PCT && app.settings.power < POWER_MAX;
+  return !isUsbPowered() && pct >= 0 && pct <= LOW_BATTERY_POWER_LOW_PCT && app.settings.power == POWER_AUTO;
 }
 
 PowerMode effectivePowerMode() {
   if (lowBatteryPowerSaveActive()) {
-    return POWER_MAX;
+    return POWER_LOW;
   }
   return app.settings.power;
-}
-
-bool travelModeActive() {
-  return app.settings.power == POWER_TRAVEL;
 }
 
 uint16_t statusColor(StatusMode mode) {
@@ -360,6 +443,8 @@ uint16_t statusColor(StatusMode mode) {
       return rgb(122, 36, 48);
     case MODE_OFF:
       return rgb(8, 9, 10);
+    case MODE_SYNC:
+      return rgb(34, 63, 78);
     case MODE_STALE:
       return rgb(75, 66, 106);
     case MODE_WAIT:
@@ -378,6 +463,8 @@ String modeLabel(StatusMode mode) {
       return "ERR";
     case MODE_OFF:
       return "OFF";
+    case MODE_SYNC:
+      return "SYNC";
     case MODE_STALE:
       return "STALE";
     case MODE_WAIT:
@@ -391,18 +478,16 @@ String modeLabel(StatusMode mode) {
 }
 
 bool statusModeAnimates(StatusMode mode) {
-  return mode == MODE_WORK || mode == MODE_WAIT || mode == MODE_STALE || mode == MODE_ERR;
+  return mode == MODE_SYNC || mode == MODE_WORK || mode == MODE_WAIT || mode == MODE_STALE || mode == MODE_ERR;
 }
 
 uint32_t powerProfileFactor() {
   switch (effectivePowerMode()) {
-    case POWER_TRAVEL:
-      return 3;
-    case POWER_MAX:
+    case POWER_LOW:
       return 2;
-    case POWER_SAVER:
+    case POWER_AUTO:
       return 1;
-    case POWER_BALANCED:
+    case POWER_ALWAYS:
     default:
       return 0;
   }
@@ -446,25 +531,16 @@ uint32_t autoDimAfterMs() {
 }
 
 uint32_t autoSleepAfterMs() {
-  return 10000;
-}
-
-uint32_t deepSleepAfterMs() {
-  return effectivePowerMode() == POWER_MAX ? MAX_POWER_DEEP_SLEEP_MS : 0;
-}
-
-uint32_t travelShutdownAfterMs() {
-  return travelModeActive() ? TRAVEL_SHUTDOWN_AFTER_MS : 0;
+  return effectivePowerMode() == POWER_ALWAYS ? 0 : 10000;
 }
 
 uint32_t activeCpuMhz() {
   switch (effectivePowerMode()) {
-    case POWER_TRAVEL:
-    case POWER_MAX:
+    case POWER_LOW:
       return 80;
-    case POWER_SAVER:
+    case POWER_AUTO:
       return 120;
-    case POWER_BALANCED:
+    case POWER_ALWAYS:
     default:
       return 160;
   }
@@ -476,13 +552,11 @@ uint32_t sleepCpuMhz() {
 
 uint32_t shakeCheckMs() {
   switch (effectivePowerMode()) {
-    case POWER_TRAVEL:
-      return 700;
-    case POWER_MAX:
+    case POWER_LOW:
       return 500;
-    case POWER_SAVER:
+    case POWER_AUTO:
       return 320;
-    case POWER_BALANCED:
+    case POWER_ALWAYS:
     default:
       return 220;
   }
@@ -497,7 +571,7 @@ void setCpuMhzIfNeeded(uint32_t mhz) {
   currentMhz = mhz;
 }
 
-void enforceUnusedPowerRails(bool force = false) {
+void enforceIndicatorLedsOff(bool force = false) {
   const uint32_t now = millis();
   if (!force && lastPeripheralEnforceMs > 0 && now - lastPeripheralEnforceMs < PERIPHERAL_ENFORCE_MS) {
     return;
@@ -505,14 +579,11 @@ void enforceUnusedPowerRails(bool force = false) {
   lastPeripheralEnforceMs = now;
 
   M5.Power.setLed(0);
-  M5.Power.setExtOutput(false);
   if (!pmicReady) {
     return;
   }
   pm1.disableLeds();
   pm1.setLedEnLevel(false);
-  pm1.setBoostEnable(false);
-  pm1.boostSetPowerHold(false);
 }
 
 void shutdownSpeakerOutput() {
@@ -531,20 +602,18 @@ void setupSpeakerOutput() {
   speakerOffAtMs = 0;
 }
 
-void setupPmicPowerSaving() {
+void setupPmicPowerManagement() {
   pmicReady = pm1.begin(&M5.In_I2C, M5PM1_DEFAULT_ADDR, M5PM1_I2C_FREQ_100K) == M5PM1_OK;
+  M5.Power.setBatteryCharge(true);
   if (!pmicReady) {
     return;
   }
   pm1.setLedEnLevel(false);
   pm1.disableLeds();
-  pm1.setI2cSleepTime(2);
-  pm1.setAutoWakeEnable(true);
-  pm1.setBoostEnable(false);
-  pm1.boostSetPowerHold(false);
-  pm1.ldoSetPowerHold(false);
-  pm1.gpioSetWakeEnable(M5PM1_GPIO_NUM_4, false);
-  enforceUnusedPowerRails(true);
+  pm1.setChargeEnable(true);
+  pm1.setI2cSleepTime(0);
+  pm1.setAutoWakeEnable(false);
+  enforceIndicatorLedsOff(true);
 }
 
 void loadSettings() {
@@ -552,31 +621,44 @@ void loadSettings() {
   if (app.settings.brightness > 2) {
     app.settings.brightness = isUsbPowered() ? 1 : 0;
   }
-  app.settings.power = static_cast<PowerMode>(prefs.isKey("pwr") ? prefs.getUChar("pwr", POWER_BALANCED) : (isUsbPowered() ? POWER_BALANCED : POWER_SAVER));
-  if (app.settings.power > POWER_TRAVEL) {
-    app.settings.power = POWER_BALANCED;
+  const uint8_t savedPower = prefs.isKey("pwr") ? prefs.getUChar("pwr", POWER_ALWAYS) : (isUsbPowered() ? POWER_ALWAYS : POWER_AUTO);
+  app.settings.power = savedPower < POWER_COUNT ? static_cast<PowerMode>(savedPower) : (isUsbPowered() ? POWER_ALWAYS : POWER_AUTO);
+  if (app.settings.power >= POWER_COUNT) {
+    app.settings.power = POWER_ALWAYS;
   }
   app.settings.sound = static_cast<SoundMode>(prefs.getUChar("snd", SOUND_SOFT));
   if (app.settings.sound > SOUND_ALERTS) {
     app.settings.sound = SOUND_SOFT;
+  }
+  app.settings.detail = static_cast<DetailMode>(prefs.getUChar("det", DETAIL_FULL));
+  if (app.settings.detail >= DETAIL_COUNT) {
+    app.settings.detail = DETAIL_FULL;
   }
   app.settings.textNav = static_cast<TextNavMode>(prefs.getUChar("nav", TEXT_NAV_PAGE));
   if (app.settings.textNav > TEXT_NAV_LINE) {
     app.settings.textNav = TEXT_NAV_PAGE;
   }
   app.settings.autoNewest = prefs.getBool("auto", true);
+  app.settings.rotation = static_cast<RotationMode>(prefs.getUChar("rot", ROTATION_AUTO));
+  if (app.settings.rotation > ROTATION_LANDSCAPE_180) {
+    app.settings.rotation = ROTATION_AUTO;
+  }
+  displayRotation = prefs.getUChar("drot", 0) & 0x03;
+  orientationCandidate = displayRotation;
 }
 
 void saveSettings() {
   prefs.putUChar("br", app.settings.brightness);
   prefs.putUChar("pwr", app.settings.power);
+  prefs.putUChar("det", app.settings.detail);
   prefs.putUChar("snd", app.settings.sound);
   prefs.putUChar("nav", app.settings.textNav);
   prefs.putBool("auto", app.settings.autoNewest);
+  prefs.putUChar("rot", app.settings.rotation);
+  prefs.putUChar("drot", displayRotation & 0x03);
 }
 
 void wakeDisplay() {
-  travelShutdownStarted = false;
   if (!displaySleeping) {
     if (displayDimmed) {
       displayDimmed = false;
@@ -603,7 +685,6 @@ void enterDisplaySleep() {
   accelPrimed = false;
   autoSleepEligibleSinceMs = 0;
   sleepEnteredMs = millis();
-  travelShutdownStarted = false;
   displaySleeping = true;
   displayDimmed = false;
   pendingCue = CUE_NONE;
@@ -733,10 +814,17 @@ void sendStatusAck() {
   if (powerTelemetry.voltageMv > 0) {
     battery["mv"] = powerTelemetry.voltageMv;
   }
+  if (powerTelemetry.vbusMv > 0) {
+    battery["vbus_mv"] = powerTelemetry.vbusMv;
+  }
   if (powerTelemetry.hasCurrent) {
     battery["ma"] = powerTelemetry.currentMa;
   }
   battery["usb"] = isUsbPowered();
+  battery["charge_known"] = powerTelemetry.chargeKnown;
+  if (powerTelemetry.chargeKnown) {
+    battery["charging"] = powerTelemetry.charging;
+  }
   JsonObject sys = data["sys"].to<JsonObject>();
   sys["up"] = millis() / 1000;
   sys["heap"] = ESP.getFreeHeap();
@@ -748,14 +836,19 @@ void sendStatusAck() {
   settings["brightness"] = app.settings.brightness;
   settings["power"] = app.settings.power;
   settings["effective_power"] = effectivePowerMode();
-  settings["low_battery_max"] = lowBatteryPowerSaveActive();
+  const bool lowBatteryLow = lowBatteryPowerSaveActive();
+  settings["low_battery_low"] = lowBatteryLow;
+  settings["low_battery_max"] = lowBatteryLow;
   settings["sound"] = app.settings.sound;
+  settings["detail"] = app.settings.detail;
   settings["nav"] = app.settings.textNav;
   settings["auto_newest"] = app.settings.autoNewest;
+  settings["rotation_mode"] = app.settings.rotation;
+  settings["display_rotation"] = displayRotation;
   settings["auto_dim_ms"] = autoDimAfterMs();
   settings["auto_sleep_ms"] = autoSleepAfterMs();
-  settings["deep_sleep_ms"] = deepSleepAfterMs();
-  settings["travel_shutdown_ms"] = travelShutdownAfterMs();
+  settings["deep_sleep_ms"] = 0;
+  settings["travel_shutdown_ms"] = 0;
   sendJson(doc);
 }
 
@@ -766,12 +859,14 @@ void sendControl(const char* action) {
   sendJson(doc);
 }
 
+bool isLandscape();
+
 uint8_t bodyLineHeight() {
   return DASHBOARD_LINE_HEIGHT;
 }
 
 uint8_t bodyTopY() {
-  return 92;
+  return isLandscape() ? 60 : 92;
 }
 
 uint8_t bodyBottomY() {
@@ -818,6 +913,10 @@ String bodyLineAt(size_t chronologicalIndex) {
     return "";
   }
   return app.bodyLines[(app.bodyStart + chronologicalIndex) % BODY_LINE_COUNT];
+}
+
+bool isLandscape() {
+  return (displayRotation & 0x01) != 0;
 }
 
 uint16_t wrapTextLines(const String& firstPrefix, const String& nextPrefix, String text, bool appendLines) {
@@ -930,6 +1029,121 @@ void rebuildBodyLines() {
   clampScroll();
 }
 
+void createDashboardSprite() {
+  canvas.deleteSprite();
+  canvas.setColorDepth(16);
+  canvas.createSprite(M5.Display.width(), M5.Display.height());
+  useUiFont();
+}
+
+uint8_t fixedRotationForMode(RotationMode mode) {
+  switch (mode) {
+    case ROTATION_PORTRAIT:
+      return 0;
+    case ROTATION_LANDSCAPE:
+      return 1;
+    case ROTATION_PORTRAIT_180:
+      return 2;
+    case ROTATION_LANDSCAPE_180:
+      return 3;
+    case ROTATION_AUTO:
+    case ROTATION_LOCK:
+    default:
+      return displayRotation & 0x03;
+  }
+}
+
+void applyDisplayRotation(uint8_t rotation, bool persist = true) {
+  rotation &= 0x03;
+  const bool rotationChanged = rotation != displayRotation;
+  const bool missingSprite = canvas.width() != M5.Display.width() || canvas.height() != M5.Display.height();
+  if (!rotationChanged && !missingSprite) {
+    return;
+  }
+
+  displayRotation = rotation;
+  orientationCandidate = rotation;
+  orientationCandidateSinceMs = 0;
+  M5.Display.setRotation(displayRotation);
+  createDashboardSprite();
+  rebuildBodyLines();
+  if (persist) {
+    prefs.putUChar("drot", displayRotation);
+  }
+  needsRedraw = true;
+}
+
+void applyRotationMode() {
+  if (app.settings.rotation == ROTATION_AUTO || app.settings.rotation == ROTATION_LOCK) {
+    applyDisplayRotation(displayRotation, true);
+    return;
+  }
+  applyDisplayRotation(fixedRotationForMode(app.settings.rotation), true);
+}
+
+bool rotationFromAccel(float ax, float ay, uint8_t& rotation) {
+  const float absX = fabsf(ax);
+  const float absY = fabsf(ay);
+  if (max(absX, absY) < ORIENTATION_MIN_G) {
+    return false;
+  }
+  if (absX > absY + ORIENTATION_AXIS_MARGIN) {
+    rotation = ax > 0.0f ? 2 : 0;
+    return true;
+  }
+  if (absY > absX + ORIENTATION_AXIS_MARGIN) {
+    rotation = ay > 0.0f ? 1 : 3;
+    return true;
+  }
+  return false;
+}
+
+void initializeRotation() {
+  uint8_t nextRotation = displayRotation;
+  if (app.settings.rotation == ROTATION_AUTO) {
+    float ax = 0.0f;
+    float ay = 0.0f;
+    float az = 0.0f;
+    if (M5.Imu.getAccel(&ax, &ay, &az)) {
+      rotationFromAccel(ax, ay, nextRotation);
+    }
+  } else if (app.settings.rotation != ROTATION_LOCK) {
+    nextRotation = fixedRotationForMode(app.settings.rotation);
+  }
+  applyDisplayRotation(nextRotation, true);
+}
+
+void handleAutoRotation() {
+  if (displaySleeping || app.settings.rotation != ROTATION_AUTO || millis() - lastOrientationCheckMs < ORIENTATION_CHECK_MS) {
+    return;
+  }
+  lastOrientationCheckMs = millis();
+
+  float ax = 0.0f;
+  float ay = 0.0f;
+  float az = 0.0f;
+  if (!M5.Imu.getAccel(&ax, &ay, &az)) {
+    return;
+  }
+
+  uint8_t detected = displayRotation;
+  if (!rotationFromAccel(ax, ay, detected)) {
+    orientationCandidateSinceMs = 0;
+    orientationCandidate = displayRotation;
+    return;
+  }
+
+  if (detected != orientationCandidate) {
+    orientationCandidate = detected;
+    orientationCandidateSinceMs = millis();
+    return;
+  }
+
+  if (detected != displayRotation && orientationCandidateSinceMs > 0 && millis() - orientationCandidateSinceMs >= ORIENTATION_STABLE_MS) {
+    applyDisplayRotation(detected, true);
+  }
+}
+
 uint16_t appendActivityBlock(const String& speaker, const String& kind, String text) {
   text = cleanText(text);
   if (text.isEmpty()) {
@@ -1040,6 +1254,9 @@ uint8_t handleActivity(JsonArray activity) {
       setCurrentStatus("Tool", kind, text);
       continue;
     }
+    if (app.settings.detail != DETAIL_FULL) {
+      continue;
+    }
     if (displaySleeping) {
       wakeDisplay();
     }
@@ -1061,18 +1278,22 @@ String legacySnapshotSignature(JsonDocument& doc) {
   return signature;
 }
 
-void handleLegacyText(JsonDocument& doc) {
+bool handleLegacyText(JsonDocument& doc) {
   const String signature = legacySnapshotSignature(doc);
   if (signature.isEmpty() || signature == app.legacySignature) {
-    return;
+    return false;
   }
   app.legacySignature = signature;
 
+  bool changed = false;
   if (doc["msg"].is<const char*>()) {
-    setCurrentStatus("Codex", "status", doc["msg"].as<String>());
+    changed = setCurrentStatus("Codex", "status", doc["msg"].as<String>()) || changed;
   }
 
   uint8_t added = 0;
+  if (app.settings.detail != DETAIL_FULL) {
+    return changed;
+  }
   if (doc["entries"].is<JsonArray>()) {
     JsonArray entries = doc["entries"].as<JsonArray>();
     for (int index = static_cast<int>(entries.size()) - 1; index >= 0; --index) {
@@ -1082,6 +1303,7 @@ void handleLegacyText(JsonDocument& doc) {
     added += appendActivityBlock("Codex", "legacy", doc["msg"].as<String>());
   }
   applyNewLines(added);
+  return changed || added > 0;
 }
 
 bool updateWindow(JsonObject source, RateLimitWindowState& target, const char* fallbackLabel) {
@@ -1131,6 +1353,10 @@ bool updateRateLimits(JsonObject rateLimits) {
 
 void handleSnapshot(JsonDocument& doc) {
   bool changed = false;
+  if (awaitingSnapshot) {
+    awaitingSnapshot = false;
+    changed = true;
+  }
   const uint16_t nextTotal = doc["total"] | app.total;
   const uint16_t nextRunning = doc["running"] | 0;
   const uint16_t nextWaiting = doc["waiting"] | 0;
@@ -1179,8 +1405,7 @@ void handleSnapshot(JsonDocument& doc) {
   if (doc["activity"].is<JsonArray>()) {
     changed = handleActivity(doc["activity"].as<JsonArray>()) > 0 || changed;
   } else if (!hasStructuredText) {
-    handleLegacyText(doc);
-    changed = true;
+    changed = handleLegacyText(doc) || changed;
   }
 
   app.lastSnapshotMs = millis();
@@ -1224,7 +1449,7 @@ void handleLine(const String& line) {
   JsonDocument doc;
   DeserializationError error = deserializeJson(doc, line);
   if (error) {
-    setCurrentStatus("System", "error", "JSON error");
+    Serial.printf("Ignoring malformed BLE JSON line: %s\n", error.c_str());
     return;
   }
 
@@ -1253,7 +1478,7 @@ void processRx(const std::string& value) {
       rxBuffer += ch;
     } else {
       rxBuffer = "";
-      setCurrentStatus("System", "error", "RX overflow");
+      Serial.println("Cleared BLE RX buffer after overflow");
     }
   }
 }
@@ -1266,19 +1491,25 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     bleServer = server;
     wakeDisplay();
     bleConnected = true;
+    awaitingSnapshot = true;
+    rxBuffer = "";
+    lastAdvertisingEnsureMs = millis();
     requestBleConnectionTuning();
-    setCurrentStatus("System", "connected", "BLE connected");
+    setCurrentStatus("System", "sync", "BLE syncing");
     requestCue(CUE_CONNECTED);
   }
 
   void onDisconnect(NimBLEServer*) override {
     wakeDisplay();
     bleConnected = false;
+    awaitingSnapshot = false;
     bleConnParamsPending = false;
+    rxBuffer = "";
     setCurrentStatus("System", "disconnected", "BLE disconnected");
     requestCue(CUE_DISCONNECTED);
     delay(80);
     applyBlePowerPolicy();
+    lastAdvertisingEnsureMs = millis();
     NimBLEDevice::startAdvertising();
   }
 };
@@ -1291,13 +1522,11 @@ class RxCallbacks : public NimBLECharacteristicCallbacks {
 
 uint16_t advertisingMinInterval() {
   switch (effectivePowerMode()) {
-    case POWER_TRAVEL:
-      return 3200;  // 2.0s while waiting for a last connection before shutdown.
-    case POWER_MAX:
+    case POWER_LOW:
       return 2400;  // 1.5s in 0.625ms units.
-    case POWER_SAVER:
+    case POWER_AUTO:
       return 1600;  // 1.0s.
-    case POWER_BALANCED:
+    case POWER_ALWAYS:
     default:
       return 800;   // 0.5s.
   }
@@ -1305,13 +1534,11 @@ uint16_t advertisingMinInterval() {
 
 uint16_t advertisingMaxInterval() {
   switch (effectivePowerMode()) {
-    case POWER_TRAVEL:
-      return 4800;  // 3.0s.
-    case POWER_MAX:
+    case POWER_LOW:
       return 3200;  // 2.0s.
-    case POWER_SAVER:
+    case POWER_AUTO:
       return 2400;  // 1.5s.
-    case POWER_BALANCED:
+    case POWER_ALWAYS:
     default:
       return 1200;  // 0.75s.
   }
@@ -1319,25 +1546,19 @@ uint16_t advertisingMaxInterval() {
 
 void connectionParamsForPower(uint16_t& minInterval, uint16_t& maxInterval, uint16_t& latency, uint16_t& timeout) {
   switch (effectivePowerMode()) {
-    case POWER_TRAVEL:
-      minInterval = 240;  // 300ms in 1.25ms units.
-      maxInterval = 400;  // 500ms.
-      latency = 10;
-      timeout = 800;      // 8s in 10ms units.
-      break;
-    case POWER_MAX:
+    case POWER_LOW:
       minInterval = 160;  // 200ms in 1.25ms units.
       maxInterval = 320;  // 400ms.
       latency = 8;
       timeout = 700;      // 7s in 10ms units.
       break;
-    case POWER_SAVER:
+    case POWER_AUTO:
       minInterval = 80;   // 100ms.
       maxInterval = 160;  // 200ms.
       latency = 4;
       timeout = 600;      // 6s.
       break;
-    case POWER_BALANCED:
+    case POWER_ALWAYS:
     default:
       minInterval = 36;   // 45ms.
       maxInterval = 96;   // 120ms.
@@ -1349,12 +1570,11 @@ void connectionParamsForPower(uint16_t& minInterval, uint16_t& maxInterval, uint
 
 esp_power_level_t bleTxPowerLevel() {
   switch (effectivePowerMode()) {
-    case POWER_TRAVEL:
-    case POWER_MAX:
-      return ESP_PWR_LVL_N9;
-    case POWER_SAVER:
+    case POWER_LOW:
       return ESP_PWR_LVL_N6;
-    case POWER_BALANCED:
+    case POWER_AUTO:
+      return ESP_PWR_LVL_N3;
+    case POWER_ALWAYS:
     default:
       return ESP_PWR_LVL_N3;
   }
@@ -1371,6 +1591,15 @@ void applyBlePowerPolicy() {
 void requestBleConnectionTuning() {
   bleConnParamsPending = true;
   bleTuneRequestedMs = millis();
+}
+
+void ensureBleAdvertising() {
+  if (bleConnected || millis() - lastAdvertisingEnsureMs < BLE_ADVERTISING_ENSURE_MS) {
+    return;
+  }
+  lastAdvertisingEnsureMs = millis();
+  applyBlePowerPolicy();
+  NimBLEDevice::startAdvertising();
 }
 
 void handleBleConnectionTuning() {
@@ -1397,7 +1626,7 @@ void handleBleConnectionTuning() {
 
 void handlePowerPolicyChange() {
   static bool initialized = false;
-  static PowerMode lastMode = POWER_BALANCED;
+  static PowerMode lastMode = POWER_ALWAYS;
   const PowerMode mode = effectivePowerMode();
   if (initialized && mode == lastMode) {
     return;
@@ -1409,7 +1638,7 @@ void handlePowerPolicyChange() {
   applyBlePowerPolicy();
   requestBleConnectionTuning();
   setCpuMhzIfNeeded(displaySleeping ? sleepCpuMhz() : activeCpuMhz());
-  enforceUnusedPowerRails(true);
+  enforceIndicatorLedsOff(true);
   needsRedraw = true;
 }
 
@@ -1439,6 +1668,7 @@ void setupBle() {
   advertising->setMaxInterval(advertisingMaxInterval());
   advertising->setMinPreferred(0x06);
   advertising->setMaxPreferred(0x12);
+  lastAdvertisingEnsureMs = millis();
   NimBLEDevice::startAdvertising();
 }
 
@@ -1536,8 +1766,18 @@ void drawLimitRow(int y, const RateLimitWindowState& window, const char* fallbac
   const uint16_t color = limitColor(pct);
   useUiFont();
   drawTextAt(4, y, fitTextPixels(label, 18), rgb(168, 172, 170));
-  drawTextAt(25, y, pct >= 0 ? String(pct) + "%" : "--%", color);
-  drawBar(64, y + 5, 66, 8, pct, limitColor(pct));
+  drawBar(30, y + 5, 68, 8, pct, color);
+  drawTextAt(104, y, pct >= 0 ? String(pct) + "%" : "--%", color);
+}
+
+void drawLimitInline(int x, int y, const RateLimitWindowState& window, const char* fallbackLabel) {
+  const String label = window.available ? window.label : fallbackLabel;
+  const int pct = window.available ? window.remainingPct : app.remainingPct;
+  const uint16_t color = limitColor(pct);
+  useUiFont();
+  drawTextAt(x, y, fitTextPixels(label, 18), rgb(168, 172, 170));
+  drawBar(x + 22, y + 5, 28, 8, pct, color);
+  drawTextAt(x + 54, y, pct >= 0 ? String(pct) + "%" : "--%", color);
 }
 
 void drawStatusIndicator(StatusMode mode) {
@@ -1567,6 +1807,16 @@ void drawStatusIndicator(StatusMode mode) {
     case MODE_IDLE: {
       static const uint8_t levels[9] = {1, 1, 1, 1, 1, 1, 1, 1, 1};
       drawMatrix(levels, rgb(42, 46, 50), rgb(112, 118, 122), rgb(112, 118, 122));
+      break;
+    }
+    case MODE_SYNC: {
+      static const uint8_t frames[4][9] = {
+        {2, 2, 2, 1, 0, 0, 0, 0, 0},
+        {0, 1, 2, 0, 0, 2, 0, 1, 2},
+        {0, 0, 0, 0, 0, 1, 2, 2, 2},
+        {2, 1, 0, 2, 0, 0, 2, 1, 0}
+      };
+      drawMatrix(frames[(frame / 2) % 4], rgb(18, 42, 52), rgb(72, 116, 134), rgb(144, 198, 214));
       break;
     }
     case MODE_WORK: {
@@ -1625,7 +1875,6 @@ void drawTopBar() {
   const uint16_t color = statusColor(mode);
   canvas.fillRect(0, 0, canvas.width(), TOP_BAR_HEIGHT, color);
   drawStatusIndicator(mode);
-  drawTextAt(16, 1, fitTextPixels(modeLabel(mode), 36), TFT_WHITE, color);
 
   const int pct = batteryPercent();
   char battery[5];
@@ -1635,32 +1884,19 @@ void drawTopBar() {
     snprintf(battery, sizeof(battery), "--%");
   }
   const uint16_t active = rgb(235, 239, 235);
-  const int batteryX = canvas.width() - canvas.textWidth(battery) - 2;
+  const int batteryX = canvas.width() - 27;
+  const int bleX = canvas.width() - 56;
+  const int usbX = canvas.width() - 86;
+  drawTextAt(16, 1, fitTextPixels(modeLabel(mode), max(24, usbX - 20)), TFT_WHITE, color);
   if (app.hasNew && app.scrollOffset > 0) {
-    canvas.fillCircle(53, TOP_BAR_HEIGHT / 2, 3, rgb(255, 196, 78));
+    canvas.fillRect(0, TOP_BAR_HEIGHT - 2, canvas.width(), 2, rgb(255, 196, 78));
   }
-  drawTextAt(62, 1, isUsbPowered() ? "USB" : "   ", active, color);
-  drawTextAt(87, 1, bleConnected ? "BLE" : "   ", active, color);
+  drawTextAt(usbX, 1, isBatteryCharging() ? "CHG" : (isUsbPowered() ? "USB" : "   "), active, color);
+  drawTextAt(bleX, 1, bleConnected ? "BLE" : "   ", active, color);
   drawTextAt(batteryX, 1, battery, active, color);
 }
 
-void drawDashboard() {
-  canvas.fillScreen(TFT_BLACK);
-  useUiFont();
-  drawTopBar();
-
-  drawLimitRow(21, app.primaryLimit, "5h");
-  drawLimitRow(37, app.secondaryLimit, "7d");
-  useUiFont();
-  drawTextAt(4, 54, fitTextPixels("TOK " + tokenLabel(), canvas.width() - 8), TFT_LIGHTGREY);
-
-  const String currentRaw = app.statusSpeaker + ": " + app.statusText;
-  useBodyFontFor(currentRaw);
-  const String current = fitTextPixels(currentRaw, canvas.width() - 8);
-  drawTextAt(4, 70, current, speakerColor(app.statusSpeaker));
-  useUiFont();
-  canvas.drawFastHLine(4, 88, canvas.width() - 8, rgb(42, 42, 42));
-
+void drawBodyText() {
   const uint8_t visible = visibleBodyLines();
   const uint16_t maxOffset = maxScrollOffset();
   app.scrollOffset = min<uint16_t>(app.scrollOffset, maxOffset);
@@ -1688,6 +1924,41 @@ void drawDashboard() {
     y += bodyLineHeight();
   }
   useUiFont();
+}
+
+void drawDashboard() {
+  canvas.fillScreen(TFT_BLACK);
+  useUiFont();
+  drawTopBar();
+
+  if (isLandscape()) {
+    drawLimitInline(4, 21, app.primaryLimit, "5h");
+    drawLimitInline(88, 21, app.secondaryLimit, "7d");
+    drawTextAt(176, 21, fitTextPixels(tokenLabel(), canvas.width() - 180), TFT_LIGHTGREY);
+
+    const String currentRaw = app.statusSpeaker + ": " + app.statusText;
+    useBodyFontFor(currentRaw);
+    const String current = fitTextPixels(currentRaw, canvas.width() - 8);
+    drawTextAt(4, 39, current, speakerColor(app.statusSpeaker));
+    useUiFont();
+    canvas.drawFastHLine(4, 56, canvas.width() - 8, rgb(42, 42, 42));
+  } else {
+    drawLimitRow(21, app.primaryLimit, "5h");
+    drawLimitRow(37, app.secondaryLimit, "7d");
+    useUiFont();
+    drawTextAt(4, 54, fitTextPixels("TOK " + tokenLabel(), canvas.width() - 8), TFT_LIGHTGREY);
+
+    const String currentRaw = app.statusSpeaker + ": " + app.statusText;
+    useBodyFontFor(currentRaw);
+    const String current = fitTextPixels(currentRaw, canvas.width() - 8);
+    drawTextAt(4, 70, current, speakerColor(app.statusSpeaker));
+    useUiFont();
+    canvas.drawFastHLine(4, 88, canvas.width() - 8, rgb(42, 42, 42));
+  }
+
+  if (app.settings.detail == DETAIL_FULL) {
+    drawBodyText();
+  }
 
 }
 
@@ -1698,15 +1969,25 @@ const char* brightnessName() {
 
 const char* powerName() {
   switch (app.settings.power) {
-    case POWER_TRAVEL:
-      return "Travel";
-    case POWER_MAX:
-      return "Max";
-    case POWER_SAVER:
-      return "Saver";
-    case POWER_BALANCED:
+    case POWER_LOW:
+      return "Low";
+    case POWER_AUTO:
+      return "Auto";
+    case POWER_ALWAYS:
     default:
-      return "Balanced";
+      return "Always";
+  }
+}
+
+const char* detailName() {
+  switch (app.settings.detail) {
+    case DETAIL_USAGE:
+      return "Usage";
+    case DETAIL_STATUS:
+      return "Status";
+    case DETAIL_FULL:
+    default:
+      return "Full";
   }
 }
 
@@ -1724,18 +2005,40 @@ const char* navName() {
   return app.settings.textNav == TEXT_NAV_LINE ? "Line" : "Page";
 }
 
+const char* rotationName() {
+  switch (app.settings.rotation) {
+    case ROTATION_LOCK:
+      return "Lock";
+    case ROTATION_PORTRAIT:
+      return "P";
+    case ROTATION_LANDSCAPE:
+      return "L";
+    case ROTATION_PORTRAIT_180:
+      return "P180";
+    case ROTATION_LANDSCAPE_180:
+      return "L180";
+    case ROTATION_AUTO:
+    default:
+      return "Auto";
+  }
+}
+
 String settingLabel(uint8_t index) {
   switch (index) {
     case SETTING_BRIGHTNESS:
       return "Brightness " + String(brightnessName());
     case SETTING_POWER:
-      return String("Power ") + powerName() + (lowBatteryPowerSaveActive() ? ">Max" : "");
+      return String("Power ") + powerName() + (lowBatteryPowerSaveActive() ? ">Low" : "");
+    case SETTING_DETAIL:
+      return "Detail " + String(detailName());
     case SETTING_SOUND:
       return "Sound " + String(soundName());
     case SETTING_TEXT_NAV:
       return "Text nav " + String(navName());
     case SETTING_AUTO_NEWEST:
       return String("Auto newest ") + (app.settings.autoNewest ? "On" : "Off");
+    case SETTING_ROTATION:
+      return "Rotation " + String(rotationName());
     default:
       return "";
   }
@@ -1747,8 +2050,11 @@ void drawSettings() {
   drawTopBar();
   drawTextAt(4, 22, "SETTINGS", rgb(210, 214, 210));
 
+  const bool landscape = isLandscape();
+  const uint8_t rowStart = landscape ? 36 : 48;
+  const uint8_t rowHeight = landscape ? 15 : 20;
   for (uint8_t i = 0; i < SETTING_COUNT; ++i) {
-    const uint8_t y = 48 + i * 20;
+    const uint8_t y = rowStart + i * rowHeight;
     const bool selected = i == app.settings.selected;
     const uint16_t fg = selected ? TFT_BLACK : TFT_LIGHTGREY;
     const uint16_t bg = selected ? rgb(118, 166, 154) : TFT_BLACK;
@@ -1761,22 +2067,30 @@ void drawSettings() {
   const int pct = batteryPercent();
   String batteryLine = "BLE ";
   batteryLine += bleConnected ? "on" : "off";
-  batteryLine += " BAT ";
+  batteryLine += isBatteryCharging() ? " CHG " : (isUsbPowered() ? " USB " : " BAT ");
   batteryLine += pct >= 0 ? String(pct) + "%" : "n/a";
   if (powerTelemetry.voltageMv > 0) {
     batteryLine += " ";
     batteryLine += String(powerTelemetry.voltageMv);
     batteryLine += "mV";
   }
+  if (powerTelemetry.vbusMv > 0) {
+    batteryLine += " VIN";
+    batteryLine += String(powerTelemetry.vbusMv);
+  }
   if (powerTelemetry.hasCurrent) {
     batteryLine += " ";
     batteryLine += String(powerTelemetry.currentMa);
     batteryLine += "mA";
   }
-  drawTextAt(4, 166, fitTextPixels(app.deviceName, canvas.width() - 8), rgb(100, 104, 108));
-  drawTextAt(4, 183, fitTextPixels(batteryLine, canvas.width() - 8), rgb(100, 104, 108));
-  drawTextAt(4, 200, fitTextPixels("Heap " + formatCompact(ESP.getFreeHeap()), canvas.width() - 8), rgb(100, 104, 108));
-  drawTextAt(4, canvas.height() - DASHBOARD_FONT_HEIGHT, fitTextPixels("A change  B next", canvas.width() - 8), rgb(100, 104, 108));
+  if (landscape) {
+    drawTextAt(100, 22, fitTextPixels(batteryLine, canvas.width() - 104), rgb(100, 104, 108));
+  } else {
+    drawTextAt(4, 176, fitTextPixels(app.deviceName, canvas.width() - 8), rgb(100, 104, 108));
+    drawTextAt(4, 193, fitTextPixels(batteryLine, canvas.width() - 8), rgb(100, 104, 108));
+    drawTextAt(4, 210, fitTextPixels("Heap " + formatCompact(ESP.getFreeHeap()), canvas.width() - 8), rgb(100, 104, 108));
+    drawTextAt(4, canvas.height() - DASHBOARD_FONT_HEIGHT, fitTextPixels("A change  B next", canvas.width() - 8), rgb(100, 104, 108));
+  }
 }
 
 void redraw() {
@@ -1794,6 +2108,12 @@ void redraw() {
 }
 
 void scrollNewer() {
+  if (app.settings.detail != DETAIL_FULL) {
+    app.scrollOffset = 0;
+    app.hasNew = false;
+    needsRedraw = true;
+    return;
+  }
   const uint16_t step = app.settings.textNav == TEXT_NAV_LINE ? 1 : visibleBodyLines();
   app.scrollOffset = app.scrollOffset > step ? app.scrollOffset - step : 0;
   if (app.scrollOffset == 0) {
@@ -1803,6 +2123,12 @@ void scrollNewer() {
 }
 
 void scrollOlder() {
+  if (app.settings.detail != DETAIL_FULL) {
+    app.scrollOffset = 0;
+    app.hasNew = false;
+    needsRedraw = true;
+    return;
+  }
   const uint16_t step = app.settings.textNav == TEXT_NAV_LINE ? 1 : visibleBodyLines();
   app.scrollOffset = min<uint16_t>(maxScrollOffset(), app.scrollOffset + step);
   needsRedraw = true;
@@ -1838,14 +2164,19 @@ void rotateSetting() {
       applyBrightness();
       break;
     case SETTING_POWER:
-      app.settings.power = static_cast<PowerMode>((app.settings.power + 1) % 4);
-      if (!isUsbPowered() && app.settings.power != POWER_BALANCED && app.settings.brightness > 1) {
+      app.settings.power = static_cast<PowerMode>((app.settings.power + 1) % POWER_COUNT);
+      if (!isUsbPowered() && app.settings.power != POWER_ALWAYS && app.settings.brightness > 1) {
         app.settings.brightness = 1;
       }
       applyBrightness();
       applyBlePowerPolicy();
       requestBleConnectionTuning();
       setCpuMhzIfNeeded(displaySleeping ? sleepCpuMhz() : activeCpuMhz());
+      break;
+    case SETTING_DETAIL:
+      app.settings.detail = static_cast<DetailMode>((app.settings.detail + 1) % DETAIL_COUNT);
+      app.scrollOffset = 0;
+      app.hasNew = false;
       break;
     case SETTING_SOUND:
       app.settings.sound = static_cast<SoundMode>((app.settings.sound + 1) % 3);
@@ -1857,6 +2188,10 @@ void rotateSetting() {
       break;
     case SETTING_AUTO_NEWEST:
       app.settings.autoNewest = !app.settings.autoNewest;
+      break;
+    case SETTING_ROTATION:
+      app.settings.rotation = static_cast<RotationMode>((app.settings.rotation + 1) % 6);
+      applyRotationMode();
       break;
     default:
       break;
@@ -1984,57 +2319,6 @@ void checkShakeWake() {
   }
 }
 
-void prepareTravelWakeSources() {
-  if (!pmicReady) {
-    return;
-  }
-
-  pm1.disableLeds();
-  pm1.setLedEnLevel(false);
-  pm1.setBoostEnable(false);
-  pm1.boostSetPowerHold(false);
-  pm1.gpioSetPowerHold(M5PM1_GPIO_NUM_3, false);
-
-  // Keep the IMU rail available for the StickS3 PMIC wake chain and arm GPIO4,
-  // which is wired to the IMU interrupt path on StickS3-class hardware.
-  pm1.ldoSetPowerHold(true);
-  pm1.gpioSetFunc(M5PM1_GPIO_NUM_4, M5PM1_GPIO_FUNC_WAKE);
-  pm1.gpioSetWakeEdge(M5PM1_GPIO_NUM_4, M5PM1_GPIO_WAKE_RISING);
-  pm1.gpioSetWakeEnable(M5PM1_GPIO_NUM_4, true);
-  pm1.clearWakeSource(0x7F);
-}
-
-void enterTravelShutdown() {
-  if (travelShutdownStarted) {
-    return;
-  }
-  travelShutdownStarted = true;
-  app.settings.open = false;
-  saveSettings();
-  shutdownSpeakerOutput();
-  enforceUnusedPowerRails(true);
-  prepareTravelWakeSources();
-  M5.Display.sleep();
-  delay(120);
-  if (pmicReady) {
-    pm1.shutdown();
-    delay(500);
-  }
-  M5.Power.powerOff();
-  delay(200);
-  M5.Power.deepSleep(0, true);
-}
-
-void enterDeepSleep() {
-  app.settings.open = false;
-  saveSettings();
-  shutdownSpeakerOutput();
-  enforceUnusedPowerRails(true);
-  M5.Display.sleep();
-  delay(20);
-  M5.Power.deepSleep(0, true);
-}
-
 void handleStatusAnimation() {
   static uint32_t lastAnimationMs = 0;
   const StatusMode mode = currentStatusMode();
@@ -2052,14 +2336,6 @@ void handleStatusAnimation() {
 void handleSleepTimers() {
   if (displaySleeping) {
     checkShakeWake();
-    const uint32_t travelMs = travelShutdownAfterMs();
-    if (travelMs > 0 && !isUsbPowered() && app.running == 0 && app.waiting == 0 && !app.hasNew && millis() - sleepEnteredMs > travelMs) {
-      enterTravelShutdown();
-    }
-    const uint32_t deepMs = deepSleepAfterMs();
-    if (deepMs > 0 && !isUsbPowered() && app.running == 0 && app.waiting == 0 && !app.hasNew && millis() - sleepEnteredMs > deepMs) {
-      enterDeepSleep();
-    }
     return;
   }
 
@@ -2073,22 +2349,24 @@ void handleSleepTimers() {
     autoSleepEligibleSinceMs = millis();
     return;
   }
-  if (millis() - autoSleepEligibleSinceMs > autoSleepAfterMs()) {
+  const uint32_t sleepMs = autoSleepAfterMs();
+  if (sleepMs > 0 && millis() - autoSleepEligibleSinceMs > sleepMs) {
     enterDisplaySleep();
   }
 }
 
 uint32_t loopDelayMs() {
+  const PowerMode mode = effectivePowerMode();
   if (displaySleeping) {
-    return effectivePowerMode() == POWER_BALANCED ? 160 : 280;
+    return mode == POWER_ALWAYS ? 160 : (mode == POWER_AUTO ? 240 : 300);
   }
   if (app.settings.open || pendingCue != CUE_NONE || speakerOutputActive) {
     return 20;
   }
   if (currentStatusMode() == MODE_WORK) {
-    return effectivePowerMode() == POWER_BALANCED ? 50 : 120;
+    return mode == POWER_ALWAYS ? 50 : (mode == POWER_AUTO ? 120 : 180);
   }
-  return effectivePowerMode() == POWER_BALANCED ? 60 : 140;
+  return mode == POWER_ALWAYS ? 60 : (mode == POWER_AUTO ? 140 : 220);
 }
 
 void seedBody() {
@@ -2109,16 +2387,13 @@ void setup() {
   cfg.led_brightness = 0;
   M5.begin(cfg);
   M5.Power.setLed(0);
-  setupPmicPowerSaving();
+  setupPmicPowerManagement();
   setupSpeakerOutput();
-  M5.Display.setRotation(0);
-  canvas.setColorDepth(16);
-  canvas.createSprite(M5.Display.width(), M5.Display.height());
-  useUiFont();
 
   prefs.begin("codexdash", false);
   samplePowerTelemetry(true);
   loadSettings();
+  initializeRotation();
   applyBrightness();
   setCpuMhzIfNeeded(activeCpuMhz());
 
@@ -2132,9 +2407,11 @@ void setup() {
 void loop() {
   M5.update();
   handleButtons();
+  handleAutoRotation();
   handleSleepTimers();
   handleStatusAnimation();
   handlePowerPolicyChange();
+  ensureBleAdvertising();
   handleBleConnectionTuning();
   playPendingCue();
   handleSpeakerPower();
@@ -2143,12 +2420,18 @@ void loop() {
     closeSettings();
   }
 
-  if (samplePowerTelemetry(false)) {
+  const bool wasUsb = powerTelemetry.usb;
+  const bool wasCharging = powerTelemetry.charging;
+  const bool powerChanged = samplePowerTelemetry(false);
+  if (powerChanged) {
+    if (displaySleeping && (wasUsb != powerTelemetry.usb || wasCharging != powerTelemetry.charging)) {
+      wakeDisplay();
+    }
     needsRedraw = true;
     handlePowerPolicyChange();
   }
 
-  enforceUnusedPowerRails(false);
+  enforceIndicatorLedsOff(false);
 
   if (needsRedraw) {
     redraw();

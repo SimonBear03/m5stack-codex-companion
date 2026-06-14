@@ -20,6 +20,23 @@ DESKTOP_ACTIVITY_HISTORY = 4
 DESKTOP_ACTIVITY_TEXT_LIMIT = 1000
 DEFAULT_ACTIVE_HEARTBEAT_INTERVAL = 10.0
 DEFAULT_IDLE_HEARTBEAT_INTERVAL = 45.0
+ACTIVE_WORK_WATCHDOG_SECONDS = 600.0
+RECENT_WORK_EVENT_MAX_AGE_SECONDS = 120.0
+USAGE_REFRESH_INTERVAL_SECONDS = 5.0
+USAGE_SCAN_FILE_LIMIT = 32
+USAGE_INCREMENTAL_LOOKBACK_BYTES = 65536
+DETAIL_FULL = 0
+DETAIL_STATUS = 1
+DETAIL_USAGE = 2
+TRANSIENT_WORK_STATUS_KINDS = {
+    "message",
+    "output",
+    "patch",
+    "replying",
+    "started",
+    "thinking",
+    "working",
+}
 
 
 def default_codex_home() -> Path:
@@ -64,6 +81,40 @@ def compact_desktop_rate_limits(rate_limits: dict[str, Any] | None) -> dict[str,
         "secondary": convert(rate_limits.get("secondary")),
     }
     return normalize_rate_limits(converted)
+
+
+@dataclass(frozen=True)
+class DesktopUsageSnapshot:
+    tokens_total: int | None = None
+    rate_limits: dict[str, dict[str, Any]] | None = None
+    event_ts: float | None = None
+    path: Path | None = None
+
+    @property
+    def has_usage(self) -> bool:
+        return self.tokens_total is not None or self.rate_limits is not None
+
+
+@dataclass(frozen=True)
+class UsageFileCacheEntry:
+    size: int
+    mtime_ns: int
+    usage: DesktopUsageSnapshot | None = None
+
+
+def usage_from_token_count_payload(payload: dict[str, Any], *, event_ts: float | None = None, path: Path | None = None) -> DesktopUsageSnapshot:
+    tokens_total: int | None = None
+    info = payload.get("info") or {}
+    if isinstance(info, dict):
+        usage = info.get("total_token_usage") or {}
+        if isinstance(usage, dict) and isinstance(usage.get("total_tokens"), int):
+            tokens_total = max(0, int(usage["total_tokens"]))
+    return DesktopUsageSnapshot(
+        tokens_total=tokens_total,
+        rate_limits=compact_desktop_rate_limits(payload.get("rate_limits")),
+        event_ts=event_ts,
+        path=path,
+    )
 
 
 def rollout_metadata(path: Path) -> dict[str, Any]:
@@ -117,6 +168,87 @@ def latest_user_rollout(sessions_dir: Path) -> Path | None:
     return files[0] if files else None
 
 
+def recent_rollout_files(sessions_dir: Path, *, limit: int = USAGE_SCAN_FILE_LIMIT) -> list[Path]:
+    try:
+        files = sorted(sessions_dir.glob("**/*.jsonl"), key=lambda path: path.stat().st_mtime, reverse=True)
+    except OSError:
+        return []
+    return files[:limit]
+
+
+def latest_usage_from_rollout(path: Path, *, start_offset: int = 0) -> DesktopUsageSnapshot | None:
+    latest: DesktopUsageSnapshot | None = None
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            if start_offset > 0:
+                handle.seek(start_offset)
+                handle.readline()
+            for line in handle:
+                if '"token_count"' not in line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if event.get("type") != "event_msg":
+                    continue
+                payload = event.get("payload")
+                if not isinstance(payload, dict) or payload.get("type") != "token_count":
+                    continue
+                usage = usage_from_token_count_payload(payload, event_ts=event_timestamp_seconds(event), path=path)
+                if usage.has_usage:
+                    latest = usage
+    except OSError:
+        return None
+    return latest
+
+
+def latest_account_usage(
+    sessions_dir: Path,
+    *,
+    limit: int = USAGE_SCAN_FILE_LIMIT,
+    cache: dict[Path, UsageFileCacheEntry] | None = None,
+) -> DesktopUsageSnapshot | None:
+    best: DesktopUsageSnapshot | None = None
+    recent_paths = recent_rollout_files(sessions_dir, limit=limit)
+    for path in recent_paths:
+        usage: DesktopUsageSnapshot | None = None
+        if cache is None:
+            usage = latest_usage_from_rollout(path)
+        else:
+            try:
+                stat = path.stat()
+            except OSError:
+                cache.pop(path, None)
+                continue
+            cached = cache.get(path)
+            if cached and cached.size == stat.st_size and cached.mtime_ns == stat.st_mtime_ns:
+                usage = cached.usage
+            else:
+                start_offset = 0
+                if cached and stat.st_size >= cached.size:
+                    start_offset = max(0, cached.size - USAGE_INCREMENTAL_LOOKBACK_BYTES)
+                scanned = latest_usage_from_rollout(path, start_offset=start_offset)
+                usage = scanned or (cached.usage if cached and stat.st_size >= cached.size else None)
+                cache[path] = UsageFileCacheEntry(size=stat.st_size, mtime_ns=stat.st_mtime_ns, usage=usage)
+        if usage is None:
+            continue
+        if best is None:
+            best = usage
+            continue
+        if usage.event_ts is not None and best.event_ts is not None:
+            if usage.event_ts > best.event_ts:
+                best = usage
+        elif usage.event_ts is not None and best.event_ts is None:
+            best = usage
+    if cache is not None:
+        recent_set = set(recent_paths)
+        for cached_path in list(cache):
+            if cached_path not in recent_set:
+                cache.pop(cached_path, None)
+    return best
+
+
 def clean_tool_name(value: Any) -> str:
     text = short_text(value or "tool", 40)
     if "." in text:
@@ -139,12 +271,14 @@ class DesktopObserverState:
     next_seq: int = 1
     tokens_total: int | None = None
     rate_limits: dict[str, dict[str, Any]] | None = None
+    usage_event_ts: float | None = None
     last_event_ts: float | None = None
 
-    def snapshot(self, activity: tuple[dict[str, Any], ...] | None = None) -> Snapshot:
+    def snapshot(self, activity: tuple[dict[str, Any], ...] | None = None, *, working: bool | None = None) -> Snapshot:
+        is_working = self.active if working is None else working
         label = self.thread_name or (self.thread_id[:8] if self.thread_id else "Desktop")
         msg = self.last_message
-        if not self.active and self.thread_id and msg == "Desktop observer connected":
+        if not is_working and self.thread_id and msg == "Desktop observer connected":
             msg = short_text(f"Idle: {label}", 80)
         ordered_activity = tuple(reversed(self.activity)) if activity is None else activity
         entries = tuple(
@@ -153,7 +287,7 @@ class DesktopObserverState:
         )
         return Snapshot(
             total=1 if self.thread_id else 0,
-            running=1 if self.active else 0,
+            running=1 if is_working else 0,
             waiting=0,
             msg=msg,
             entries=entries[:3],
@@ -176,6 +310,9 @@ class DesktopObserverBridge:
         heartbeat_interval: float = DEFAULT_ACTIVE_HEARTBEAT_INTERVAL,
         idle_heartbeat_interval: float = DEFAULT_IDLE_HEARTBEAT_INTERVAL,
         status_file: Path | None = None,
+        reconnect: bool = True,
+        reconnect_delay: float = 1.0,
+        max_reconnect_delay: float = 3.0,
     ) -> None:
         self.device = device
         self.sessions_dir = sessions_dir or (default_codex_home() / "sessions")
@@ -185,26 +322,98 @@ class DesktopObserverBridge:
         self.heartbeat_interval = heartbeat_interval
         self.idle_heartbeat_interval = idle_heartbeat_interval
         self.status_file = status_file
+        self.reconnect = reconnect
+        self.reconnect_delay = max(0.5, float(reconnect_delay))
+        self.max_reconnect_delay = max(self.reconnect_delay, float(max_reconnect_delay))
         self.state = DesktopObserverState()
         self._offset = 0
         self._last_size = 0
         self._last_sent = 0.0
         self._last_activity_seq_sent = 0
+        self._active_work_deadline = 0.0
+        self._last_sent_working = False
+        self._last_usage_scan = 0.0
+        self._usage_file_cache: dict[Path, UsageFileCacheEntry] = {}
+        self._last_wire_payload: dict[str, Any] | None = None
+        self._poll_lock = asyncio.Lock()
         self._snapshot_lock = asyncio.Lock()
+        self._device_connected = bool(getattr(device, "always_connected", False))
+        self._device_state = "connected" if self._device_connected else "disconnected"
+        self._device_error: str | None = None
 
     async def run(self) -> None:
-        self.write_status("connecting", detail="Scanning for StickS3")
-        await self.device.connect()
-        self.write_status("connected", detail="BLE connected")
-        asyncio.create_task(self.handle_device_controls())
+        self.write_status(self._device_state, detail="Codex observer running")
+        async with asyncio.TaskGroup() as task_group:
+            task_group.create_task(self.device_connection_loop())
+            task_group.create_task(self.handle_device_controls())
+            task_group.create_task(self.observer_loop())
 
+    async def observer_loop(self) -> None:
         while True:
-            changed = await self.poll_once()
+            changed = await self.refresh_observed_state(force_usage=self._last_usage_scan <= 0.0)
             now = time.monotonic()
-            heartbeat_interval = self.heartbeat_interval if self.state.active else self.idle_heartbeat_interval
-            if changed or now - self._last_sent >= heartbeat_interval:
-                await self.send_snapshot()
+            working = self.is_working(now)
+            heartbeat_interval = self.heartbeat_interval if working else self.idle_heartbeat_interval
+            work_expired = self._last_sent_working and not working
+            status_expired = self.expire_transient_work_status() if not working else False
+            changed = changed or status_expired
+            force_send = now - self._last_sent >= heartbeat_interval
+            if changed or work_expired or force_send:
+                await self.send_snapshot(force=force_send)
             await asyncio.sleep(self.poll_interval)
+
+    async def device_connection_loop(self) -> None:
+        if self._device_connected and getattr(self.device, "always_connected", False):
+            return
+
+        delay = self.reconnect_delay
+        while True:
+            if self._device_connected:
+                if not self.device.is_connected():
+                    self._device_connected = False
+                    self._device_state = "disconnected"
+                    self._device_error = "BLE link closed"
+                    await self.device.close()
+                    self.write_status(self._device_state, detail="StickS3 disconnected", error=self._device_error)
+                    delay = self.reconnect_delay
+                    continue
+                await asyncio.sleep(1.0)
+                continue
+
+            self._device_state = "scanning"
+            self._device_error = None
+            self.write_status(self._device_state, detail="Scanning for StickS3")
+            try:
+                await self.device.connect()
+            except Exception as exc:
+                self._device_connected = False
+                self._device_state = "disconnected"
+                self._device_error = str(exc)
+                self.write_status(self._device_state, detail=f"Retrying BLE in {delay:.0f}s", error=str(exc))
+                if not self.reconnect:
+                    raise
+                await self.device.close()
+                await asyncio.sleep(delay)
+                delay = min(self.max_reconnect_delay, max(delay * 1.6, delay + 1.0))
+                continue
+
+            delay = self.reconnect_delay
+            self._device_connected = True
+            self._device_state = "connected"
+            self._device_error = None
+            await self.sync_connected_device()
+
+    async def refresh_observed_state(self, *, force_usage: bool = False) -> bool:
+        async with self._poll_lock:
+            changed = await self.poll_once()
+            usage_changed = self.refresh_account_usage(force=force_usage)
+            return changed or usage_changed
+
+    async def sync_connected_device(self) -> None:
+        await self.refresh_observed_state(force_usage=True)
+        self.write_status(self._device_state, detail="BLE connected; syncing")
+        if await self.send_initial_sync_snapshot():
+            await self.send_snapshot(force=True)
 
     async def poll_once(self) -> bool:
         path = self.resolve_rollout()
@@ -216,11 +425,17 @@ class DesktopObserverBridge:
             return False
 
         if self.rollout_path != path:
+            tokens_total = self.state.tokens_total
+            rate_limits = self.state.rate_limits
+            usage_event_ts = self.state.usage_event_ts
             self.rollout_path = path
             self._offset = 0
             self._last_size = 0
             self._last_activity_seq_sent = 0
-            self.state = DesktopObserverState()
+            self._active_work_deadline = 0.0
+            self._last_sent_working = False
+            self._last_wire_payload = None
+            self.state = DesktopObserverState(tokens_total=tokens_total, rate_limits=rate_limits, usage_event_ts=usage_event_ts)
             LOGGER.info("Observing Codex Desktop rollout: %s", path)
 
         try:
@@ -247,7 +462,7 @@ class DesktopObserverBridge:
             return False
 
         self._last_size = stat.st_size
-        return changed
+        return self.refresh_account_usage(force=self._last_usage_scan <= 0.0) or changed
 
     def resolve_rollout(self) -> Path | None:
         if self.rollout_path and self.rollout_path.exists():
@@ -287,9 +502,12 @@ class DesktopObserverBridge:
 
         if event_type == "turn_context":
             turn_id = payload.get("turn_id")
+            if not self.mark_active_work():
+                return False
             if turn_id:
                 self.state.active_turn_id = str(turn_id)
-            return False
+            self.set_status("Codex", "working", "Working")
+            return True
 
         if event_type == "response_item":
             return self.apply_response_item(payload)
@@ -302,14 +520,28 @@ class DesktopObserverBridge:
     def apply_response_item(self, payload: dict[str, Any]) -> bool:
         payload_type = payload.get("type")
         if payload_type in {"function_call", "custom_tool_call"}:
+            if not self.mark_active_work():
+                return False
             name = clean_tool_name(payload.get("name"))
             self.set_status("Tool", "started", name)
             self.add_activity("Tool", "started", name)
             return True
         if payload_type == "function_call_output":
+            if not self.mark_active_work():
+                return False
             self.set_status("Tool", "output", "output ready")
             self.add_activity("Tool", "output", "output ready")
             return True
+        if payload_type == "reasoning":
+            if self.mark_active_work():
+                self.set_status("Codex", "thinking", "Thinking")
+                return True
+            return False
+        if payload_type == "message":
+            if self.mark_active_work():
+                self.set_status("Codex", "replying", "Replying")
+                return True
+            return False
         return False
 
     def apply_event_payload(self, payload: dict[str, Any]) -> bool:
@@ -317,26 +549,29 @@ class DesktopObserverBridge:
 
         if payload_type == "task_started":
             turn_id = payload.get("turn_id")
+            if not self.mark_active_work():
+                return False
             if turn_id:
                 self.state.active_turn_id = str(turn_id)
-            self.state.active = True
             self.state.last_message = "Codex working"
             self.set_status("Codex", "working", "Working")
             self.add_activity("System", "started", "Turn started")
             return True
 
-        if payload_type == "task_complete":
-            self.state.active = False
-            self.state.active_turn_id = None
+        if payload_type in {"task_complete", "task_aborted", "turn_aborted", "interrupted", "cancelled", "canceled"}:
+            self.clear_active_work()
             summary = payload.get("last_agent_message") or "Turn completed"
-            self.state.last_message = "Turn completed"
-            self.set_status("Codex", "completed", "Turn completed")
-            self.add_activity("Codex", "completed", summary)
+            completed = payload_type == "task_complete"
+            self.state.last_message = "Turn completed" if completed else "Turn stopped"
+            self.set_status("Codex", "completed" if completed else "stopped", self.state.last_message)
+            self.add_activity("Codex", "completed" if completed else "stopped", summary if completed else self.state.last_message)
             return True
 
         if payload_type == "agent_message":
             message = payload.get("message")
             if isinstance(message, str) and message.strip():
+                if not self.mark_active_work():
+                    return False
                 self.state.last_message = short_text(message, 80)
                 self.set_status("Codex", "message", message)
                 self.add_activity("Codex", "message", message)
@@ -344,6 +579,8 @@ class DesktopObserverBridge:
             return False
 
         if payload_type == "user_message":
+            if not self.mark_active_work():
+                return False
             message = payload.get("message")
             self.state.last_message = "User message"
             self.set_status("User", "message", message or "User message")
@@ -351,15 +588,11 @@ class DesktopObserverBridge:
             return True
 
         if payload_type == "token_count":
-            info = payload.get("info") or {}
-            if isinstance(info, dict):
-                usage = info.get("total_token_usage") or {}
-                if isinstance(usage, dict) and isinstance(usage.get("total_tokens"), int):
-                    self.state.tokens_total = max(0, int(usage["total_tokens"]))
-            self.state.rate_limits = compact_desktop_rate_limits(payload.get("rate_limits")) or self.state.rate_limits
-            return True
+            return self.apply_usage(usage_from_token_count_payload(payload, event_ts=self.state.last_event_ts))
 
         if payload_type == "patch_apply_end":
+            if not self.mark_active_work():
+                return False
             success = payload.get("success")
             self.state.last_message = "Patch applied" if success else "Patch failed"
             text = "Patch applied" if success else "Patch failed"
@@ -368,6 +601,176 @@ class DesktopObserverBridge:
             return True
 
         return False
+
+    def mark_active_work(self) -> bool:
+        event_ts = self.state.last_event_ts
+        if event_ts is not None and time.time() - event_ts > RECENT_WORK_EVENT_MAX_AGE_SECONDS:
+            return False
+        self.state.active = True
+        self._active_work_deadline = max(
+            self._active_work_deadline,
+            time.monotonic() + ACTIVE_WORK_WATCHDOG_SECONDS,
+        )
+        return True
+
+    def mark_recent_work(self) -> bool:
+        return self.mark_active_work()
+
+    def clear_active_work(self) -> None:
+        self.state.active = False
+        self.state.active_turn_id = None
+        self._active_work_deadline = 0.0
+
+    def clear_recent_work(self) -> None:
+        self.clear_active_work()
+
+    def expire_transient_work_status(self) -> bool:
+        if self.is_working():
+            return False
+        changed = False
+        if self.state.active or self.state.active_turn_id is not None or self._active_work_deadline > 0:
+            self.clear_active_work()
+            changed = True
+        status = self.state.status if isinstance(self.state.status, dict) else {}
+        kind = str(status.get("kind") or "").lower()
+        if kind not in TRANSIENT_WORK_STATUS_KINDS:
+            return changed
+        self.set_status("Codex", "idle", "Idle")
+        return True
+
+    def is_working(self, now: float | None = None) -> bool:
+        if not self.state.active:
+            return False
+        if self._active_work_deadline <= 0:
+            return True
+        current = time.monotonic() if now is None else now
+        return current < self._active_work_deadline
+
+    def build_snapshot(self, activity: tuple[dict[str, Any], ...] | None = None) -> Snapshot:
+        return self.state.snapshot(activity=activity, working=self.is_working())
+
+    def apply_usage(self, usage: DesktopUsageSnapshot | None) -> bool:
+        if usage is None or not usage.has_usage:
+            return False
+        if (
+            usage.event_ts is not None
+            and self.state.usage_event_ts is not None
+            and usage.event_ts < self.state.usage_event_ts
+        ):
+            return False
+        changed = False
+        if usage.tokens_total is not None and usage.tokens_total != self.state.tokens_total:
+            self.state.tokens_total = usage.tokens_total
+            changed = True
+        if usage.rate_limits is not None and usage.rate_limits != self.state.rate_limits:
+            self.state.rate_limits = usage.rate_limits
+            changed = True
+        if usage.event_ts is not None and (self.state.usage_event_ts is None or usage.event_ts > self.state.usage_event_ts):
+            self.state.usage_event_ts = usage.event_ts
+        return changed
+
+    def refresh_account_usage(self, *, force: bool = False) -> bool:
+        now = time.monotonic()
+        if not force and now - self._last_usage_scan < USAGE_REFRESH_INTERVAL_SECONDS:
+            return False
+        self._last_usage_scan = now
+        return self.apply_usage(latest_account_usage(self.sessions_dir, cache=self._usage_file_cache))
+
+    def device_detail_mode(self) -> int:
+        device_status = getattr(self.device, "last_status_ack", None)
+        if not isinstance(device_status, dict):
+            return DETAIL_FULL
+        settings = device_status.get("settings")
+        if not isinstance(settings, dict):
+            return DETAIL_FULL
+        detail = settings.get("detail")
+        if isinstance(detail, int) and detail in {DETAIL_FULL, DETAIL_STATUS, DETAIL_USAGE}:
+            return detail
+        return DETAIL_FULL
+
+    @staticmethod
+    def sanitize_status(status: dict[str, Any] | None, *, detail: int, working: bool) -> dict[str, str] | None:
+        if not isinstance(status, dict):
+            return None
+
+        speaker = short_text(status.get("speaker") or "Codex", 16)
+        kind = short_text(status.get("kind") or "status", 24)
+        text = short_text(status.get("text") or kind, 96)
+        if detail == DETAIL_FULL:
+            return {"speaker": speaker, "kind": kind, "text": text}
+
+        normalized_kind = kind.lower()
+        normalized_speaker = speaker.lower()
+        if detail == DETAIL_STATUS:
+            if normalized_speaker == "user":
+                text = "User message"
+            elif normalized_speaker == "codex" and normalized_kind == "message":
+                text = "Codex message"
+            elif normalized_speaker == "system" and normalized_kind in {"connected", "disconnected", "error"}:
+                text = text
+            elif normalized_speaker == "tool":
+                text = short_text(text or "Tool activity", 40)
+            elif working:
+                text = "Working"
+            return {"speaker": speaker, "kind": kind, "text": text}
+
+        if working:
+            return {"speaker": "Codex", "kind": "working", "text": "Working"}
+        if normalized_kind in {"completed", "complete", "task_complete"}:
+            return {"speaker": "Codex", "kind": "completed", "text": "Turn completed"}
+        if normalized_kind == "error":
+            return {"speaker": "System", "kind": "error", "text": "Bridge error"}
+        if normalized_kind == "disconnected":
+            return {"speaker": "System", "kind": "disconnected", "text": "Disconnected"}
+        if normalized_kind == "connected":
+            return {"speaker": "System", "kind": "connected", "text": "Connected"}
+        return {"speaker": "Codex", "kind": "idle", "text": "Idle"}
+
+    def snapshot_for_detail(self, snapshot: Snapshot, *, detail: int, working: bool) -> Snapshot:
+        if detail == DETAIL_FULL:
+            return snapshot
+        status = self.sanitize_status(snapshot.status, detail=detail, working=working)
+        msg = status["text"] if status else ("Working" if working else "Usage synced")
+        return Snapshot(
+            total=snapshot.total,
+            running=snapshot.running,
+            waiting=snapshot.waiting,
+            msg=msg,
+            entries=(),
+            status=status,
+            activity=(),
+            tokens=snapshot.tokens,
+            tokens_today=snapshot.tokens_today,
+            remaining_pct=snapshot.remaining_pct,
+            rate_limits=snapshot.rate_limits,
+            legacy_text=False,
+        )
+
+    def initial_sync_snapshot(self) -> Snapshot:
+        working = self.is_working()
+        detail = self.device_detail_mode()
+        base = self.state.snapshot(activity=(), working=working)
+        status = self.sanitize_status(base.status, detail=detail, working=working)
+        if status is None:
+            status = {
+                "speaker": "Codex" if working else "System",
+                "kind": "working" if working else "sync",
+                "text": "Working" if working else "Syncing",
+            }
+        return Snapshot(
+            total=base.total,
+            running=base.running,
+            waiting=base.waiting,
+            msg=status["text"],
+            entries=(),
+            status=status,
+            activity=(),
+            tokens=base.tokens,
+            tokens_today=base.tokens_today,
+            remaining_pct=base.remaining_pct,
+            rate_limits=base.rate_limits,
+            legacy_text=False,
+        )
 
     def set_status(self, speaker: str, kind: str, text: Any) -> None:
         clean = short_text(text, 96)
@@ -404,16 +807,64 @@ class DesktopObserverBridge:
             return ordered
         return tuple(item for item in ordered if self.activity_seq_value(item) > self._last_activity_seq_sent)
 
-    async def send_snapshot(self) -> None:
+    async def mark_device_send_failure(self, exc: Exception) -> None:
+        LOGGER.warning("StickS3 send failed: %s", exc)
+        self._device_connected = False
+        self._device_state = "disconnected"
+        self._device_error = str(exc)
+        await self.device.close()
+        self.write_status(self._device_state, detail="StickS3 disconnected", error=str(exc))
+
+    async def send_initial_sync_snapshot(self) -> bool:
+        async with self._snapshot_lock:
+            working = self.is_working()
+            snapshot = self.initial_sync_snapshot()
+            if not self._device_connected:
+                self._last_sent_working = working
+                self.write_status(self._device_state, detail=self.state.last_message, error=self._device_error)
+                self._last_sent = time.monotonic()
+                return False
+            try:
+                await self.device.send_snapshot(snapshot)
+            except Exception as exc:
+                await self.mark_device_send_failure(exc)
+                return False
+            self._last_sent_working = working
+            self._last_sent = time.monotonic()
+            self.write_status(self._device_state, detail="Initial sync sent")
+            return True
+
+    async def send_snapshot(self, *, force: bool = False) -> None:
         async with self._snapshot_lock:
             activity = self.pending_activity()
-            await self.device.send_snapshot(self.state.snapshot(activity=activity))
+            working = self.is_working()
+            detail = self.device_detail_mode()
+            snapshot = self.snapshot_for_detail(self.state.snapshot(activity=activity, working=working), detail=detail, working=working)
+            wire_payload = snapshot.to_wire()
+            self._last_sent_working = working
+            if not self._device_connected:
+                self.write_status(self._device_state, detail=self.state.last_message, error=self._device_error)
+                self._last_sent = time.monotonic()
+                return
+            if not force and wire_payload == self._last_wire_payload:
+                self._last_sent_working = working
+                self.write_status(self._device_state, detail=self.state.last_message)
+                return
+            try:
+                await self.device.send_snapshot(snapshot)
+            except Exception as exc:
+                await self.mark_device_send_failure(exc)
+                return
+            try:
+                await self.device.request_status()
+            except Exception as exc:
+                LOGGER.debug("StickS3 status request failed after snapshot delivery: %s", exc)
             if activity:
                 self._last_activity_seq_sent = max(self.activity_seq_value(item) for item in activity)
-            await self.device.request_status()
             await asyncio.sleep(0.05)
             self._last_sent = time.monotonic()
-            self.write_status("connected", detail=self.state.last_message)
+            self._last_wire_payload = wire_payload
+            self.write_status(self._device_state, detail=self.state.last_message)
 
     async def handle_device_controls(self) -> None:
         while True:
@@ -426,16 +877,32 @@ class DesktopObserverBridge:
         if self.status_file is None:
             return
 
+        self._device_state = state
+        if error is not None:
+            self._device_error = error
+        elif state == "connected":
+            self._device_error = None
+        codex_state = self.codex_state()
         payload: dict[str, Any] = {
             "state": state,
             "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
             "pid": os.getpid(),
+            "bridge_state": "running",
+            "supervisor_state": "running",
+            "supervisor_pid": os.getpid(),
+            "mode": codex_state,
+            "menu_mode": codex_state,
+            "codex_state": codex_state,
+            "device_state": self._device_state,
+            "device_error": self._device_error,
             "detail": detail,
             "error": error,
             "rollout": str(self.rollout_path) if self.rollout_path else None,
             "thread_id": self.state.thread_id,
             "thread_name": self.state.thread_name,
-            "active": self.state.active,
+            "active": self.is_working(),
+            "task_active": self.state.active,
+            "detail_mode": self.device_detail_mode(),
             "last_message": self.state.last_message,
             "status": self.state.status,
             "tokens": self.state.tokens_total,
@@ -452,3 +919,13 @@ class DesktopObserverBridge:
             temp_path.replace(self.status_file)
         except OSError as exc:
             LOGGER.debug("Could not write status file %s: %s", self.status_file, exc)
+
+    def codex_state(self) -> str:
+        status_kind = str(self.state.status.get("kind") or "").lower() if isinstance(self.state.status, dict) else ""
+        if status_kind == "error":
+            return "err"
+        if self.is_working():
+            return "work"
+        if self.state.thread_id:
+            return "idle"
+        return "wait"

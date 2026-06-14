@@ -92,6 +92,7 @@ class Snapshot:
     tokens_today: int | None = None
     remaining_pct: int | None = None
     rate_limits: dict[str, dict[str, Any]] | None = None
+    legacy_text: bool = True
     plan: dict[str, Any] | None = None
     goal: dict[str, Any] | None = None
     prompt: dict[str, str] | None = None
@@ -102,9 +103,10 @@ class Snapshot:
             "total": self.total,
             "running": self.running,
             "waiting": self.waiting,
-            "msg": self.msg,
-            "entries": list(self.entries[:3]),
         }
+        if self.legacy_text:
+            data["msg"] = self.msg
+            data["entries"] = list(self.entries[:3])
         if self.status:
             data["status"] = self.status
         if self.activity:

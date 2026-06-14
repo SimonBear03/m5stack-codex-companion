@@ -221,6 +221,12 @@ class ProtocolTests(unittest.TestCase):
         self.assertIn("msg", wire)
         self.assertIn("entries", wire)
 
+    def test_snapshot_can_omit_legacy_text_fields(self) -> None:
+        wire = Snapshot(status={"speaker": "Codex", "kind": "idle", "text": "Idle"}, legacy_text=False).to_wire()
+        self.assertEqual({"speaker": "Codex", "kind": "idle", "text": "Idle"}, wire["status"])
+        self.assertNotIn("msg", wire)
+        self.assertNotIn("entries", wire)
+
     def test_snapshot_serializes_interaction(self) -> None:
         interaction = {"id": "req_1", "kind": "approval", "title": "Command"}
         self.assertEqual(interaction, Snapshot(interaction=interaction).to_wire()["interaction"])

@@ -1,0 +1,61 @@
+#!/usr/bin/env zsh
+set -euo pipefail
+
+REPO="${STICKS3_REPO:-$(cd "$(dirname "$0")/.." && pwd)}"
+PACKAGE_DIR="$REPO/macos/StickS3Companion"
+PRODUCT="StickS3Companion"
+APP_NAME="StickS3 Companion.app"
+APP_DIR="${STICKS3_COMPANION_APP:-$HOME/Applications/$APP_NAME}"
+BUILD_DIR="$PACKAGE_DIR/.build/release"
+BINARY="$BUILD_DIR/$PRODUCT"
+export DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
+
+if [[ ! -d "$DEVELOPER_DIR" ]]; then
+  echo "Xcode developer directory not found: $DEVELOPER_DIR" >&2
+  exit 1
+fi
+
+swift build -c release --package-path "$PACKAGE_DIR"
+
+rm -rf "$APP_DIR"
+mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
+cp "$BINARY" "$APP_DIR/Contents/MacOS/$PRODUCT"
+
+cat > "$APP_DIR/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>en</string>
+  <key>CFBundleDisplayName</key>
+  <string>StickS3 Companion</string>
+  <key>CFBundleExecutable</key>
+  <string>$PRODUCT</string>
+  <key>CFBundleIdentifier</key>
+  <string>com.simon.sticks3companion</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleName</key>
+  <string>StickS3 Companion</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>0.1.0</string>
+  <key>CFBundleVersion</key>
+  <string>1</string>
+  <key>LSUIElement</key>
+  <true/>
+  <key>NSDocumentsFolderUsageDescription</key>
+  <string>StickS3 Companion reads the local StickS3 bridge status and Codex session logs from Simon's Documents workspace.</string>
+  <key>STICKS3RepoPath</key>
+  <string>$REPO</string>
+</dict>
+</plist>
+PLIST
+
+printf 'APPL????' > "$APP_DIR/Contents/PkgInfo"
+/usr/bin/codesign --force --deep --sign - "$APP_DIR" >/dev/null
+
+echo "Built $APP_DIR"

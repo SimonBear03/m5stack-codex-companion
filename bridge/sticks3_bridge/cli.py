@@ -83,7 +83,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--rollout",
         help="Specific rollout JSONL file to observe.",
     )
-    desktop_observer.add_argument("--poll-interval", type=float, default=2.0)
+    desktop_observer.add_argument("--poll-interval", type=float, default=0.5)
     desktop_observer.add_argument("--heartbeat-interval", type=float, default=10.0)
     desktop_observer.add_argument(
         "--idle-heartbeat-interval",
@@ -94,6 +94,25 @@ def build_parser() -> argparse.ArgumentParser:
     desktop_observer.add_argument(
         "--status-file",
         help="Write desktop-observer lifecycle/status JSON to this file for menu bar helpers.",
+    )
+    desktop_observer.add_argument(
+        "--no-reconnect",
+        dest="reconnect",
+        action="store_false",
+        default=True,
+        help="Exit on BLE scan/connect/write failure instead of retrying forever.",
+    )
+    desktop_observer.add_argument(
+        "--reconnect-delay",
+        type=float,
+        default=1.0,
+        help="Initial delay before retrying a failed BLE bridge connection.",
+    )
+    desktop_observer.add_argument(
+        "--max-reconnect-delay",
+        type=float,
+        default=3.0,
+        help="Maximum delay between BLE bridge reconnect attempts.",
     )
 
     return parser
@@ -117,11 +136,11 @@ async def run_app_server(args: argparse.Namespace) -> None:
 
 
 async def run_desktop_observer(args: argparse.Namespace) -> None:
-    device = build_device(args)
     codex_home = Path(args.codex_home).expanduser() if args.codex_home else default_codex_home()
     sessions_dir = Path(args.sessions_dir).expanduser() if args.sessions_dir else codex_home / "sessions"
     rollout_path = Path(args.rollout).expanduser() if args.rollout else None
 
+    device = build_device(args)
     bridge = DesktopObserverBridge(
         device=device,
         sessions_dir=sessions_dir,
@@ -131,6 +150,9 @@ async def run_desktop_observer(args: argparse.Namespace) -> None:
         heartbeat_interval=args.heartbeat_interval,
         idle_heartbeat_interval=args.idle_heartbeat_interval,
         status_file=Path(args.status_file).expanduser() if args.status_file else None,
+        reconnect=args.reconnect,
+        reconnect_delay=args.reconnect_delay,
+        max_reconnect_delay=args.max_reconnect_delay,
     )
 
     try:

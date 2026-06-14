@@ -8,7 +8,6 @@ from typing import Any
 from .protocol import (
     DEFAULT_BLE_CHUNK_SIZE,
     NUS_RX_UUID,
-    NUS_SERVICE_UUID,
     NUS_TX_UUID,
     JsonLineDecoder,
     Snapshot,
@@ -17,6 +16,14 @@ from .protocol import (
 )
 
 LOGGER = logging.getLogger(__name__)
+
+
+def advertisement_matches_prefix(dev: Any, adv: Any, device_prefix: str) -> bool:
+    """Return true only for explicitly named StickS3 companion advertisements."""
+    return bool(
+        (getattr(dev, "name", None) or "").startswith(device_prefix)
+        or (getattr(adv, "local_name", None) or "").startswith(device_prefix)
+    )
 
 
 class StickS3Device(abc.ABC):
@@ -44,6 +51,9 @@ class StickS3Device(abc.ABC):
     async def request_status(self) -> None:
         raise NotImplementedError
 
+    def is_connected(self) -> bool:
+        return False
+
 
 class BleStickS3Device(StickS3Device):
     def __init__(
@@ -63,6 +73,7 @@ class BleStickS3Device(StickS3Device):
         self._interaction_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self._control_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
         self.last_status_ack: dict[str, Any] | None = None
+        self.always_connected = False
 
     async def connect(self) -> None:
         try:
@@ -73,11 +84,7 @@ class BleStickS3Device(StickS3Device):
         target = self.address
         if not target:
             device = await BleakScanner.find_device_by_filter(
-                lambda dev, adv: (
-                    (dev.name or "").startswith(self.device_prefix)
-                    or (adv.local_name or "").startswith(self.device_prefix)
-                    or NUS_SERVICE_UUID.lower() in [uuid.lower() for uuid in adv.service_uuids]
-                ),
+                lambda dev, adv: advertisement_matches_prefix(dev, adv, self.device_prefix),
                 timeout=self.scan_timeout,
             )
             if device is None:
@@ -88,15 +95,20 @@ class BleStickS3Device(StickS3Device):
         await client.connect()
         await client.start_notify(NUS_TX_UUID, self._handle_notification)
         self._client = client
-        await self.request_status()
 
     async def close(self) -> None:
         if self._client is None:
             return
         try:
-            await self._client.stop_notify(NUS_TX_UUID)
+            try:
+                await self._client.stop_notify(NUS_TX_UUID)
+            except Exception as exc:
+                LOGGER.debug("Ignoring BLE stop_notify cleanup error: %s", exc)
+            try:
+                await self._client.disconnect()
+            except Exception as exc:
+                LOGGER.debug("Ignoring BLE disconnect cleanup error: %s", exc)
         finally:
-            await self._client.disconnect()
             self._client = None
 
     async def send_snapshot(self, snapshot: Snapshot) -> None:
@@ -106,11 +118,14 @@ class BleStickS3Device(StickS3Device):
         if self._client is None:
             raise RuntimeError("StickS3 BLE client is not connected")
         for chunk in chunk_bytes(encode_json_line(data), self.chunk_size):
-            await self._client.write_gatt_char(NUS_RX_UUID, chunk, response=False)
-            await asyncio.sleep(0.008)
+            await self._client.write_gatt_char(NUS_RX_UUID, chunk, response=True)
+            await asyncio.sleep(0.004)
 
     async def request_status(self) -> None:
         await self.send_json({"cmd": "status"})
+
+    def is_connected(self) -> bool:
+        return bool(self._client is not None and getattr(self._client, "is_connected", False))
 
     async def wait_for_interaction(self, interaction_id: str, timeout: float) -> dict[str, Any]:
         while True:
@@ -150,6 +165,7 @@ class FakeStickS3Device(StickS3Device):
         self.auto_decision = auto_decision
         self.snapshots: list[Snapshot] = []
         self.last_status_ack: dict[str, Any] | None = None
+        self.always_connected = True
 
     async def connect(self) -> None:
         LOGGER.info("Using fake StickS3 device with auto decision: %s", self.auto_decision)
@@ -172,3 +188,6 @@ class FakeStickS3Device(StickS3Device):
 
     async def request_status(self) -> None:
         return None
+
+    def is_connected(self) -> bool:
+        return self.always_connected

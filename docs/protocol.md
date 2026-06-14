@@ -6,7 +6,7 @@ The BLE side is intentionally device-local and simple. It is not an official Ope
 
 ## BLE
 
-Advertise a name starting with `Codex-` over Nordic UART Service.
+Advertise a name starting with `Codex-S3-` over Nordic UART Service.
 
 The current firmware implements this with NimBLE-Arduino to keep the app binary small enough for the StickS3 workflow. The on-wire protocol remains Nordic UART Service JSONL.
 
@@ -20,7 +20,12 @@ Messages are UTF-8 JSON objects, one per line, terminated with `\n`.
 
 BLE notifications and writes are chunked. Use 20-byte chunks unless the host and device negotiate and test a larger MTU.
 
-The validated physical device currently advertises as `Codex-S3-0470`, but host software should only depend on the `Codex-` prefix and NUS service UUID.
+The firmware clears any partial receive buffer on BLE connect/disconnect and
+ignores malformed JSON fragments as transport noise instead of turning the
+dashboard mode into `ERR`. A clean full snapshot after reconnect restores the
+visible state.
+
+The validated physical device currently advertises as `Codex-S3-0470`. By default, host scans match the `Codex-S3-` advertised/local name only; generic Nordic UART Service advertisements are ignored unless the bridge is given an explicit device address.
 
 ## Dashboard Snapshot
 
@@ -76,11 +81,13 @@ The device accepts snapshots like:
 
 The firmware renders conversation activity as compact message blocks, not a raw line stream: a colored header such as `[Codex]` or `[User]`, followed by flush-left wrapped body lines and a blank separator line before the next message. Tool activity is treated as pinned current status only and is not added to scrollback, so command noise does not displace the readable conversation.
 
-The desktop observer caps each activity text at 1000 characters and keeps the latest 4 activity records for the first snapshot after connect or rollout switch. After that, it sends only new activity records. BLE still sends JSON as 20-byte chunks, but that is only a transport chunk size. The firmware accepts JSON lines up to 8192 bytes, keeps the latest raw activity messages, and rebuilds wrapped body lines for the selected text mode. The rendered body uses a fixed 190-line ring buffer.
+The device reports a `settings.detail` preference in status acks: `0=Full`, `1=Status`, `2=Usage`. Bridges should honor it before sending snapshots. `Full` may include `activity` and message text. `Status` should omit body `activity` and replace full user/Codex message text with generic labels. `Usage` should omit body `activity`, omit tool names/message text, omit legacy `msg`/`entries`, and send only generic state plus usage/token fields.
+
+The desktop observer caps each activity text at 1000 characters and keeps the latest 4 activity records for the first snapshot after connect or rollout switch. After that, it sends only new activity records. BLE sends JSON as 20-byte chunks using acknowledged writes, but that is only a transport chunk size. The firmware accepts JSON lines up to 8192 bytes, keeps the latest raw activity messages, and rebuilds wrapped body lines for the selected text mode. The rendered body uses a fixed 190-line ring buffer.
 
 The bridge normalizes common smart punctuation such as curly apostrophes, curly quotes, long dashes, and ellipses to terminal-safe ASCII before sending text to the device. Chinese display is currently a test path: the BLE/JSON path carries UTF-8, dashboard text uses M5GFX `efontCN_14` for both ASCII and non-ASCII text, and body wrapping measures rendered pixel width instead of raw byte count. Mixed-language typography still needs hardware validation.
 
-The firmware still accepts legacy `msg` and `entries`. When structured `activity` is absent, it uses those fields as a fallback body source.
+The firmware still accepts legacy `msg` and `entries`. When structured `activity` is absent and legacy text fields are present, it uses those fields as a fallback body source. Counter-only snapshots that carry only usage/rate-limit fields update the pinned widgets without creating body text.
 
 `tokens` is optional. When absent, the firmware displays `TOK n/a` rather than treating missing data as zero. Token totals are shown with compact units on-device.
 
@@ -123,7 +130,8 @@ The device replies:
       "pct": 85,
       "mv": 3890,
       "ma": -72,
-      "usb": true
+      "usb": true,
+      "charging": true
     },
     "sys": {
       "up": 123,
@@ -138,10 +146,14 @@ The device replies:
       "brightness": 1,
       "power": 1,
       "effective_power": 1,
+      "low_battery_low": false,
       "low_battery_max": false,
       "sound": 1,
+      "detail": 0,
       "nav": 0,
       "auto_newest": true,
+      "rotation_mode": 0,
+      "display_rotation": 1,
       "auto_dim_ms": 0,
       "auto_sleep_ms": 10000,
       "deep_sleep_ms": 0,
@@ -151,13 +163,15 @@ The device replies:
 }
 ```
 
-Battery telemetry fields are best-effort. `bat.mv` and `bat.ma` are omitted when the board API cannot provide a plausible reading. `settings.power` maps the saved profile: `0=Balanced`, `1=Saver`, `2=Max`, `3=Travel`. `settings.effective_power` can report `2=Max` when the low-battery auto policy is active even if the saved profile is lower.
+Battery telemetry fields are best-effort. `bat.mv` and `bat.ma` are omitted when the board API cannot provide a plausible reading. `bat.usb` means external power is present. `bat.charging` is emitted only when the board API reports a known charge state; when true, the top bar shows `CHG`, otherwise USB power shows as `USB`. `settings.power` maps the saved profile: `0=Always`, `1=Auto`, `2=Low`. `settings.effective_power` can report `2=Low` when the low-battery auto policy downgrades saved `Auto`; saved `Always` remains no-auto-sleep. `settings.detail` maps `0=Full`, `1=Status`, `2=Usage`. `settings.low_battery_max` is kept as a compatibility alias for `settings.low_battery_low`. `settings.auto_sleep_ms` is `0` when automatic display sleep is disabled for the current effective profile. `settings.deep_sleep_ms` and `settings.travel_shutdown_ms` are kept for compatibility and currently report `0` because dashboard power profiles keep BLE reachable. `settings.rotation_mode` maps `0=Auto`, `1=Lock`, `2=P`, `3=L`, `4=P180`, `5=L180`; `settings.display_rotation` is the active M5GFX rotation value `0..3`.
 
 The firmware also accepts `owner`, `name`, and `unpair` commands for compatibility with existing bridge tooling.
 
 ## Rate Limits
 
-Codex App Server exposes rolling Codex rate-limit windows through `account/rateLimits/read` and `account/rateLimits/updated`. Codex Desktop rollout logs can also include the same window shape in `token_count` events.
+Codex App Server exposes rolling Codex rate-limit windows through `account/rateLimits/read` and `account/rateLimits/updated`. Codex Desktop rollout logs can also include the same window shape in `token_count` events. `desktop-observer` seeds the `5h` and `7d` account usage rows from the freshest recent `token_count` event across rollout files, then keeps following the selected/current thread for activity text.
+
+The `tokens` field intentionally comes from `info.total_token_usage.total_tokens` in the latest observed `token_count` event. The bridge does not compute a local daily or weekly token sum.
 
 The current observed Codex bucket uses:
 
@@ -175,10 +189,18 @@ The device displays remaining percentages beside compact bars, for example `5h 6
 - `agent_message` -> `Codex` activity
 - `user_message` -> `User` activity
 - `response_item` function calls -> `Tool` activity with a cleaned tool name
-- `token_count` -> token total and rate-limit windows without replacing the current action line
+- `token_count` -> token total and account rate-limit windows without replacing the current action line
 - `patch_apply_end` -> `Tool: Patch applied` or `Tool: Patch failed`
 
-The observer sends active changes immediately. Idle heartbeat defaults to 45 seconds and does not repeat old `activity` items; this keeps the BLE radio and firmware JSON parser quieter while preserving the pinned status and usage rows.
+The observer treats fresh tool calls, tool output, patches, task starts, and Codex messages as durable work until a terminal event arrives, with a long watchdog fallback so the top bar can show `WORK` through longer thinking/tool runs. It refreshes usage from recent rollout `token_count` events about every 5 seconds with a file-change cache, so rate-limit rows can populate while the current observed thread is idle and reset/refill events replace stale low-limit values quickly. It also strips or suppresses message payloads according to the device-reported detail mode, and skips duplicate sanitized snapshots except for heartbeat sends. Idle heartbeat defaults to 45 seconds and does not repeat old `activity` items; this keeps the BLE radio and firmware JSON parser quieter while preserving the pinned status and usage rows.
+
+On BLE reconnect, the Desktop observer re-polls Codex state, sends a compact
+first sync packet, then sends the full dashboard snapshot before requesting the
+device status ack, so the StickS3 gets current usage and Codex state immediately
+after the link is established. The firmware shows `SYNC` between BLE connect and
+the first valid snapshot. The bridge also checks BLE client liveness while idle
+and keeps reconnect backoff short so display wake and reconnect do not wait for a
+long idle heartbeat.
 
 ## App Server Compatibility
 
