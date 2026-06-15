@@ -5,10 +5,23 @@ REPO="${STICKS3_REPO:-$(cd "$(dirname "$0")/.." && pwd)}"
 PACKAGE_DIR="$REPO/macos/StickS3Companion"
 PRODUCT="StickS3Companion"
 APP_NAME="StickS3 Companion.app"
-APP_DIR="${STICKS3_COMPANION_APP:-$HOME/Applications/$APP_NAME}"
+APP_DIR="${STICKS3_COMPANION_APP:-$REPO/dist/$APP_NAME}"
 BUILD_DIR="$PACKAGE_DIR/.build/release"
 BINARY="$BUILD_DIR/$PRODUCT"
+LAUNCH=0
 export DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
+
+for arg in "$@"; do
+  case "$arg" in
+    --launch)
+      LAUNCH=1
+      ;;
+    *)
+      echo "unknown argument: $arg" >&2
+      exit 64
+      ;;
+  esac
+done
 
 if [[ ! -d "$DEVELOPER_DIR" ]]; then
   echo "Xcode developer directory not found: $DEVELOPER_DIR" >&2
@@ -47,6 +60,14 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
   <string>1</string>
   <key>LSUIElement</key>
   <true/>
+  <key>LSMinimumSystemVersion</key>
+  <string>13.0</string>
+  <key>NSPrincipalClass</key>
+  <string>NSApplication</string>
+  <key>NSBluetoothAlwaysUsageDescription</key>
+  <string>StickS3 Companion uses Bluetooth to pair with and update Simon's StickS3 and Cardputer dashboard devices.</string>
+  <key>NSBluetoothPeripheralUsageDescription</key>
+  <string>StickS3 Companion uses Bluetooth to pair with and update Simon's StickS3 and Cardputer dashboard devices.</string>
   <key>NSDocumentsFolderUsageDescription</key>
   <string>StickS3 Companion reads the local StickS3 bridge status and Codex session logs from Simon's Documents workspace.</string>
   <key>STICKS3RepoPath</key>
@@ -57,5 +78,12 @@ PLIST
 
 printf 'APPL????' > "$APP_DIR/Contents/PkgInfo"
 /usr/bin/codesign --force --deep --sign - "$APP_DIR" >/dev/null
+/usr/bin/xattr -cr "$APP_DIR" 2>/dev/null || true
+/usr/bin/xattr -rd com.apple.provenance "$APP_DIR" 2>/dev/null || true
 
 echo "Built $APP_DIR"
+
+if (( LAUNCH )); then
+  /usr/bin/open -n "$APP_DIR"
+  echo "Launched $APP_DIR"
+fi

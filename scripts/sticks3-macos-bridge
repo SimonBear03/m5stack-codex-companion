@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+#!/usr/bin/python3
 from __future__ import annotations
 
 import argparse
@@ -32,7 +32,8 @@ APP_PLIST = APP_CONTENTS / "Info.plist"
 APP_PKGINFO = APP_CONTENTS / "PkgInfo"
 AGENT_LABEL = "com.simon.sticks3-codex-companion.bridge"
 AGENT_PLIST = Path.home() / "Library" / "LaunchAgents" / f"{AGENT_LABEL}.plist"
-AGENT_APP_DIR = Path.home() / "Applications" / "StickS3Bridge.app"
+APP_SUPPORT_DIR = Path.home() / "Library" / "Application Support" / "StickS3 Codex Companion"
+AGENT_APP_DIR = APP_SUPPORT_DIR / "StickS3Bridge.app"
 BRIDGE_PYTHON_INFO: dict[str, str] | None = None
 
 
@@ -177,6 +178,8 @@ def bridge_args(args: argparse.Namespace) -> list[str]:
         command.append("--no-reconnect")
     if args.device_prefix:
         command.extend(["--device-prefix", args.device_prefix])
+    if args.pairing_store:
+        command.extend(["--pairing-store", args.pairing_store])
     if args.address:
         command.extend(["--address", args.address])
     if args.codex_home:
@@ -217,6 +220,8 @@ def supervisor_option_args(args: argparse.Namespace) -> list[str]:
         command.append("--no-reconnect")
     if args.device_prefix:
         command.extend(["--device-prefix", args.device_prefix])
+    if args.pairing_store:
+        command.extend(["--pairing-store", args.pairing_store])
     if args.address:
         command.extend(["--address", args.address])
     if args.codex_home:
@@ -235,7 +240,7 @@ def supervisor_option_args(args: argparse.Namespace) -> list[str]:
 def python_bin() -> Path:
     local_bin = REPO_ROOT / ".bridge-venv" / "bin" / "python"
     if local_bin.exists():
-        return local_bin.resolve()
+        return local_bin
     return Path(sys.executable).resolve()
 
 
@@ -355,60 +360,15 @@ def app_info_plist() -> str:
 
 
 def app_launcher_source() -> str:
-    return f"""#include <stdio.h>
-#include <stdlib.h>
-#include <Python.h>
+    return f"""#!/bin/zsh
+set -euo pipefail
 
-int main(int argc, char *argv[]) {{
-    if (argc < 2) {{
-        fprintf(stderr, "missing bridge app main path\\n");
-        return 64;
-    }}
+if [[ "$#" -lt 1 ]]; then
+  echo "missing bridge app main path" >&2
+  exit 64
+fi
 
-    PyStatus status;
-    PyConfig config;
-    PyConfig_InitPythonConfig(&config);
-    config.use_environment = 1;
-    config.site_import = 1;
-    config.parse_argv = 0;
-
-    status = PyConfig_SetBytesString(&config, &config.program_name, argv[0]);
-    if (PyStatus_Exception(status)) {{
-        Py_ExitStatusException(status);
-    }}
-    status = PyConfig_SetBytesString(&config, &config.executable, {json.dumps(str(python_bin()))});
-    if (PyStatus_Exception(status)) {{
-        Py_ExitStatusException(status);
-    }}
-    status = PyConfig_SetBytesString(&config, &config.home, {json.dumps(str(python_home_dir()))});
-    if (PyStatus_Exception(status)) {{
-        Py_ExitStatusException(status);
-    }}
-    status = PyConfig_SetBytesArgv(&config, argc - 1, argv + 1);
-    if (PyStatus_Exception(status)) {{
-        Py_ExitStatusException(status);
-    }}
-
-    status = Py_InitializeFromConfig(&config);
-    PyConfig_Clear(&config);
-    if (PyStatus_Exception(status)) {{
-        Py_ExitStatusException(status);
-    }}
-
-    FILE *fp = fopen(argv[1], "r");
-    if (!fp) {{
-        perror(argv[1]);
-        Py_FinalizeEx();
-        return 66;
-    }}
-
-    int result = PyRun_SimpleFileExFlags(fp, argv[1], 1, NULL);
-    int final_result = Py_FinalizeEx();
-    if (final_result < 0) {{
-        return 120;
-    }}
-    return result == 0 ? 0 : 1;
-}}
+exec {shlex.quote(str(python_bin()))} "$@"
 """
 
 
@@ -488,11 +448,16 @@ finally:
 
 def sign_app_bundle(app_dir: Path) -> None:
     codesign = shutil.which("codesign") or "/usr/bin/codesign"
-    result = subprocess.run(
-        [codesign, "--force", "--deep", "--sign", "-", str(app_dir)],
-        text=True,
-        capture_output=True,
-    )
+    try:
+        result = subprocess.run(
+            [codesign, "--force", "--deep", "--sign", "-", str(app_dir)],
+            text=True,
+            capture_output=True,
+            timeout=15.0,
+        )
+    except subprocess.TimeoutExpired:
+        print(f"warning: codesign timed out for {app_dir}; continuing with unsigned helper", file=sys.stderr)
+        return
     if result.returncode != 0:
         message = result.stderr.strip() or result.stdout.strip() or "codesign failed"
         raise RuntimeError(f"Could not sign {app_dir}: {message}")
@@ -508,14 +473,14 @@ def app_paths(app_dir: Path) -> dict[str, Path]:
         "main": contents / "Resources" / "bridge_app_main.py",
         "plist": contents / "Info.plist",
         "pkginfo": contents / "PkgInfo",
-        "launcher_source": contents / "Resources" / "launcher.c",
+        "launcher_source": contents / "Resources" / "launcher.sh",
     }
 
 
 def text_matches(path: Path, desired: str) -> bool:
     try:
         return path.read_text(encoding="utf-8") == desired
-    except OSError:
+    except (OSError, UnicodeDecodeError):
         return False
 
 
@@ -530,6 +495,7 @@ def app_bundle_current(app_dir: Path) -> bool:
     paths = app_paths(app_dir)
     return (
         paths["exec"].exists()
+        and text_matches(paths["exec"], app_launcher_source())
         and text_matches(paths["plist"], app_info_plist())
         and text_matches(paths["pkginfo"], "APPL????")
         and text_matches(paths["main"], app_main_source())
@@ -538,18 +504,7 @@ def app_bundle_current(app_dir: Path) -> bool:
 
 
 def build_app_launcher() -> None:
-    clang = shutil.which("clang") or "/usr/bin/clang"
-    launcher_source = APP_RESOURCES / "launcher.c"
-    cflags = python_config_flags("--embed", "--cflags")
-    ldflags = python_config_flags("--embed", "--ldflags")
-    result = subprocess.run(
-        [clang, *cflags, "-Os", str(launcher_source), "-o", str(APP_EXEC), *ldflags],
-        text=True,
-        capture_output=True,
-    )
-    if result.returncode != 0:
-        message = result.stderr.strip() or result.stdout.strip() or "clang failed"
-        raise RuntimeError(f"Could not build StickS3 bridge app launcher: {message}")
+    APP_EXEC.write_text(app_launcher_source(), encoding="utf-8")
     APP_EXEC.chmod(0o755)
 
 
@@ -560,7 +515,13 @@ def ensure_bridge_app() -> Path:
     changed = write_text_if_changed(APP_PLIST, app_info_plist()) or changed
     changed = write_text_if_changed(APP_PKGINFO, "APPL????", encoding="ascii") or changed
     changed = write_text_if_changed(APP_MAIN, app_main_source()) or changed
-    changed = write_text_if_changed(APP_RESOURCES / "launcher.c", app_launcher_source()) or changed
+    changed = write_text_if_changed(APP_RESOURCES / "launcher.sh", app_launcher_source()) or changed
+    old_launcher_source = APP_RESOURCES / "launcher.c"
+    try:
+        old_launcher_source.unlink()
+        changed = True
+    except FileNotFoundError:
+        pass
     if changed or not APP_EXEC.exists():
         build_app_launcher()
         changed = True
@@ -591,8 +552,8 @@ def ensure_agent_app() -> Path:
 def app_open_command(args: argparse.Namespace) -> list[str]:
     app_dir = ensure_agent_app()
     app_main = app_dir / "Contents" / "Resources" / "bridge_app_main.py"
-    open_bin = shutil.which("open") or "/usr/bin/open"
-    return [open_bin, "-n", "-g", str(app_dir), "--args", str(app_main), *bridge_args(args)]
+    app_exec = app_dir / "Contents" / "MacOS" / "StickS3BridgeLauncher"
+    return ["/bin/zsh", str(app_exec), str(app_main), *bridge_args(args)]
 
 
 def launchd_domain() -> str:
@@ -606,10 +567,10 @@ def launchd_service() -> str:
 def agent_payload(args: argparse.Namespace) -> dict[str, Any]:
     app_dir = ensure_agent_app()
     app_main = app_dir / "Contents" / "Resources" / "bridge_app_main.py"
-    open_bin = shutil.which("open") or "/usr/bin/open"
+    app_exec = app_dir / "Contents" / "MacOS" / "StickS3BridgeLauncher"
     return {
         "Label": AGENT_LABEL,
-        "ProgramArguments": [open_bin, "-n", "-g", str(app_dir), "--args", str(app_main), *bridge_args(args)],
+        "ProgramArguments": ["/bin/zsh", str(app_exec), str(app_main), *bridge_args(args)],
         "RunAtLoad": True,
         "LimitLoadToSessionType": "Aqua",
         "KeepAlive": {"Crashed": True},
@@ -776,7 +737,7 @@ def command_ensure(args: argparse.Namespace) -> int:
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     write_status("starting", detail="Menu auto-start queued")
     script = REPO_ROOT / "scripts" / "sticks3-macos-bridge"
-    command = [str(script), "start", *supervisor_option_args(args)]
+    command = [sys.executable, str(script), "start", *supervisor_option_args(args)]
     with LOG_FILE.open("ab") as log:
         log.write(f"\n[{now_iso()}] menu auto-start queued\n".encode("utf-8"))
         subprocess.Popen(
@@ -879,6 +840,11 @@ def command_status(args: argparse.Namespace) -> int:
     updated = payload.get("updated_at") or "never"
     print(f"bridge: {supervisor}" + (f" (pid {pid})" if pid else ""))
     print(f"device: {state}")
+    if payload.get("device_count") is not None:
+        print(f"devices: {payload.get('connected_device_count', 0)}/{payload.get('device_count', 0)} connected")
+        for device in payload.get("devices") or []:
+            label = device.get("label") or device.get("device_id") or "device"
+            print(f"  - {label}: {device.get('state') or 'unknown'}")
     print(f"updated: {updated}")
     if detail:
         print(f"detail: {detail}")
@@ -913,7 +879,14 @@ def add_bridge_options(parser: argparse.ArgumentParser) -> None:
         default=float(os.environ.get("STICKS3_MAX_RECONNECT_DELAY", "3")),
     )
     parser.add_argument("--no-reconnect", dest="reconnect", action="store_false", default=True)
-    parser.add_argument("--device-prefix", default=os.environ.get("STICKS3_DEVICE_PREFIX", "Codex-S3-"))
+    parser.add_argument("--device-prefix", default=os.environ.get("STICKS3_DEVICE_PREFIX", "Codex-S3-,Codex-CP-"))
+    parser.add_argument(
+        "--pairing-store",
+        default=os.environ.get(
+            "STICKS3_PAIRING_STORE",
+            str(Path.home() / "Library" / "Application Support" / "StickS3 Codex Companion" / "paired-devices.json"),
+        ),
+    )
     parser.add_argument("--address", default=os.environ.get("STICKS3_ADDRESS"))
     parser.add_argument("--codex-home", default=os.environ.get("STICKS3_CODEX_HOME"))
     parser.add_argument("--sessions-dir", default=os.environ.get("STICKS3_SESSIONS_DIR"))

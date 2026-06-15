@@ -50,6 +50,70 @@ class StatusRequestFailingDevice(FakeStickS3Device):
         raise RuntimeError("status ack write failed")
 
 
+class FakeFleetTarget:
+    def __init__(self, device_id: str, *, detail: int = 0, connected: bool = True) -> None:
+        self.device_id = device_id
+        self.label = device_id
+        self.state = "connected" if connected else "disconnected"
+        self.error = None
+        self.snapshots = []
+        self.last_status_ack = {"settings": {"detail": detail}}
+        self.last_wire_payload = None
+        self.last_activity_seq_sent = 0
+        self.initial_sync_needed = False
+
+    def is_connected(self) -> bool:
+        return self.state == "connected"
+
+    async def send_snapshot(self, snapshot) -> None:
+        self.snapshots.append(snapshot)
+
+    async def request_status(self) -> None:
+        return None
+
+    async def close(self) -> None:
+        self.state = "disconnected"
+
+    def status(self) -> dict:
+        return {"device_id": self.device_id, "label": self.label, "state": self.state, "error": self.error}
+
+
+class FakeFleetDevice:
+    def __init__(self, targets: list[FakeFleetTarget]) -> None:
+        self.targets = targets
+        self.always_connected = False
+
+    async def connect(self) -> None:
+        return None
+
+    async def close(self) -> None:
+        return None
+
+    def all_targets(self) -> list[FakeFleetTarget]:
+        return self.targets
+
+    def connected_targets(self) -> list[FakeFleetTarget]:
+        return [target for target in self.targets if target.is_connected()]
+
+    def needs_initial_sync(self) -> bool:
+        return any(target.initial_sync_needed for target in self.connected_targets())
+
+    def aggregate_state(self) -> str:
+        return "connected" if self.connected_targets() else "disconnected"
+
+    def status_summary(self) -> dict:
+        return {
+            "state": self.aggregate_state(),
+            "device_count": len(self.targets),
+            "connected_device_count": len(self.connected_targets()),
+            "devices": [target.status() for target in self.targets],
+            "device_error": None,
+        }
+
+    async def wait_for_control(self) -> dict:
+        raise RuntimeError("not used")
+
+
 class DesktopObserverTests(unittest.IsolatedAsyncioTestCase):
     def test_desktop_rate_limits_normalize_codex_rollout_shape(self) -> None:
         normalized = compact_desktop_rate_limits(
@@ -554,6 +618,61 @@ class DesktopObserverTests(unittest.IsolatedAsyncioTestCase):
         await bridge.send_snapshot()
 
         self.assertEqual(1, len(device.snapshots))
+
+    async def test_fleet_honors_detail_mode_per_device(self) -> None:
+        full = FakeFleetTarget("full", detail=0)
+        usage = FakeFleetTarget("usage", detail=2)
+        bridge = DesktopObserverBridge(device=FakeFleetDevice([full, usage]))
+        bridge.state.thread_id = "thread-fleet-detail"
+        bridge.state.active = True
+        bridge.set_status("Tool", "started", "exec_command")
+        bridge.add_activity("Codex", "message", "Sensitive answer text")
+        bridge.state.tokens_total = 1000
+
+        await bridge.send_snapshot()
+
+        full_wire = full.snapshots[-1].to_wire()
+        usage_wire = usage.snapshots[-1].to_wire()
+        self.assertIn("activity", full_wire)
+        self.assertIn("Sensitive answer text", json.dumps(full_wire))
+        self.assertNotIn("Sensitive answer text", json.dumps(usage_wire))
+        self.assertNotIn("exec_command", json.dumps(usage_wire))
+        self.assertNotIn("activity", usage_wire)
+
+    async def test_fleet_disconnected_device_does_not_block_connected_device(self) -> None:
+        connected = FakeFleetTarget("connected", detail=0)
+        disconnected = FakeFleetTarget("disconnected", detail=0, connected=False)
+        bridge = DesktopObserverBridge(device=FakeFleetDevice([connected, disconnected]))
+        bridge.state.thread_id = "thread-fleet-connected"
+        bridge.set_status("Codex", "idle", "Idle")
+
+        await bridge.send_snapshot(force=True)
+
+        self.assertEqual(1, len(connected.snapshots))
+        self.assertEqual(0, len(disconnected.snapshots))
+
+    async def test_reconnected_fleet_device_gets_activity_from_its_own_cursor(self) -> None:
+        first = FakeFleetTarget("first", detail=0)
+        second = FakeFleetTarget("second", detail=0, connected=False)
+        bridge = DesktopObserverBridge(device=FakeFleetDevice([first, second]))
+        bridge.state.thread_id = "thread-fleet-reconnect"
+        bridge.set_status("Codex", "message", "First")
+        bridge.add_activity("Codex", "message", "First activity")
+
+        await bridge.send_snapshot(force=True)
+        self.assertEqual(1, first.last_activity_seq_sent)
+        self.assertEqual(0, second.last_activity_seq_sent)
+
+        second.state = "connected"
+        second.initial_sync_needed = True
+        bridge.set_status("Codex", "message", "Second")
+        bridge.add_activity("Codex", "message", "Second activity")
+
+        await bridge.send_snapshot()
+
+        second_wire = second.snapshots[-1].to_wire()
+        texts = [item["text"] for item in second_wire["activity"]]
+        self.assertEqual(["First activity", "Second activity"], texts)
 
     def test_work_like_activity_sets_running_without_task_started(self) -> None:
         device = FakeStickS3Device()

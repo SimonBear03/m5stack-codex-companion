@@ -7,13 +7,15 @@ from pathlib import Path
 
 from .app_server import CodexAppServerBridge, build_transport
 from .desktop_observer import DesktopObserverBridge, default_codex_home
-from .device import BleStickS3Device, FakeStickS3Device
+from .device import DEFAULT_DEVICE_PREFIXES, BleCompanionFleet, BleStickS3Device, FakeStickS3Device
+from .pairing import DEFAULT_PAIRING_STORE_PATH, PairingStore
 
 
 def add_device_args(parser: argparse.ArgumentParser) -> None:
-    parser.add_argument("--device-prefix", default="Codex-S3-")
+    parser.add_argument("--device-prefix", default=DEFAULT_DEVICE_PREFIXES)
     parser.add_argument("--address", help="BLE address to connect directly instead of scanning.")
     parser.add_argument("--scan-timeout", type=float, default=10.0)
+    parser.add_argument("--pairing-store", default=str(DEFAULT_PAIRING_STORE_PATH))
     parser.add_argument(
         "--fake-device",
         action="store_true",
@@ -30,6 +32,18 @@ def build_device(args: argparse.Namespace) -> FakeStickS3Device | BleStickS3Devi
             address=args.address,
             scan_timeout=args.scan_timeout,
         )
+    )
+
+
+def build_fleet(args: argparse.Namespace) -> FakeStickS3Device | BleCompanionFleet:
+    if args.fake_device:
+        return FakeStickS3Device(auto_decision=getattr(args, "auto_decision", "deny"))
+    return BleCompanionFleet(
+        store=PairingStore(Path(args.pairing_store).expanduser()),
+        device_prefix=args.device_prefix,
+        scan_timeout=args.scan_timeout,
+        reconnect_delay=getattr(args, "reconnect_delay", 1.0),
+        max_reconnect_delay=getattr(args, "max_reconnect_delay", 3.0),
     )
 
 
@@ -115,6 +129,23 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum delay between BLE bridge reconnect attempts.",
     )
 
+    pair_device = subcommands.add_parser("pair-device", help="Pair one StickS3/Cardputer companion before it can receive Codex data.")
+    pair_device.add_argument("--device-prefix", default=DEFAULT_DEVICE_PREFIXES)
+    pair_device.add_argument("--address", help="BLE address to connect directly instead of scanning.")
+    pair_device.add_argument("--scan-timeout", type=float, default=10.0)
+    pair_device.add_argument("--pairing-store", default=str(DEFAULT_PAIRING_STORE_PATH))
+    pair_device.add_argument("--label", help="Friendly label stored on the Mac for this companion.")
+
+    list_devices = subcommands.add_parser("list-devices", help="List paired companion devices.")
+    list_devices.add_argument("--pairing-store", default=str(DEFAULT_PAIRING_STORE_PATH))
+    list_devices.add_argument("--json", action="store_true")
+
+    unpair_device = subcommands.add_parser("unpair-device", help="Unpair a companion by device_id.")
+    unpair_device.add_argument("device_id")
+    unpair_device.add_argument("--device-prefix", default=DEFAULT_DEVICE_PREFIXES)
+    unpair_device.add_argument("--scan-timeout", type=float, default=10.0)
+    unpair_device.add_argument("--pairing-store", default=str(DEFAULT_PAIRING_STORE_PATH))
+
     return parser
 
 
@@ -135,12 +166,64 @@ async def run_app_server(args: argparse.Namespace) -> None:
         await transport.close()
 
 
+async def run_pair_device(args: argparse.Namespace) -> None:
+    store = PairingStore(Path(args.pairing_store).expanduser())
+    device = BleStickS3Device(device_prefix=args.device_prefix, address=args.address, scan_timeout=args.scan_timeout)
+    try:
+        await device.connect()
+        paired = await device.pair(host_id=store.host_id(), label=args.label)
+        store.upsert_device(paired)
+        print(f"paired {paired.label} ({paired.device_id})")
+        if paired.address:
+            print(f"address: {paired.address}")
+    finally:
+        await device.close()
+
+
+async def run_unpair_device(args: argparse.Namespace) -> None:
+    store = PairingStore(Path(args.pairing_store).expanduser())
+    devices = {device.device_id: device for device in store.devices()}
+    paired = devices.get(args.device_id)
+    if paired is None:
+        print(f"device is not paired locally: {args.device_id}")
+        return
+
+    device = BleStickS3Device(device_prefix=args.device_prefix, address=paired.address, scan_timeout=args.scan_timeout)
+    try:
+        try:
+            await device.connect()
+            await device.authenticate(paired, host_id=store.host_id())
+            await device.send_command("unpair", timeout=5.0)
+        except Exception as exc:
+            logging.warning("Could not send unpair to device; removing local pairing only: %s", exc)
+        store.remove_device(args.device_id)
+        print(f"unpaired {paired.label} ({paired.device_id})")
+    finally:
+        await device.close()
+
+
+def run_list_devices(args: argparse.Namespace) -> None:
+    store = PairingStore(Path(args.pairing_store).expanduser())
+    devices = store.devices()
+    if args.json:
+        import json
+
+        print(json.dumps({"host_id": store.host_id(), "devices": [device.to_dict() for device in devices]}, indent=2, sort_keys=True))
+        return
+    if not devices:
+        print("no paired devices")
+        return
+    for device in devices:
+        state = "enabled" if device.enabled else "disabled"
+        print(f"{device.device_id}  {state}  {device.label}  {device.board}  {device.address or '-'}  {device.name}")
+
+
 async def run_desktop_observer(args: argparse.Namespace) -> None:
     codex_home = Path(args.codex_home).expanduser() if args.codex_home else default_codex_home()
     sessions_dir = Path(args.sessions_dir).expanduser() if args.sessions_dir else codex_home / "sessions"
     rollout_path = Path(args.rollout).expanduser() if args.rollout else None
 
-    device = build_device(args)
+    device = build_fleet(args)
     bridge = DesktopObserverBridge(
         device=device,
         sessions_dir=sessions_dir,
@@ -182,6 +265,34 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "desktop-observer":
         try:
             asyncio.run(run_desktop_observer(args))
+        except KeyboardInterrupt:
+            return 130
+        except Exception as exc:
+            logging.error("%s", exc)
+            return 1
+        return 0
+
+    if args.command == "pair-device":
+        try:
+            asyncio.run(run_pair_device(args))
+        except KeyboardInterrupt:
+            return 130
+        except Exception as exc:
+            logging.error("%s", exc)
+            return 1
+        return 0
+
+    if args.command == "list-devices":
+        try:
+            run_list_devices(args)
+        except Exception as exc:
+            logging.error("%s", exc)
+            return 1
+        return 0
+
+    if args.command == "unpair-device":
+        try:
+            asyncio.run(run_unpair_device(args))
         except KeyboardInterrupt:
             return 130
         except Exception as exc:

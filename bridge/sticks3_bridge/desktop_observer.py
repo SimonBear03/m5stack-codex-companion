@@ -357,12 +357,21 @@ class DesktopObserverBridge:
             work_expired = self._last_sent_working and not working
             status_expired = self.expire_transient_work_status() if not working else False
             changed = changed or status_expired
+            fleet_needs_sync = bool(getattr(self.device, "needs_initial_sync", lambda: False)())
             force_send = now - self._last_sent >= heartbeat_interval
-            if changed or work_expired or force_send:
+            if changed or work_expired or force_send or fleet_needs_sync:
                 await self.send_snapshot(force=force_send)
             await asyncio.sleep(self.poll_interval)
 
     async def device_connection_loop(self) -> None:
+        if hasattr(self.device, "all_targets"):
+            await self.device.connect()
+            while True:
+                state = getattr(self.device, "aggregate_state", lambda: "disconnected")()
+                self._device_connected = state == "connected"
+                self.write_status(state, detail=self.state.last_message)
+                await asyncio.sleep(1.0)
+
         if self._device_connected and getattr(self.device, "always_connected", False):
             return
 
@@ -435,6 +444,7 @@ class DesktopObserverBridge:
             self._active_work_deadline = 0.0
             self._last_sent_working = False
             self._last_wire_payload = None
+            self.reset_device_send_state()
             self.state = DesktopObserverState(tokens_total=tokens_total, rate_limits=rate_limits, usage_event_ts=usage_event_ts)
             LOGGER.info("Observing Codex Desktop rollout: %s", path)
 
@@ -676,8 +686,17 @@ class DesktopObserverBridge:
         self._last_usage_scan = now
         return self.apply_usage(latest_account_usage(self.sessions_dir, cache=self._usage_file_cache))
 
-    def device_detail_mode(self) -> int:
-        device_status = getattr(self.device, "last_status_ack", None)
+    def reset_device_send_state(self) -> None:
+        if not hasattr(self.device, "all_targets"):
+            return
+        for target in self.device.all_targets():
+            target.last_wire_payload = None
+            target.last_activity_seq_sent = 0
+            target.initial_sync_needed = target.is_connected()
+
+    def device_detail_mode(self, target: Any | None = None) -> int:
+        source = target if target is not None else self.device
+        device_status = getattr(source, "last_status_ack", None)
         if not isinstance(device_status, dict):
             return DETAIL_FULL
         settings = device_status.get("settings")
@@ -746,9 +765,9 @@ class DesktopObserverBridge:
             legacy_text=False,
         )
 
-    def initial_sync_snapshot(self) -> Snapshot:
+    def initial_sync_snapshot(self, *, detail: int | None = None) -> Snapshot:
         working = self.is_working()
-        detail = self.device_detail_mode()
+        detail = self.device_detail_mode() if detail is None else detail
         base = self.state.snapshot(activity=(), working=working)
         status = self.sanitize_status(base.status, detail=detail, working=working)
         if status is None:
@@ -807,6 +826,13 @@ class DesktopObserverBridge:
             return ordered
         return tuple(item for item in ordered if self.activity_seq_value(item) > self._last_activity_seq_sent)
 
+    def pending_activity_for_target(self, target: Any) -> tuple[dict[str, Any], ...]:
+        ordered = tuple(reversed(self.state.activity))
+        last_sent = int(getattr(target, "last_activity_seq_sent", 0) or 0)
+        if last_sent <= 0:
+            return ordered
+        return tuple(item for item in ordered if self.activity_seq_value(item) > last_sent)
+
     async def mark_device_send_failure(self, exc: Exception) -> None:
         LOGGER.warning("StickS3 send failed: %s", exc)
         self._device_connected = False
@@ -815,7 +841,17 @@ class DesktopObserverBridge:
         await self.device.close()
         self.write_status(self._device_state, detail="StickS3 disconnected", error=str(exc))
 
+    async def mark_target_send_failure(self, target: Any, exc: Exception) -> None:
+        LOGGER.warning("Companion send failed for %s: %s", getattr(target, "label", "device"), exc)
+        target.state = "disconnected"
+        target.error = str(exc)
+        await target.close()
+        self.write_status(getattr(self.device, "aggregate_state", lambda: "disconnected")(), detail="Companion disconnected", error=str(exc))
+
     async def send_initial_sync_snapshot(self) -> bool:
+        if hasattr(self.device, "all_targets"):
+            return await self.send_initial_sync_to_fleet()
+
         async with self._snapshot_lock:
             working = self.is_working()
             snapshot = self.initial_sync_snapshot()
@@ -834,7 +870,32 @@ class DesktopObserverBridge:
             self.write_status(self._device_state, detail="Initial sync sent")
             return True
 
+    async def send_initial_sync_to_fleet(self) -> bool:
+        async with self._snapshot_lock:
+            await self.refresh_observed_state(force_usage=True)
+            sent = False
+            for target in self.device.connected_targets():
+                detail = self.device_detail_mode(target)
+                snapshot = self.initial_sync_snapshot(detail=detail)
+                try:
+                    await target.send_snapshot(snapshot)
+                    await target.request_status()
+                except Exception as exc:
+                    await self.mark_target_send_failure(target, exc)
+                    continue
+                target.last_wire_payload = snapshot.to_wire()
+                target.initial_sync_needed = False
+                sent = True
+            self._last_sent_working = self.is_working()
+            self._last_sent = time.monotonic()
+            self.write_status(getattr(self.device, "aggregate_state", lambda: "disconnected")(), detail="Initial sync sent" if sent else self.state.last_message)
+            return sent
+
     async def send_snapshot(self, *, force: bool = False) -> None:
+        if hasattr(self.device, "all_targets"):
+            await self.send_snapshot_to_fleet(force=force)
+            return
+
         async with self._snapshot_lock:
             activity = self.pending_activity()
             working = self.is_working()
@@ -866,6 +927,40 @@ class DesktopObserverBridge:
             self._last_wire_payload = wire_payload
             self.write_status(self._device_state, detail=self.state.last_message)
 
+    async def send_snapshot_to_fleet(self, *, force: bool = False) -> None:
+        async with self._snapshot_lock:
+            working = self.is_working()
+            sent_any = False
+            for target in self.device.connected_targets():
+                activity = self.pending_activity_for_target(target)
+                detail = self.device_detail_mode(target)
+                snapshot = self.snapshot_for_detail(self.state.snapshot(activity=activity, working=working), detail=detail, working=working)
+                wire_payload = snapshot.to_wire()
+                if not force and not target.initial_sync_needed and wire_payload == target.last_wire_payload:
+                    continue
+                try:
+                    if target.initial_sync_needed:
+                        initial = self.initial_sync_snapshot(detail=detail)
+                        await target.send_snapshot(initial)
+                        target.initial_sync_needed = False
+                    await target.send_snapshot(snapshot)
+                except Exception as exc:
+                    await self.mark_target_send_failure(target, exc)
+                    continue
+                try:
+                    await target.request_status()
+                except Exception as exc:
+                    LOGGER.debug("Companion status request failed after snapshot delivery: %s", exc)
+                if activity:
+                    target.last_activity_seq_sent = max(self.activity_seq_value(item) for item in activity)
+                target.last_wire_payload = wire_payload
+                sent_any = True
+            self._last_sent_working = working
+            self._last_sent = time.monotonic()
+            self.write_status(getattr(self.device, "aggregate_state", lambda: "disconnected")(), detail=self.state.last_message)
+            if sent_any:
+                await asyncio.sleep(0.05)
+
     async def handle_device_controls(self) -> None:
         while True:
             message = await self.device.wait_for_control()
@@ -877,6 +972,11 @@ class DesktopObserverBridge:
         if self.status_file is None:
             return
 
+        fleet_summary = getattr(self.device, "status_summary", lambda: None)()
+        if isinstance(fleet_summary, dict):
+            state = str(fleet_summary.get("state") or state)
+            if error is None:
+                error = fleet_summary.get("device_error")
         self._device_state = state
         if error is not None:
             self._device_error = error
@@ -908,6 +1008,10 @@ class DesktopObserverBridge:
             "tokens": self.state.tokens_total,
             "rate_limits": self.state.rate_limits,
         }
+        if isinstance(fleet_summary, dict):
+            payload["device_count"] = fleet_summary.get("device_count", 0)
+            payload["connected_device_count"] = fleet_summary.get("connected_device_count", 0)
+            payload["devices"] = fleet_summary.get("devices", [])
         device_status = getattr(self.device, "last_status_ack", None)
         if isinstance(device_status, dict):
             payload["device"] = device_status

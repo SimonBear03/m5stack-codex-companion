@@ -1,10 +1,16 @@
 #include <Arduino.h>
 #include <ArduinoJson.h>
 #include <M5Unified.h>
+#if defined(CODEX_COMPANION_CARDPUTER)
+#include <M5Cardputer.h>
+#else
 #include <M5PM1.h>
+#endif
 #include <NimBLEDevice.h>
 #include <Preferences.h>
+#include <ctype.h>
 #include <math.h>
+#include <mbedtls/md.h>
 
 namespace {
 
@@ -12,9 +18,24 @@ constexpr const char* NUS_SERVICE_UUID = "6e400001-b5a3-f393-e0a9-e50e24dcca9e";
 constexpr const char* NUS_RX_UUID = "6e400002-b5a3-f393-e0a9-e50e24dcca9e";
 constexpr const char* NUS_TX_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e";
 
+#if defined(CODEX_COMPANION_CARDPUTER)
+constexpr bool BOARD_HAS_IMU_ORIENTATION = false;
+constexpr uint8_t BOARD_DEFAULT_ROTATION = 1;
+constexpr const char* BOARD_DEVICE_PREFIX = "Codex-CP-";
+constexpr const char* BOARD_INPUT_HINT = "Enter set  Arrows nav";
+constexpr const char* BOARD_TYPE = "cardputer_adv";
+#else
+constexpr bool BOARD_HAS_IMU_ORIENTATION = true;
+constexpr uint8_t BOARD_DEFAULT_ROTATION = 0;
+constexpr const char* BOARD_DEVICE_PREFIX = "Codex-S3-";
+constexpr const char* BOARD_INPUT_HINT = "A change  B next";
+constexpr const char* BOARD_TYPE = "sticks3";
+#endif
+
 constexpr uint32_t STALE_AFTER_MS = 90000;
 constexpr uint32_t BLE_NOTIFY_CHUNK_DELAY_MS = 8;
 constexpr uint32_t LONG_PRESS_MS = 650;
+constexpr uint32_t PAIRING_TIMEOUT_MS = 60000;
 constexpr uint32_t SETTINGS_IDLE_MS = 12000;
 constexpr uint32_t ACTIVITY_SOUND_COOLDOWN_MS = 1400;
 constexpr uint32_t SHAKE_WAKE_ARM_DELAY_MS = 2500;
@@ -39,13 +60,33 @@ constexpr size_t RAW_ACTIVITY_COUNT = 8;
 constexpr size_t SEEN_SEQ_COUNT = 24;
 constexpr size_t BLE_NOTIFY_CHUNK_SIZE = 20;
 constexpr size_t RX_BUFFER_LIMIT = 8192;
+constexpr size_t PAIR_SECRET_HEX_LENGTH = 64;
 
-enum InputEvent : uint8_t {
-  INPUT_NONE = 0,
-  INPUT_A_SINGLE,
-  INPUT_B_SINGLE,
-  INPUT_A_LONG,
-  INPUT_B_LONG
+enum InputAction : uint8_t {
+  ACTION_NONE = 0,
+  ACTION_SCROLL_NEWER,
+  ACTION_SCROLL_OLDER,
+  ACTION_SCROLL_NEWER_LINE,
+  ACTION_SCROLL_OLDER_LINE,
+  ACTION_SCROLL_NEWER_PAGE,
+  ACTION_SCROLL_OLDER_PAGE,
+  ACTION_OPEN_SETTINGS,
+  ACTION_CLOSE_SETTINGS,
+  ACTION_NEXT_SETTING,
+  ACTION_PREVIOUS_SETTING,
+  ACTION_NEXT_VALUE,
+  ACTION_PREVIOUS_VALUE,
+  ACTION_CONFIRM,
+  ACTION_BACK,
+  ACTION_GO,
+  ACTION_SLEEP,
+  ACTION_JUMP_OR_SLEEP
+};
+
+enum PressEvent : uint8_t {
+  PRESS_NONE = 0,
+  PRESS_SINGLE,
+  PRESS_LONG
 };
 
 enum SoundMode : uint8_t {
@@ -157,6 +198,20 @@ struct PowerTelemetry {
   uint32_t sampledMs = 0;
 };
 
+struct SecurityState {
+  String deviceId;
+  String hostId;
+  String secretHex;
+  String sessionNonce;
+  bool sessionAuthorized = false;
+  bool pairingActive = false;
+  bool pairingConfirmed = false;
+  String pairingCode;
+  String pendingHostId;
+  String pendingSecretHex;
+  uint32_t pairingStartedMs = 0;
+};
+
 struct AppState {
   String deviceName;
   uint16_t total = 0;
@@ -191,10 +246,22 @@ NimBLECharacteristic* txCharacteristic = nullptr;
 NimBLEServer* bleServer = nullptr;
 Preferences prefs;
 M5Canvas canvas(&M5.Display);
+#if !defined(CODEX_COMPANION_CARDPUTER)
 M5PM1 pm1;
+#endif
 PowerTelemetry powerTelemetry;
+SecurityState security;
 ButtonTracker buttonA;
 ButtonTracker buttonB;
+#if defined(CODEX_COMPANION_CARDPUTER)
+ButtonTracker keyUp;
+ButtonTracker keyDown;
+ButtonTracker keyLeft;
+ButtonTracker keyRight;
+ButtonTracker keyEnter;
+ButtonTracker keyBack;
+ButtonTracker keyGo;
+#endif
 AppState app;
 String rxBuffer;
 bool bleConnected = false;
@@ -229,6 +296,134 @@ String chipSuffix() {
   char suffix[5];
   snprintf(suffix, sizeof(suffix), "%04X", static_cast<unsigned int>(chip & 0xFFFF));
   return String(suffix);
+}
+
+String randomHex(size_t bytes) {
+  static const char* digits = "0123456789abcdef";
+  String value;
+  value.reserve(bytes * 2);
+  for (size_t i = 0; i < bytes; ++i) {
+    const uint8_t byte = static_cast<uint8_t>(esp_random() & 0xFF);
+    value += digits[byte >> 4];
+    value += digits[byte & 0x0F];
+  }
+  return value;
+}
+
+String randomPairingCode() {
+  char code[7];
+  snprintf(code, sizeof(code), "%06lu", static_cast<unsigned long>(100000 + (esp_random() % 900000)));
+  return String(code);
+}
+
+bool isPaired() {
+  return security.secretHex.length() == PAIR_SECRET_HEX_LENGTH && !security.hostId.isEmpty();
+}
+
+void resetAuthorizedSession() {
+  security.sessionNonce = randomHex(16);
+  security.sessionAuthorized = false;
+}
+
+bool hexToBytes(const String& hex, uint8_t* output, size_t outputLen) {
+  if (hex.length() != outputLen * 2) {
+    return false;
+  }
+  for (size_t i = 0; i < outputLen; ++i) {
+    const char high = hex.charAt(i * 2);
+    const char low = hex.charAt(i * 2 + 1);
+    if (!isxdigit(high) || !isxdigit(low)) {
+      return false;
+    }
+    char pair[3] = {high, low, '\0'};
+    output[i] = static_cast<uint8_t>(strtoul(pair, nullptr, 16));
+  }
+  return true;
+}
+
+String bytesToHex(const uint8_t* bytes, size_t length) {
+  static const char* digits = "0123456789abcdef";
+  String value;
+  value.reserve(length * 2);
+  for (size_t i = 0; i < length; ++i) {
+    value += digits[bytes[i] >> 4];
+    value += digits[bytes[i] & 0x0F];
+  }
+  return value;
+}
+
+String hmacSha256Hex(const String& secretHex, const String& message) {
+  uint8_t key[32];
+  if (!hexToBytes(secretHex, key, sizeof(key))) {
+    return "";
+  }
+  uint8_t digest[32];
+  const mbedtls_md_info_t* info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+  if (info == nullptr) {
+    return "";
+  }
+  const int rc = mbedtls_md_hmac(
+    info,
+    key,
+    sizeof(key),
+    reinterpret_cast<const uint8_t*>(message.c_str()),
+    message.length(),
+    digest
+  );
+  if (rc != 0) {
+    return "";
+  }
+  return bytesToHex(digest, sizeof(digest));
+}
+
+String authMessage(const String& hostNonce, const String& hostId) {
+  return "auth:v1:" + security.deviceId + ":" + security.sessionNonce + ":" + hostNonce + ":" + hostId;
+}
+
+bool constantTimeEquals(const String& left, const String& right) {
+  if (left.length() != right.length()) {
+    return false;
+  }
+  uint8_t diff = 0;
+  for (int i = 0; i < static_cast<int>(left.length()); ++i) {
+    diff |= static_cast<uint8_t>(left.charAt(i) ^ right.charAt(i));
+  }
+  return diff == 0;
+}
+
+void loadSecurityState() {
+  security.deviceId = prefs.getString("dev_id", "");
+  if (security.deviceId.isEmpty()) {
+    security.deviceId = String(BOARD_TYPE) + "-" + chipSuffix() + "-" + randomHex(4);
+    prefs.putString("dev_id", security.deviceId);
+  }
+  security.hostId = prefs.getString("host_id", "");
+  security.secretHex = prefs.getString("secret", "");
+  if (security.secretHex.length() != PAIR_SECRET_HEX_LENGTH) {
+    security.hostId = "";
+    security.secretHex = "";
+  }
+  resetAuthorizedSession();
+}
+
+void savePairing(const String& hostId, const String& secretHex) {
+  security.hostId = hostId;
+  security.secretHex = secretHex;
+  prefs.putString("host_id", security.hostId);
+  prefs.putString("secret", security.secretHex);
+  security.sessionAuthorized = true;
+}
+
+void clearPairing() {
+  security.hostId = "";
+  security.secretHex = "";
+  security.sessionAuthorized = false;
+  security.pairingActive = false;
+  security.pairingConfirmed = false;
+  security.pendingHostId = "";
+  security.pendingSecretHex = "";
+  prefs.remove("host_id");
+  prefs.remove("secret");
 }
 
 String cleanText(String text) {
@@ -306,12 +501,14 @@ int readBatteryVoltageMv() {
   if (voltage > 0) {
     return voltage;
   }
+#if !defined(CODEX_COMPANION_CARDPUTER)
   if (pmicReady) {
     uint16_t pmicVoltage = 0;
     if (pm1.readVbat(&pmicVoltage) == M5PM1_OK && pmicVoltage > 0) {
       return pmicVoltage;
     }
   }
+#endif
   return -1;
 }
 
@@ -320,12 +517,14 @@ int readVbusVoltageMv() {
   if (voltage > 0) {
     return voltage;
   }
+#if !defined(CODEX_COMPANION_CARDPUTER)
   if (pmicReady) {
     uint16_t pmicVoltage = 0;
     if (pm1.readVin(&pmicVoltage) == M5PM1_OK && pmicVoltage > 0) {
       return pmicVoltage;
     }
   }
+#endif
   return -1;
 }
 
@@ -582,8 +781,10 @@ void enforceIndicatorLedsOff(bool force = false) {
   if (!pmicReady) {
     return;
   }
+#if !defined(CODEX_COMPANION_CARDPUTER)
   pm1.disableLeds();
   pm1.setLedEnLevel(false);
+#endif
 }
 
 void shutdownSpeakerOutput() {
@@ -603,6 +804,10 @@ void setupSpeakerOutput() {
 }
 
 void setupPmicPowerManagement() {
+#if defined(CODEX_COMPANION_CARDPUTER)
+  pmicReady = false;
+  M5.Power.setBatteryCharge(true);
+#else
   pmicReady = pm1.begin(&M5.In_I2C, M5PM1_DEFAULT_ADDR, M5PM1_I2C_FREQ_100K) == M5PM1_OK;
   M5.Power.setBatteryCharge(true);
   if (!pmicReady) {
@@ -614,6 +819,7 @@ void setupPmicPowerManagement() {
   pm1.setI2cSleepTime(0);
   pm1.setAutoWakeEnable(false);
   enforceIndicatorLedsOff(true);
+#endif
 }
 
 void loadSettings() {
@@ -639,11 +845,15 @@ void loadSettings() {
     app.settings.textNav = TEXT_NAV_PAGE;
   }
   app.settings.autoNewest = prefs.getBool("auto", true);
-  app.settings.rotation = static_cast<RotationMode>(prefs.getUChar("rot", ROTATION_AUTO));
+  const RotationMode defaultRotationMode = BOARD_HAS_IMU_ORIENTATION ? ROTATION_AUTO : ROTATION_LANDSCAPE;
+  app.settings.rotation = static_cast<RotationMode>(prefs.getUChar("rot", defaultRotationMode));
   if (app.settings.rotation > ROTATION_LANDSCAPE_180) {
-    app.settings.rotation = ROTATION_AUTO;
+    app.settings.rotation = defaultRotationMode;
   }
-  displayRotation = prefs.getUChar("drot", 0) & 0x03;
+  if (!BOARD_HAS_IMU_ORIENTATION && app.settings.rotation == ROTATION_AUTO) {
+    app.settings.rotation = defaultRotationMode;
+  }
+  displayRotation = prefs.getUChar("drot", BOARD_DEFAULT_ROTATION) & 0x03;
   orientationCandidate = displayRotation;
 }
 
@@ -691,7 +901,9 @@ void enterDisplaySleep() {
   shutdownSpeakerOutput();
   M5.Power.setLed(0);
   if (pmicReady) {
+#if !defined(CODEX_COMPANION_CARDPUTER)
     pm1.disableLeds();
+#endif
   }
   M5.Display.sleep();
   setCpuMhzIfNeeded(sleepCpuMhz());
@@ -798,14 +1010,30 @@ void sendAck(const char* command, bool ok, const char* error = nullptr) {
   sendJson(doc);
 }
 
+void sendHelloAck() {
+  JsonDocument doc;
+  doc["ack"] = "hello";
+  doc["ok"] = true;
+  JsonObject data = doc["data"].to<JsonObject>();
+  data["device_id"] = security.deviceId;
+  data["board"] = BOARD_TYPE;
+  data["name"] = app.deviceName;
+  data["paired"] = isPaired();
+  data["nonce"] = security.sessionNonce;
+  sendJson(doc);
+}
+
 void sendStatusAck() {
   samplePowerTelemetry(true);
   JsonDocument doc;
   doc["ack"] = "status";
   doc["ok"] = true;
   JsonObject data = doc["data"].to<JsonObject>();
+  data["device_id"] = security.deviceId;
+  data["board"] = BOARD_TYPE;
   data["name"] = app.deviceName;
-  data["sec"] = false;
+  data["sec"] = isPaired();
+  data["auth"] = security.sessionAuthorized;
   JsonObject battery = data["bat"].to<JsonObject>();
   const int pct = batteryPercent();
   if (pct >= 0) {
@@ -1100,7 +1328,7 @@ bool rotationFromAccel(float ax, float ay, uint8_t& rotation) {
 
 void initializeRotation() {
   uint8_t nextRotation = displayRotation;
-  if (app.settings.rotation == ROTATION_AUTO) {
+  if (BOARD_HAS_IMU_ORIENTATION && app.settings.rotation == ROTATION_AUTO) {
     float ax = 0.0f;
     float ay = 0.0f;
     float az = 0.0f;
@@ -1114,7 +1342,12 @@ void initializeRotation() {
 }
 
 void handleAutoRotation() {
-  if (displaySleeping || app.settings.rotation != ROTATION_AUTO || millis() - lastOrientationCheckMs < ORIENTATION_CHECK_MS) {
+  if (
+    !BOARD_HAS_IMU_ORIENTATION
+    || displaySleeping
+    || app.settings.rotation != ROTATION_AUTO
+    || millis() - lastOrientationCheckMs < ORIENTATION_CHECK_MS
+  ) {
     return;
   }
   lastOrientationCheckMs = millis();
@@ -1418,8 +1651,109 @@ void handleSnapshot(JsonDocument& doc) {
   }
 }
 
+void cancelPairing();
+
 void handleCommand(JsonDocument& doc) {
   const String command = doc["cmd"].as<String>();
+  if (command == "hello") {
+    sendHelloAck();
+    return;
+  }
+  if (command == "pair_begin") {
+    if (isPaired()) {
+      sendAck("pair_begin", false, "already_paired");
+      return;
+    }
+    const String hostId = doc["host_id"].as<String>();
+    const String secretHex = doc["secret"].as<String>();
+    if (hostId.isEmpty() || secretHex.length() != PAIR_SECRET_HEX_LENGTH) {
+      sendAck("pair_begin", false, "invalid_pairing_request");
+      return;
+    }
+    security.pendingHostId = hostId;
+    security.pendingSecretHex = secretHex;
+    security.pairingCode = randomPairingCode();
+    security.pairingStartedMs = millis();
+    security.pairingActive = true;
+    security.pairingConfirmed = false;
+    app.settings.open = false;
+    setCurrentStatus("System", "pair", "Pair " + security.pairingCode);
+    needsRedraw = true;
+
+    JsonDocument ack;
+    ack["ack"] = "pair_begin";
+    ack["ok"] = true;
+    JsonObject data = ack["data"].to<JsonObject>();
+    data["code"] = security.pairingCode;
+    data["device_id"] = security.deviceId;
+    data["board"] = BOARD_TYPE;
+    data["name"] = app.deviceName;
+    sendJson(ack);
+    return;
+  }
+  if (command == "pair_commit") {
+    if (!security.pairingActive) {
+      sendAck("pair_commit", false, "pairing_not_active");
+      return;
+    }
+    if (millis() - security.pairingStartedMs > PAIRING_TIMEOUT_MS) {
+      cancelPairing();
+      sendAck("pair_commit", false, "pairing_expired");
+      return;
+    }
+    const String code = doc["code"].as<String>();
+    if (code != security.pairingCode) {
+      sendAck("pair_commit", false, "invalid_code");
+      return;
+    }
+    if (!security.pairingConfirmed) {
+      sendAck("pair_commit", false, "confirm_on_device");
+      return;
+    }
+    savePairing(security.pendingHostId, security.pendingSecretHex);
+    security.pairingActive = false;
+    security.pairingConfirmed = false;
+    security.pendingHostId = "";
+    security.pendingSecretHex = "";
+    security.pairingCode = "";
+    setCurrentStatus("System", "pair", "Paired");
+    needsRedraw = true;
+
+    JsonDocument ack;
+    ack["ack"] = "pair_commit";
+    ack["ok"] = true;
+    JsonObject data = ack["data"].to<JsonObject>();
+    data["device_id"] = security.deviceId;
+    data["board"] = BOARD_TYPE;
+    data["name"] = app.deviceName;
+    sendJson(ack);
+    return;
+  }
+  if (command == "auth") {
+    if (!isPaired()) {
+      sendAck("auth", false, "not_paired");
+      return;
+    }
+    const String hostId = doc["host_id"].as<String>();
+    const String hostNonce = doc["nonce"].as<String>();
+    const String mac = doc["mac"].as<String>();
+    if (hostId != security.hostId || hostNonce.isEmpty() || mac.isEmpty()) {
+      sendAck("auth", false, "invalid_auth");
+      return;
+    }
+    const String expected = hmacSha256Hex(security.secretHex, authMessage(hostNonce, hostId));
+    if (expected.isEmpty() || !constantTimeEquals(expected, mac)) {
+      sendAck("auth", false, "auth_failed");
+      return;
+    }
+    security.sessionAuthorized = true;
+    sendAck("auth", true);
+    return;
+  }
+  if (isPaired() && !security.sessionAuthorized) {
+    sendAck(command.c_str(), false, "unauthorized");
+    return;
+  }
   if (command == "status") {
     sendStatusAck();
     return;
@@ -1438,7 +1772,10 @@ void handleCommand(JsonDocument& doc) {
     return;
   }
   if (command == "unpair") {
+    clearPairing();
     sendAck("unpair", true);
+    setCurrentStatus("System", "unpair", "Unpaired");
+    needsRedraw = true;
     return;
   }
 
@@ -1460,6 +1797,11 @@ void handleLine(const String& line) {
 
   if (doc["time"].is<JsonArray>()) {
     setCurrentStatus("System", "time", "Time synced");
+    return;
+  }
+
+  if (isPaired() && !security.sessionAuthorized) {
+    Serial.println("Ignoring unauthenticated snapshot");
     return;
   }
 
@@ -1491,6 +1833,7 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     bleServer = server;
     wakeDisplay();
     bleConnected = true;
+    resetAuthorizedSession();
     awaitingSnapshot = true;
     rxBuffer = "";
     lastAdvertisingEnsureMs = millis();
@@ -1502,6 +1845,7 @@ class ServerCallbacks : public NimBLEServerCallbacks {
   void onDisconnect(NimBLEServer*) override {
     wakeDisplay();
     bleConnected = false;
+    resetAuthorizedSession();
     awaitingSnapshot = false;
     bleConnParamsPending = false;
     rxBuffer = "";
@@ -2089,8 +2433,23 @@ void drawSettings() {
     drawTextAt(4, 176, fitTextPixels(app.deviceName, canvas.width() - 8), rgb(100, 104, 108));
     drawTextAt(4, 193, fitTextPixels(batteryLine, canvas.width() - 8), rgb(100, 104, 108));
     drawTextAt(4, 210, fitTextPixels("Heap " + formatCompact(ESP.getFreeHeap()), canvas.width() - 8), rgb(100, 104, 108));
-    drawTextAt(4, canvas.height() - DASHBOARD_FONT_HEIGHT, fitTextPixels("A change  B next", canvas.width() - 8), rgb(100, 104, 108));
+    drawTextAt(4, canvas.height() - DASHBOARD_FONT_HEIGHT, fitTextPixels(BOARD_INPUT_HINT, canvas.width() - 8), rgb(100, 104, 108));
   }
+}
+
+void drawPairing() {
+  canvas.fillScreen(TFT_BLACK);
+  useUiFont();
+  drawTopBar();
+  const uint16_t accent = security.pairingConfirmed ? rgb(114, 166, 109) : rgb(224, 166, 78);
+  const String title = security.pairingConfirmed ? "PAIR CONFIRMED" : "PAIR " + security.pairingCode;
+  drawTextAt(8, 34, fitTextPixels(title, canvas.width() - 16), accent);
+  drawTextAt(8, 56, fitTextPixels("Confirm on this device", canvas.width() - 16), TFT_LIGHTGREY);
+#if defined(CODEX_COMPANION_CARDPUTER)
+  drawTextAt(8, 76, fitTextPixels("Press GO/G0", canvas.width() - 16), rgb(100, 104, 108));
+#else
+  drawTextAt(8, 76, fitTextPixels("Press Button A", canvas.width() - 16), rgb(100, 104, 108));
+#endif
 }
 
 void redraw() {
@@ -2098,7 +2457,9 @@ void redraw() {
     needsRedraw = false;
     return;
   }
-  if (app.settings.open) {
+  if (security.pairingActive) {
+    drawPairing();
+  } else if (app.settings.open) {
     drawSettings();
   } else {
     drawDashboard();
@@ -2107,14 +2468,14 @@ void redraw() {
   needsRedraw = false;
 }
 
-void scrollNewer() {
+void scrollNewerBy(uint16_t step) {
   if (app.settings.detail != DETAIL_FULL) {
     app.scrollOffset = 0;
     app.hasNew = false;
     needsRedraw = true;
     return;
   }
-  const uint16_t step = app.settings.textNav == TEXT_NAV_LINE ? 1 : visibleBodyLines();
+  step = max<uint16_t>(1, step);
   app.scrollOffset = app.scrollOffset > step ? app.scrollOffset - step : 0;
   if (app.scrollOffset == 0) {
     app.hasNew = false;
@@ -2122,16 +2483,24 @@ void scrollNewer() {
   needsRedraw = true;
 }
 
-void scrollOlder() {
+void scrollOlderBy(uint16_t step) {
   if (app.settings.detail != DETAIL_FULL) {
     app.scrollOffset = 0;
     app.hasNew = false;
     needsRedraw = true;
     return;
   }
-  const uint16_t step = app.settings.textNav == TEXT_NAV_LINE ? 1 : visibleBodyLines();
+  step = max<uint16_t>(1, step);
   app.scrollOffset = min<uint16_t>(maxScrollOffset(), app.scrollOffset + step);
   needsRedraw = true;
+}
+
+void scrollNewer() {
+  scrollNewerBy(app.settings.textNav == TEXT_NAV_LINE ? 1 : visibleBodyLines());
+}
+
+void scrollOlder() {
+  scrollOlderBy(app.settings.textNav == TEXT_NAV_LINE ? 1 : visibleBodyLines());
 }
 
 void jumpNewest() {
@@ -2156,15 +2525,40 @@ void closeSettings() {
   needsRedraw = true;
 }
 
-void rotateSetting() {
+uint8_t cycledIndex(uint8_t value, uint8_t count, int8_t delta) {
+  if (count == 0) {
+    return 0;
+  }
+  int next = static_cast<int>(value) + delta;
+  while (next < 0) {
+    next += count;
+  }
+  return static_cast<uint8_t>(next % count);
+}
+
+RotationMode cycledRotationMode(int8_t delta) {
+  uint8_t current = app.settings.rotation;
+  for (uint8_t attempts = 0; attempts < 6; ++attempts) {
+    current = cycledIndex(current, 6, delta);
+    if (BOARD_HAS_IMU_ORIENTATION || current != ROTATION_AUTO) {
+      return static_cast<RotationMode>(current);
+    }
+  }
+  return app.settings.rotation;
+}
+
+void rotateSetting(int8_t delta = 1) {
+  if (delta == 0) {
+    return;
+  }
   touchSettings();
   switch (app.settings.selected) {
     case SETTING_BRIGHTNESS:
-      app.settings.brightness = (app.settings.brightness + 1) % 3;
+      app.settings.brightness = cycledIndex(app.settings.brightness, 3, delta);
       applyBrightness();
       break;
     case SETTING_POWER:
-      app.settings.power = static_cast<PowerMode>((app.settings.power + 1) % POWER_COUNT);
+      app.settings.power = static_cast<PowerMode>(cycledIndex(app.settings.power, POWER_COUNT, delta));
       if (!isUsbPowered() && app.settings.power != POWER_ALWAYS && app.settings.brightness > 1) {
         app.settings.brightness = 1;
       }
@@ -2174,12 +2568,12 @@ void rotateSetting() {
       setCpuMhzIfNeeded(displaySleeping ? sleepCpuMhz() : activeCpuMhz());
       break;
     case SETTING_DETAIL:
-      app.settings.detail = static_cast<DetailMode>((app.settings.detail + 1) % DETAIL_COUNT);
+      app.settings.detail = static_cast<DetailMode>(cycledIndex(app.settings.detail, DETAIL_COUNT, delta));
       app.scrollOffset = 0;
       app.hasNew = false;
       break;
     case SETTING_SOUND:
-      app.settings.sound = static_cast<SoundMode>((app.settings.sound + 1) % 3);
+      app.settings.sound = static_cast<SoundMode>(cycledIndex(app.settings.sound, 3, delta));
       requestCue(app.settings.sound == SOUND_OFF ? CUE_NONE : CUE_ACTIVITY);
       break;
     case SETTING_TEXT_NAV:
@@ -2190,7 +2584,7 @@ void rotateSetting() {
       app.settings.autoNewest = !app.settings.autoNewest;
       break;
     case SETTING_ROTATION:
-      app.settings.rotation = static_cast<RotationMode>((app.settings.rotation + 1) % 6);
+      app.settings.rotation = cycledRotationMode(delta);
       applyRotationMode();
       break;
     default:
@@ -2206,8 +2600,41 @@ void nextSetting() {
   needsRedraw = true;
 }
 
-void dispatchInput(InputEvent event) {
-  if (event == INPUT_NONE) {
+void previousSetting() {
+  touchSettings();
+  app.settings.selected = cycledIndex(app.settings.selected, SETTING_COUNT, -1);
+  needsRedraw = true;
+}
+
+void jumpNewestOrSleep() {
+  if (app.scrollOffset > 0 && app.hasNew) {
+    jumpNewest();
+  } else {
+    enterDisplaySleep();
+  }
+}
+
+void confirmPairingOnDevice() {
+  if (!security.pairingActive) {
+    return;
+  }
+  security.pairingConfirmed = true;
+  setCurrentStatus("System", "pair", "Pair confirmed");
+  needsRedraw = true;
+}
+
+void cancelPairing() {
+  security.pairingActive = false;
+  security.pairingConfirmed = false;
+  security.pairingCode = "";
+  security.pendingHostId = "";
+  security.pendingSecretHex = "";
+  setCurrentStatus("System", "pair", "Pair cancelled");
+  needsRedraw = true;
+}
+
+void dispatchInput(InputAction action) {
+  if (action == ACTION_NONE) {
     return;
   }
   if (displaySleeping) {
@@ -2216,40 +2643,90 @@ void dispatchInput(InputEvent event) {
   }
   autoSleepEligibleSinceMs = 0;
 
-  if (app.settings.open) {
-    if (event == INPUT_A_LONG) {
-      closeSettings();
-    } else if (event == INPUT_A_SINGLE) {
-      rotateSetting();
-    } else if (event == INPUT_B_SINGLE) {
-      nextSetting();
+  if (security.pairingActive) {
+    if (action == ACTION_SCROLL_NEWER || action == ACTION_GO || action == ACTION_CONFIRM) {
+      confirmPairingOnDevice();
+    } else if (action == ACTION_BACK || action == ACTION_SLEEP) {
+      cancelPairing();
     }
     return;
   }
 
-  switch (event) {
-    case INPUT_A_SINGLE:
+  if (app.settings.open) {
+    switch (action) {
+      case ACTION_CLOSE_SETTINGS:
+      case ACTION_OPEN_SETTINGS:
+      case ACTION_BACK:
+        closeSettings();
+        break;
+      case ACTION_NEXT_SETTING:
+      case ACTION_SCROLL_NEWER_LINE:
+        nextSetting();
+        break;
+      case ACTION_PREVIOUS_SETTING:
+      case ACTION_SCROLL_OLDER_LINE:
+        previousSetting();
+        break;
+      case ACTION_NEXT_VALUE:
+      case ACTION_SCROLL_NEWER_PAGE:
+      case ACTION_CONFIRM:
+      case ACTION_GO:
+        rotateSetting(1);
+        break;
+      case ACTION_PREVIOUS_VALUE:
+      case ACTION_SCROLL_OLDER_PAGE:
+        rotateSetting(-1);
+        break;
+      case ACTION_SLEEP:
+        enterDisplaySleep();
+        break;
+      default:
+        break;
+    }
+    return;
+  }
+
+  switch (action) {
+    case ACTION_SCROLL_NEWER:
       scrollNewer();
       break;
-    case INPUT_B_SINGLE:
+    case ACTION_SCROLL_OLDER:
       scrollOlder();
       break;
-    case INPUT_A_LONG:
+    case ACTION_SCROLL_NEWER_LINE:
+      scrollNewerBy(1);
+      break;
+    case ACTION_SCROLL_OLDER_LINE:
+      scrollOlderBy(1);
+      break;
+    case ACTION_SCROLL_NEWER_PAGE:
+      scrollNewerBy(visibleBodyLines());
+      break;
+    case ACTION_SCROLL_OLDER_PAGE:
+      scrollOlderBy(visibleBodyLines());
+      break;
+    case ACTION_OPEN_SETTINGS:
+    case ACTION_CONFIRM:
       openSettings();
       break;
-    case INPUT_B_LONG:
-      if (app.scrollOffset > 0 && app.hasNew) {
+    case ACTION_BACK:
+    case ACTION_GO:
+      if (app.scrollOffset > 0) {
         jumpNewest();
-      } else {
-        enterDisplaySleep();
       }
+      break;
+    case ACTION_SLEEP:
+      enterDisplaySleep();
+      break;
+    case ACTION_JUMP_OR_SLEEP:
+      jumpNewestOrSleep();
       break;
     default:
       break;
   }
 }
 
-void updateButtonTracker(ButtonTracker& tracker, bool pressed, InputEvent singleEvent, InputEvent longEvent, bool suppressIndividual) {
+PressEvent updateButtonTracker(ButtonTracker& tracker, bool pressed, bool allowLong, bool suppressIndividual) {
   const uint32_t now = millis();
   if (pressed && !tracker.down) {
     tracker.down = true;
@@ -2257,38 +2734,106 @@ void updateButtonTracker(ButtonTracker& tracker, bool pressed, InputEvent single
     tracker.pressMs = now;
   }
 
-  if (pressed && tracker.down && !tracker.longSent && now - tracker.pressMs >= LONG_PRESS_MS && !suppressIndividual) {
+  if (pressed && tracker.down && allowLong && !tracker.longSent && now - tracker.pressMs >= LONG_PRESS_MS && !suppressIndividual) {
     tracker.longSent = true;
-    dispatchInput(longEvent);
+    return PRESS_LONG;
   }
 
   if (!pressed && tracker.down) {
     tracker.down = false;
     if (!tracker.longSent && !suppressIndividual) {
-      dispatchInput(singleEvent);
+      return PRESS_SINGLE;
     }
+  }
+  return PRESS_NONE;
+}
+
+void dispatchPress(PressEvent event, InputAction singleAction, InputAction longAction = ACTION_NONE) {
+  if (event == PRESS_SINGLE) {
+    dispatchInput(singleAction);
+  } else if (event == PRESS_LONG) {
+    dispatchInput(longAction);
   }
 }
 
-void handleButtons() {
-  const bool aPressed = M5.BtnA.isPressed();
-  const bool bPressed = M5.BtnB.isPressed();
+void handleStickButtons(bool aPressed, bool bPressed) {
   const bool bothPressed = aPressed && bPressed;
 
   if (bothPressed) {
     comboActive = true;
   }
 
-  updateButtonTracker(buttonA, aPressed, INPUT_A_SINGLE, INPUT_A_LONG, comboActive);
-  updateButtonTracker(buttonB, bPressed, INPUT_B_SINGLE, INPUT_B_LONG, comboActive);
+  const PressEvent aEvent = updateButtonTracker(buttonA, aPressed, true, comboActive);
+  const PressEvent bEvent = updateButtonTracker(buttonB, bPressed, true, comboActive);
+
+  if (aEvent == PRESS_SINGLE) {
+    dispatchInput(app.settings.open ? ACTION_NEXT_VALUE : ACTION_SCROLL_NEWER);
+  } else if (aEvent == PRESS_LONG) {
+    dispatchInput(app.settings.open ? ACTION_CLOSE_SETTINGS : ACTION_OPEN_SETTINGS);
+  }
+
+  if (bEvent == PRESS_SINGLE) {
+    dispatchInput(app.settings.open ? ACTION_NEXT_SETTING : ACTION_SCROLL_OLDER);
+  } else if (bEvent == PRESS_LONG && !app.settings.open) {
+    dispatchInput(ACTION_JUMP_OR_SLEEP);
+  }
 
   if (!aPressed && !bPressed) {
     comboActive = false;
   }
 }
 
+#if defined(CODEX_COMPANION_CARDPUTER)
+void handleCardputerButtons() {
+  auto& keys = M5Cardputer.Keyboard.keysState();
+  const bool upPressed = keys.up || M5Cardputer.Keyboard.isKeyPressed(';');
+  const bool downPressed = keys.down || M5Cardputer.Keyboard.isKeyPressed('.');
+  const bool leftPressed = keys.left || M5Cardputer.Keyboard.isKeyPressed(',');
+  const bool rightPressed = keys.right || M5Cardputer.Keyboard.isKeyPressed('/');
+  const bool backPressed = keys.backspace || keys.esc || M5Cardputer.Keyboard.isKeyPressed('`');
+  dispatchPress(updateButtonTracker(keyUp, upPressed, false, false), ACTION_SCROLL_OLDER_LINE);
+  dispatchPress(updateButtonTracker(keyDown, downPressed, false, false), ACTION_SCROLL_NEWER_LINE);
+  dispatchPress(updateButtonTracker(keyLeft, leftPressed, false, false), ACTION_SCROLL_OLDER_PAGE);
+  dispatchPress(updateButtonTracker(keyRight, rightPressed, false, false), ACTION_SCROLL_NEWER_PAGE);
+  dispatchPress(updateButtonTracker(keyEnter, keys.enter, false, false), ACTION_CONFIRM);
+  dispatchPress(updateButtonTracker(keyBack, backPressed, false, false), ACTION_BACK);
+  dispatchPress(updateButtonTracker(keyGo, M5Cardputer.BtnA.isPressed(), true, false), ACTION_GO, ACTION_SLEEP);
+}
+#endif
+
+void beginBoard() {
+  auto cfg = M5.config();
+  cfg.serial_baudrate = 115200;
+  cfg.internal_spk = true;
+  cfg.internal_mic = false;
+  cfg.led_brightness = 0;
+#if defined(CODEX_COMPANION_CARDPUTER)
+  M5Cardputer.begin(cfg, true);
+#else
+  M5.begin(cfg);
+#endif
+}
+
+void updateBoard() {
+#if defined(CODEX_COMPANION_CARDPUTER)
+  M5Cardputer.update();
+#else
+  M5.update();
+#endif
+}
+
+void handleButtons() {
+#if defined(CODEX_COMPANION_CARDPUTER)
+  handleCardputerButtons();
+#else
+  const bool aPressed = M5.BtnA.isPressed();
+  const bool bPressed = M5.BtnB.isPressed();
+  handleStickButtons(aPressed, bPressed);
+#endif
+}
+
 void checkShakeWake() {
-  if (!displaySleeping || millis() - lastShakeCheckMs < shakeCheckMs()) {
+  if (!displaySleeping || !BOARD_HAS_IMU_ORIENTATION || millis() - lastShakeCheckMs < shakeCheckMs()) {
     return;
   }
   if (millis() - sleepEnteredMs < SHAKE_WAKE_ARM_DELAY_MS) {
@@ -2355,6 +2900,13 @@ void handleSleepTimers() {
   }
 }
 
+void handlePairingTimeout() {
+  if (!security.pairingActive || millis() - security.pairingStartedMs <= PAIRING_TIMEOUT_MS) {
+    return;
+  }
+  cancelPairing();
+}
+
 uint32_t loopDelayMs() {
   const PowerMode mode = effectivePowerMode();
   if (displaySleeping) {
@@ -2380,24 +2932,20 @@ void setup() {
   Serial.begin(115200);
 
   setCpuMhzIfNeeded(activeCpuMhz());
-  auto cfg = M5.config();
-  cfg.serial_baudrate = 115200;
-  cfg.internal_spk = true;
-  cfg.internal_mic = false;
-  cfg.led_brightness = 0;
-  M5.begin(cfg);
+  beginBoard();
   M5.Power.setLed(0);
   setupPmicPowerManagement();
   setupSpeakerOutput();
 
   prefs.begin("codexdash", false);
+  loadSecurityState();
   samplePowerTelemetry(true);
   loadSettings();
   initializeRotation();
   applyBrightness();
   setCpuMhzIfNeeded(activeCpuMhz());
 
-  app.deviceName = "Codex-S3-" + chipSuffix();
+  app.deviceName = String(BOARD_DEVICE_PREFIX) + chipSuffix();
   setupBle();
   setCurrentStatus("System", "advertise", "Advertise " + app.deviceName);
   seedBody();
@@ -2405,8 +2953,9 @@ void setup() {
 }
 
 void loop() {
-  M5.update();
+  updateBoard();
   handleButtons();
+  handlePairingTimeout();
   handleAutoRotation();
   handleSleepTimers();
   handleStatusAnimation();

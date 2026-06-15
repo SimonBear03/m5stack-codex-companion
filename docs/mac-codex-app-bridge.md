@@ -2,7 +2,7 @@
 
 This repo targets the Codex app on Mac through a local bridge.
 
-Public OpenAI docs describe Codex App Server as the protocol used for rich clients. It carries JSON-RPC messages over stdio, Unix socket, or WebSocket transports and includes command/file approval requests. The docs do not currently describe native BLE pairing from the desktop app to third-party hardware, so this repo treats BLE as the StickS3 device protocol and App Server as the Codex-side integration.
+Public OpenAI docs describe Codex App Server as the protocol used for rich clients. It carries JSON-RPC messages over stdio, Unix socket, or WebSocket transports and includes command/file approval requests. The docs do not currently describe native BLE pairing from the desktop app to third-party hardware, so this repo treats BLE as the local companion device protocol and App Server as the Codex-side integration.
 
 ## Integration Modes
 
@@ -77,10 +77,10 @@ The native `StickS3 Companion.app` wraps `desktop-observer` with a PID file,
 status JSON, and log file so it can be controlled from the macOS menu bar:
 
 ```bash
-scripts/sticks3-macos-bridge start
-scripts/sticks3-macos-bridge status
-scripts/sticks3-macos-bridge restart
-scripts/sticks3-macos-bridge stop
+python3 scripts/sticks3-macos-bridge start
+python3 scripts/sticks3-macos-bridge status
+python3 scripts/sticks3-macos-bridge restart
+python3 scripts/sticks3-macos-bridge stop
 ```
 
 Runtime files live in `runtime/` and are ignored by Git:
@@ -90,19 +90,24 @@ Runtime files live in `runtime/` and are ignored by Git:
 - `bridge.log`: bridge stdout/stderr from background starts
 
 The generated Bluetooth-permission wrapper is installed outside the repo at
-`~/Applications/StickS3Bridge.app` so macOS sees one stable app identity across
-menu refreshes and bridge restarts.
+`~/Library/Application Support/StickS3 Codex Companion/StickS3Bridge.app` so
+only the native menu bar app is opened by the user.
 
 The bridge retries BLE scan/connect/write failures by default. Normal device
 sleep, advertising delays, or transient disconnects should move the helper
-through `Codex Wait/Work · S3 Scan` and back to `Codex Idle/Work · S3 BLE`
-without a manual restart. BLE liveness is checked while idle so a closed link is
-noticed before the next long heartbeat, and retry backoff is kept short for
-faster wake/reconnect. Default BLE scans match named `Codex-S3-*` devices only,
-not arbitrary Nordic UART Service peripherals. After a BLE connect, the bridge
-re-polls Codex state, sends a compact first sync packet, sends the latest full
-snapshot, then asks the device for settings/status. The firmware top bar shows
-`SYNC` until that first valid snapshot is parsed.
+between `BLE 0/n` and `BLE n/n` states without a manual restart. BLE liveness is
+checked while idle so a closed link is noticed before the next long heartbeat,
+and retry backoff is kept short for
+faster wake/reconnect. Default BLE scans use named `Codex-S3-*` and
+`Codex-CP-*` devices for discovery, not arbitrary Nordic UART Service
+peripherals, but Desktop observer sync is paired-only. Pairing records live at
+`~/Library/Application Support/StickS3 Codex Companion/paired-devices.json` and
+the observer fans out snapshots only after the device id authenticates with its
+stored secret. Each paired companion has an independent reconnect loop, status
+ack, and detail/privacy setting. After a BLE connect, the bridge re-polls Codex
+state, sends a compact first sync packet, sends the latest full snapshot, then
+asks the device for settings/status. The firmware top bar shows `SYNC` until
+that first valid snapshot is parsed.
 
 The helper does not search for and kill unrelated `sticks3-bridge` processes. If
 you started the observer manually in a terminal, stop that terminal process before
@@ -111,23 +116,25 @@ switching to the supervisor so BLE is not claimed by two processes.
 Build or update the native menu bar app from the repo root:
 
 ```bash
-scripts/build-macos-companion
+/bin/zsh scripts/build-macos-companion --launch
 ```
 
-That installs a locally signed app at `~/Applications/StickS3 Companion.app`.
+That builds and opens a locally signed app at `dist/StickS3 Companion.app`.
 Opening it queues `scripts/sticks3-macos-bridge ensure` when the bridge is
 stopped. The app reads `runtime/bridge-status.json` every 2 seconds and exposes
-Start, Stop, Restart, Open Log, Open Repo, Reveal Helper, and Quit actions. No
-paid Apple Developer account is needed for local use; the app is ad-hoc signed.
+Start, Stop, Restart, Open Log, Open Repo, Reveal Helper, and Quit actions. The
+popover lists companions with board/name, connected/scanning/disconnected state,
+detail mode, last-seen time, and any error. Single-device and multi-device
+states use the same layout. No paid Apple Developer account is needed for local
+use; the app is ad-hoc signed.
 
-The supervisor generates a stable local app wrapper at
-`~/Applications/StickS3Bridge.app` with the Bluetooth usage string. Its native
-executable embeds the bridge venv's Python runtime and runs the BLE bridge
-inside the app process, so Bluetooth permission belongs to `StickS3 Codex
-Bridge` instead of `Python.app`. The wrapper is reused and only rebuilt when
-generated contents change; this keeps macOS from seeing a new Bluetooth client
-on every menu refresh. If macOS prompts for Bluetooth access to `StickS3 Codex
-Bridge`, allow it.
+The supervisor generates a stable local helper wrapper at
+`~/Library/Application Support/StickS3 Codex Companion/StickS3Bridge.app` with
+the Bluetooth usage string. Its launcher runs the repo's bridge venv Python
+from a stable hidden app bundle. The wrapper is reused and only rebuilt when
+generated contents change; this avoids showing a second app next to
+`StickS3 Companion.app`. If macOS prompts for Bluetooth
+access to `StickS3 Codex Bridge`, allow it.
 
 Because this repo lives under `~/Documents`, macOS may also ask once for folder
 access when the app reads the bridge code and local Codex rollout logs. That
@@ -137,12 +144,11 @@ launched from a different bundle path, or the previous prompt was denied.
 
 The menu title is intentionally compact:
 
-- `Codex Off · S3 Off`: no supervised bridge process
-- `Codex Wait · S3 Scan`: bridge is starting or scanning for the StickS3
-- `Codex Idle · S3 BLE`: Codex observer is current and BLE is connected
-- `Codex Work · S3 BLE`: Codex is active or the latest event is fresh work-like activity
-- `Codex Work · S3 Off/Scan`: Codex is active while the StickS3 is disconnected or reconnecting
-- `Codex Err · S3 Err`: bridge error
+- `Codex Off · BLE 0/0`: no supervised bridge process
+- `Codex Wait · BLE 0/2`: bridge is running with no paired companions connected
+- `Codex Idle · BLE 2/2`: Codex observer is current and all paired companions are connected
+- `Codex Work · BLE 1/2`: Codex is active while one paired companion is connected
+- `Codex Err · BLE 0/2`: bridge or device error
 
 `Codex Work` uses the same recent-work window as the StickS3 top bar. Tool
 calls, tool output, patches, task starts, and Codex messages keep the bridge in
@@ -154,14 +160,14 @@ The Start/Stop/Restart actions in the menu call the same supervisor script.
 For launch-at-login, install the generated LaunchAgent:
 
 ```bash
-scripts/sticks3-macos-bridge install-agent --scan-timeout 60
-scripts/sticks3-macos-bridge agent-status
+python3 scripts/sticks3-macos-bridge install-agent --scan-timeout 60
+python3 scripts/sticks3-macos-bridge agent-status
 ```
 
 The installer writes
 `~/Library/LaunchAgents/com.simon.sticks3-codex-companion.bridge.plist` and
-installs the generated helper app at `~/Applications/StickS3Bridge.app`. The
-bridge itself retries BLE failures forever by default, so normal StickS3 sleep,
+installs the generated helper app under Application Support. The bridge itself
+retries BLE failures forever by default, so normal StickS3 sleep,
 advertising delay, and transient disconnects should not require a restart.
 
 On newer macOS builds, launch-at-login is best-effort until the background item
@@ -174,7 +180,7 @@ falls back to direct app-wrapper launch when LaunchAgent kickstart does not
 produce a PID. Unload and remove the LaunchAgent later with:
 
 ```bash
-scripts/sticks3-macos-bridge uninstall-agent
+python3 scripts/sticks3-macos-bridge uninstall-agent
 ```
 
 ## Dashboard Mapping
@@ -199,7 +205,7 @@ Desktop observer event handling:
 
 ## Device Controls
 
-Main dashboard:
+StickS3 main dashboard:
 
 - Button A: newer/down through body text.
 - Button B: older/up through body text.
@@ -207,12 +213,35 @@ Main dashboard:
 - Long B: jump to newest when reading older text and the unread dot is shown; otherwise enter display sleep.
 - A+B: no-op in the current dashboard firmware.
 
-Settings menu:
+Cardputer main dashboard:
+
+- Up key, or `;` without Fn: older/up one line through body text.
+- Down key, or `.` without Fn: newer/down one line through body text.
+- Left key, or `,` without Fn: older/up one page through body text.
+- Right key, or `/` without Fn: newer/down one page through body text.
+- Enter: open settings.
+- Backspace, Esc, or `` ` `` without Fn: jump to newest when reading older text.
+- GO/G0 short: jump to newest when reading older text.
+- GO/G0 long: enter display sleep.
+
+StickS3 settings menu:
 
 - Button B: next option.
 - Button A: rotate/toggle selected value.
 - Long A: close settings.
 - Auto-closes after 12 seconds of no input.
+
+Cardputer settings menu:
+
+- Up/Down, or `;`/`.` without Fn: previous/next option.
+- Left/Right, or `,`/`/` without Fn: previous/next value.
+- Enter or GO/G0 short: rotate/toggle selected value forward.
+- Backspace, Esc, or `` ` `` without Fn: close settings.
+- GO/G0 long: enter display sleep.
+- Auto-closes after 12 seconds of no input.
+
+Both boards:
+
 - Settings options are brightness, power profile, detail level, sound, text navigation, auto-newest, and rotation.
 - Detail supports `Full`, `Status`, and `Usage`. `Full` shows scrollable message activity. `Status` keeps generic current status but suppresses body text. `Usage` keeps usage/token/device state and generic work/idle state without transmitting message bodies, tool names, or legacy text fields.
 - Rotation supports `Auto`, `Lock`, `P`, `L`, `P180`, and `L180`; `Auto` uses the StickS3 IMU and reflows wrapped body text when the display switches between portrait and landscape.

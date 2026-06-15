@@ -4,6 +4,7 @@
 .bridge-venv/
 .vscode/
 runtime/
+dist/
 macos/StickS3Companion/.build/
 *.bin
 *.elf

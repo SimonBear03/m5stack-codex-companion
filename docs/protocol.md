@@ -1,14 +1,17 @@
 # Protocol
 
-This firmware implements a small bridge protocol for the StickS3 Codex dashboard.
+This firmware implements a small bridge protocol for the M5Stack Codex dashboard targets.
 
 The BLE side is intentionally device-local and simple. It is not an official OpenAI BLE protocol. The Mac bridge maps Codex Desktop rollout events or Codex App Server events into compact dashboard snapshots.
 
 ## BLE
 
-Advertise a name starting with `Codex-S3-` over Nordic UART Service.
+Advertise a name starting with a supported Codex companion prefix over Nordic UART Service:
 
-The current firmware implements this with NimBLE-Arduino to keep the app binary small enough for the StickS3 workflow. The on-wire protocol remains Nordic UART Service JSONL.
+- StickS3: `Codex-S3-`
+- Cardputer ADV: `Codex-CP-`
+
+The current firmware implements this with NimBLE-Arduino to keep the app binary small enough for the device workflows. The on-wire protocol remains Nordic UART Service JSONL.
 
 | Direction | UUID |
 | --- | --- |
@@ -25,7 +28,41 @@ ignores malformed JSON fragments as transport noise instead of turning the
 dashboard mode into `ERR`. A clean full snapshot after reconnect restores the
 visible state.
 
-The validated physical device currently advertises as `Codex-S3-0470`. By default, host scans match the `Codex-S3-` advertised/local name only; generic Nordic UART Service advertisements are ignored unless the bridge is given an explicit device address.
+The validated physical StickS3 currently advertises as `Codex-S3-0470`. Host scans use `Codex-S3-*` and `Codex-CP-*` names for discovery, but the Desktop observer sends private Codex data only to paired devices that authenticate with their stored secret.
+
+## Pairing And Auth
+
+Unauthenticated hosts may send:
+
+```json
+{"cmd":"hello","nonce":"host-discovery-nonce"}
+```
+
+The device replies with safe metadata:
+
+```json
+{
+  "ack": "hello",
+  "ok": true,
+  "data": {
+    "device_id": "sticks3-0470-a1b2c3d4",
+    "board": "sticks3",
+    "name": "Codex-S3-0470",
+    "paired": true,
+    "nonce": "device-session-nonce"
+  }
+}
+```
+
+Pairing is explicit. The bridge sends `pair_begin` with a generated host id and 32-byte secret, the device displays a six-digit code, and the user confirms on-device. The bridge then retries `pair_commit` until the device has been physically confirmed or pairing times out after 60 seconds.
+
+For normal sync, the bridge authenticates each BLE connection with:
+
+```json
+{"cmd":"auth","host_id":"...","nonce":"host-session-nonce","mac":"hex-hmac-sha256"}
+```
+
+The HMAC message is `auth:v1:<device_id>:<device_nonce>:<host_nonce>:<host_id>`, keyed by the stored per-device secret. When a device is paired, snapshots, `status`, `owner`, `name`, and `unpair` are private and are rejected until `auth` succeeds for the current BLE connection.
 
 ## Dashboard Snapshot
 
@@ -124,8 +161,11 @@ The device replies:
   "ack": "status",
   "ok": true,
   "data": {
+    "device_id": "sticks3-0470-a1b2c3d4",
+    "board": "sticks3",
     "name": "Codex-S3-0470",
-    "sec": false,
+    "sec": true,
+    "auth": true,
     "bat": {
       "pct": 85,
       "mv": 3890,
@@ -165,7 +205,7 @@ The device replies:
 
 Battery telemetry fields are best-effort. `bat.mv` and `bat.ma` are omitted when the board API cannot provide a plausible reading. `bat.usb` means external power is present. `bat.charging` is emitted only when the board API reports a known charge state; when true, the top bar shows `CHG`, otherwise USB power shows as `USB`. `settings.power` maps the saved profile: `0=Always`, `1=Auto`, `2=Low`. `settings.effective_power` can report `2=Low` when the low-battery auto policy downgrades saved `Auto`; saved `Always` remains no-auto-sleep. `settings.detail` maps `0=Full`, `1=Status`, `2=Usage`. `settings.low_battery_max` is kept as a compatibility alias for `settings.low_battery_low`. `settings.auto_sleep_ms` is `0` when automatic display sleep is disabled for the current effective profile. `settings.deep_sleep_ms` and `settings.travel_shutdown_ms` are kept for compatibility and currently report `0` because dashboard power profiles keep BLE reachable. `settings.rotation_mode` maps `0=Auto`, `1=Lock`, `2=P`, `3=L`, `4=P180`, `5=L180`; `settings.display_rotation` is the active M5GFX rotation value `0..3`.
 
-The firmware also accepts `owner`, `name`, and `unpair` commands for compatibility with existing bridge tooling.
+The firmware also accepts authenticated `owner`, `name`, and `unpair` commands for compatibility with existing bridge tooling.
 
 ## Rate Limits
 

@@ -29,13 +29,136 @@ struct CurrentStatus: Decodable {
     let text: String?
 }
 
+struct CompanionDevice: Decodable {
+    let deviceId: String?
+    let label: String?
+    let board: String?
+    let name: String?
+    let address: String?
+    let state: String?
+    let error: String?
+    let lastSeen: String?
+    let detailMode: Int?
+
+    init(
+        deviceId: String? = nil,
+        label: String? = nil,
+        board: String? = nil,
+        name: String? = nil,
+        address: String? = nil,
+        state: String? = nil,
+        error: String? = nil,
+        lastSeen: String? = nil,
+        detailMode: Int? = nil
+    ) {
+        self.deviceId = deviceId
+        self.label = label
+        self.board = board
+        self.name = name
+        self.address = address
+        self.state = state
+        self.error = error
+        self.lastSeen = lastSeen
+        self.detailMode = detailMode
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case deviceId = "device_id"
+        case label
+        case board
+        case name
+        case address
+        case state
+        case error
+        case lastSeen = "last_seen"
+        case detailMode = "detail_mode"
+    }
+
+    var displayName: String {
+        firstNonEmpty(label, name, shortDeviceId, boardLabel) ?? "Companion"
+    }
+
+    var boardLabel: String {
+        switch board {
+        case "sticks3":
+            return "StickS3"
+        case "cardputer_adv":
+            return "Cardputer ADV"
+        case let value? where !value.isEmpty:
+            return value
+        default:
+            return ""
+        }
+    }
+
+    var stateLabel: String {
+        switch normalizedState {
+        case "connected":
+            return "Connected"
+        case "scanning", "connecting":
+            return "Scanning"
+        case "disconnected":
+            return "Disconnected"
+        case "error":
+            return "Error"
+        case let value where !value.isEmpty:
+            return value.capitalized
+        default:
+            return "Unknown"
+        }
+    }
+
+    var detailLabel: String? {
+        switch detailMode {
+        case 0:
+            return "Full"
+        case 1:
+            return "Status"
+        case 2:
+            return "Usage"
+        default:
+            return nil
+        }
+    }
+
+    var normalizedState: String {
+        state?.lowercased() ?? "unknown"
+    }
+
+    var subtitle: String {
+        [boardLabel, name == label ? nil : name, detailLabel.map { "Detail \($0)" }]
+            .compactMap { value in
+                guard let value, !value.isEmpty else { return nil }
+                return value
+            }
+            .joined(separator: " · ")
+    }
+
+    private var shortDeviceId: String? {
+        guard let deviceId, !deviceId.isEmpty else { return nil }
+        return String(deviceId.prefix(10))
+    }
+
+    private func firstNonEmpty(_ values: String?...) -> String? {
+        for value in values {
+            if let value, !value.isEmpty {
+                return value
+            }
+        }
+        return nil
+    }
+}
+
 struct BridgePayload: Decodable {
     let active: Bool?
     let bridgeState: String?
     let codexState: String?
     let detail: String?
+    let deviceCount: Int?
     let deviceError: String?
     let deviceState: String?
+    let devices: [CompanionDevice]?
+    let connectedDeviceCount: Int?
     let error: String?
     let launchAgentInstalled: Bool?
     let launchAgentLoaded: Bool?
@@ -61,8 +184,11 @@ struct BridgePayload: Decodable {
         case bridgeState = "bridge_state"
         case codexState = "codex_state"
         case detail
+        case deviceCount = "device_count"
         case deviceError = "device_error"
         case deviceState = "device_state"
+        case devices
+        case connectedDeviceCount = "connected_device_count"
         case error
         case launchAgentInstalled = "launch_agent_installed"
         case launchAgentLoaded = "launch_agent_loaded"
@@ -96,6 +222,7 @@ final class BridgeModel: ObservableObject {
     let scriptURL: URL
     let statusURL: URL
     let logURL: URL
+    let bridgeCLIURL: URL
 
     private var timer: Timer?
 
@@ -105,6 +232,7 @@ final class BridgeModel: ObservableObject {
         scriptURL = repoURL.appendingPathComponent("scripts/sticks3-macos-bridge")
         statusURL = repoURL.appendingPathComponent("runtime/bridge-status.json")
         logURL = repoURL.appendingPathComponent("runtime/bridge.log")
+        bridgeCLIURL = repoURL.appendingPathComponent(".bridge-venv/bin/sticks3-bridge")
         refresh()
         runBridgeCommand("ensure", announce: false)
         timer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { [weak self] _ in
@@ -125,7 +253,26 @@ final class BridgeModel: ObservableObject {
     }
 
     var menuTitle: String {
-        "\(codexLabel) · \(deviceLabel)"
+        "\(codexLabel) · \(deviceSummaryLabel)"
+    }
+
+    var compactMenuTitle: String {
+        "\(shortCodexLabel) \(connectedDeviceCount)/\(deviceCount)"
+    }
+
+    private var shortCodexLabel: String {
+        switch codexState {
+        case "work", "working":
+            return "Work"
+        case "idle", "connected":
+            return "Idle"
+        case "err", "error":
+            return "Err"
+        case "wait", "starting":
+            return "Wait"
+        default:
+            return codexState.prefix(1).uppercased() + codexState.dropFirst()
+        }
     }
 
     var symbolName: String {
@@ -168,6 +315,45 @@ final class BridgeModel: ObservableObject {
         return payload.deviceState ?? payload.state ?? "unknown"
     }
 
+    var companionDevices: [CompanionDevice] {
+        if let devices = payload?.devices, !devices.isEmpty {
+            return devices
+        }
+        guard payload?.deviceCount == nil, let legacy = legacyCompanionDevice else {
+            return []
+        }
+        return [legacy]
+    }
+
+    var deviceCount: Int {
+        payload?.deviceCount ?? companionDevices.count
+    }
+
+    var connectedDeviceCount: Int {
+        payload?.connectedDeviceCount ?? companionDevices.filter { $0.normalizedState == "connected" }.count
+    }
+
+    var deviceSummaryLabel: String {
+        if deviceCount <= 0 {
+            return "BLE 0/0"
+        }
+        return "BLE \(connectedDeviceCount)/\(deviceCount)"
+    }
+
+    private var legacyCompanionDevice: CompanionDevice? {
+        guard let payload else { return nil }
+        let state = deviceState
+        if ["off", "stopped"].contains(state) {
+            return nil
+        }
+        return CompanionDevice(
+            label: "Companion",
+            state: state,
+            error: payload.deviceError ?? payload.error,
+            lastSeen: payload.updatedAt
+        )
+    }
+
     var codexLabel: String {
         switch codexState {
         case "work", "working":
@@ -180,23 +366,6 @@ final class BridgeModel: ObservableObject {
             return "Codex Wait"
         default:
             return "Codex \(codexState.capitalized)"
-        }
-    }
-
-    var deviceLabel: String {
-        switch deviceState {
-        case "connected":
-            return "S3 BLE"
-        case "scanning", "connecting", "starting":
-            return "S3 Scan"
-        case "error":
-            return "S3 Err"
-        case "stopped", "off":
-            return "S3 Off"
-        case "disconnected":
-            return "S3 Off"
-        default:
-            return "S3 \(deviceState.capitalized)"
         }
     }
 
@@ -237,8 +406,8 @@ final class BridgeModel: ObservableObject {
         let repo = repoURL
         DispatchQueue.global(qos: .userInitiated).async {
             let process = Process()
-            process.executableURL = script
-            process.arguments = [command]
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/python3")
+            process.arguments = [script.path, command]
             process.currentDirectoryURL = repo
             process.environment = [
                 "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
@@ -276,6 +445,97 @@ final class BridgeModel: ObservableObject {
         }
     }
 
+    func pairCardputer() {
+        runPairCommand(label: "Cardputer", prefix: "Codex-CP-")
+    }
+
+    func pairStickS3() {
+        runPairCommand(label: "StickS3", prefix: "Codex-S3-")
+    }
+
+    private func runPairCommand(label: String, prefix: String) {
+        guard !commandRunning else { return }
+        guard FileManager.default.isExecutableFile(atPath: bridgeCLIURL.path) else {
+            commandMessage = "Bridge CLI is missing at \(bridgeCLIURL.path)"
+            return
+        }
+
+        commandRunning = true
+        commandMessage = "Pairing \(label)... confirm on device."
+
+        let bridgeCLI = bridgeCLIURL
+        let script = scriptURL
+        let repo = repoURL
+        DispatchQueue.global(qos: .userInitiated).async {
+            let pairResult = Self.runProcess(
+                executable: bridgeCLI,
+                arguments: [
+                    "--log-level", "INFO",
+                    "pair-device",
+                    "--device-prefix", prefix,
+                    "--scan-timeout", "30",
+                    "--label", label
+                ],
+                currentDirectory: repo
+            )
+
+            var message = Self.summarizeOutput(pairResult.output)
+            if pairResult.exitCode == 0 {
+                let restartResult = Self.runProcess(
+                    executable: URL(fileURLWithPath: "/usr/bin/python3"),
+                    arguments: [script.path, "restart"],
+                    currentDirectory: repo
+                )
+                let restartSummary = Self.summarizeOutput(restartResult.output)
+                if restartResult.exitCode == 0 {
+                    message = message.isEmpty ? "Paired \(label)" : message
+                } else {
+                    message = restartSummary.isEmpty ? "Paired \(label), but restart failed" : restartSummary
+                }
+            } else if message.isEmpty {
+                message = "Pairing \(label) failed"
+            }
+
+            DispatchQueue.main.async {
+                self.commandRunning = false
+                self.commandMessage = message
+                self.refresh()
+            }
+        }
+    }
+
+    nonisolated private static func runProcess(executable: URL, arguments: [String], currentDirectory: URL) -> (exitCode: Int32, output: String) {
+        let process = Process()
+        process.executableURL = executable
+        process.arguments = arguments
+        process.currentDirectoryURL = currentDirectory
+        process.environment = [
+            "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+            "STICKS3_REPO": currentDirectory.path
+        ]
+
+        let output = Pipe()
+        process.standardOutput = output
+        process.standardError = output
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+            let data = output.fileHandleForReading.readDataToEndOfFile()
+            return (process.terminationStatus, String(data: data, encoding: .utf8) ?? "")
+        } catch {
+            return (1, error.localizedDescription)
+        }
+    }
+
+    nonisolated private static func summarizeOutput(_ output: String) -> String {
+        output
+            .split(separator: "\n")
+            .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
+            .suffix(2)
+            .joined(separator: " ")
+    }
+
     func openRepo() {
         NSWorkspace.shared.open(repoURL)
     }
@@ -286,7 +546,7 @@ final class BridgeModel: ObservableObject {
 
     func revealBridgeHelper() {
         let url = URL(fileURLWithPath: NSHomeDirectory())
-            .appendingPathComponent("Applications/StickS3Bridge.app")
+            .appendingPathComponent("Library/Application Support/StickS3 Codex Companion/StickS3Bridge.app")
         NSWorkspace.shared.activateFileViewerSelecting([url])
     }
 
@@ -313,6 +573,7 @@ struct ContentView: View {
             header
             Divider()
             statusBlock
+            companionsBlock
             usageBlock
             commandBlock
             Divider()
@@ -352,14 +613,14 @@ struct ContentView: View {
                 .lineLimit(4)
                 .textSelection(.enabled)
             HStack {
-                Text("\(model.codexLabel) · \(model.deviceLabel)")
+                Text("\(model.codexLabel) · \(model.deviceSummaryLabel)")
                 Spacer()
                 Text("PID \(model.payload?.supervisorPid.map(String.init) ?? model.payload?.pid.map(String.init) ?? "-")")
             }
             .font(.caption)
             .foregroundStyle(.secondary)
-            if let deviceError = model.payload?.deviceError, !deviceError.isEmpty {
-                Text("S3 \(deviceError)")
+            if let deviceError = model.payload?.deviceError, !deviceError.isEmpty, model.companionDevices.isEmpty {
+                Text("Companion \(deviceError)")
                     .font(.caption)
                     .foregroundStyle(.secondary)
                     .lineLimit(2)
@@ -371,6 +632,43 @@ struct ContentView: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
             }
+        }
+    }
+
+    private var companionsBlock: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack {
+                Text("Companions")
+                    .font(.caption.weight(.semibold))
+                Spacer()
+                Text("\(model.connectedDeviceCount)/\(model.deviceCount) connected")
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+            }
+            if model.companionDevices.isEmpty {
+                Text("No paired companions")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            } else {
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(Array(model.companionDevices.enumerated()), id: \.offset) { _, device in
+                        CompanionDeviceRow(device: device)
+                    }
+                }
+            }
+            HStack(spacing: 8) {
+                Button {
+                    model.pairCardputer()
+                } label: {
+                    Label("Pair Cardputer", systemImage: "keyboard.badge.ellipsis")
+                }
+                Button {
+                    model.pairStickS3()
+                } label: {
+                    Label("Pair StickS3", systemImage: "display.badge.plus")
+                }
+            }
+            .disabled(model.commandRunning)
         }
     }
 
@@ -473,6 +771,75 @@ struct ContentView: View {
     }
 }
 
+struct CompanionDeviceRow: View {
+    let device: CompanionDevice
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 8) {
+            Image(systemName: symbolName)
+                .foregroundStyle(stateColor)
+                .frame(width: 14)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 8) {
+                    Text(device.displayName)
+                        .font(.caption.weight(.semibold))
+                        .lineLimit(1)
+                    Spacer()
+                    Text(device.stateLabel)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(stateColor)
+                }
+                if !device.subtitle.isEmpty {
+                    Text(device.subtitle)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                if let error = device.error, !error.isEmpty {
+                    Text(error)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                        .truncationMode(.middle)
+                } else if let lastSeen = device.lastSeen, !lastSeen.isEmpty {
+                    Text("Last seen \(lastSeen)")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+            }
+        }
+    }
+
+    private var symbolName: String {
+        switch device.normalizedState {
+        case "connected":
+            return "antenna.radiowaves.left.and.right.circle.fill"
+        case "scanning", "connecting":
+            return "dot.radiowaves.left.and.right"
+        case "error":
+            return "exclamationmark.triangle.fill"
+        default:
+            return "circle"
+        }
+    }
+
+    private var stateColor: Color {
+        switch device.normalizedState {
+        case "connected":
+            return .green
+        case "scanning", "connecting":
+            return .orange
+        case "error":
+            return .red
+        default:
+            return .secondary
+        }
+    }
+}
+
 struct UsageBar: View {
     let title: String
     let limit: RateLimit?
@@ -518,8 +885,11 @@ struct StickS3CompanionApp: App {
         MenuBarExtra {
             ContentView(model: model)
         } label: {
-            Text(model.menuTitle)
-                .font(.system(size: 12, weight: .semibold, design: .monospaced))
+            HStack(spacing: 4) {
+                Image(systemName: model.symbolName)
+                Text(model.compactMenuTitle)
+                    .font(.system(size: 12, weight: .semibold, design: .monospaced))
+            }
         }
         .menuBarExtraStyle(.window)
     }
