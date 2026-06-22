@@ -2319,7 +2319,12 @@ void drawTopBar() {
   const int pct = batteryPercent();
   char battery[5];
   if (pct >= 0) {
-    snprintf(battery, sizeof(battery), "%d%%", constrain(pct, 0, 100));
+    const int shownPct = constrain(pct, 0, 100);
+    if (shownPct >= 100) {
+      snprintf(battery, sizeof(battery), "100");
+    } else {
+      snprintf(battery, sizeof(battery), "%d%%", shownPct);
+    }
   } else {
     snprintf(battery, sizeof(battery), "--%");
   }
