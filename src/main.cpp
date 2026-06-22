@@ -220,6 +220,11 @@ struct AppState {
   String statusSpeaker = "System";
   String statusKind = "idle";
   String statusText = "Waiting for Codex";
+  String activityStatus = "idle";
+  String activityTitle = "Codex";
+  String activitySubtitle = "Waiting for Codex";
+  String activityWaitingKind;
+  bool hasCodexActivity = false;
   String legacySignature;
   uint64_t tokens = 0;
   bool hasTokens = false;
@@ -604,6 +609,27 @@ void useBodyFontFor(const String&) {
 }
 
 StatusMode currentStatusMode() {
+  if (app.hasCodexActivity) {
+    if (app.activityStatus == "failed") {
+      return MODE_ERR;
+    }
+    if (!bleConnected) {
+      return MODE_OFF;
+    }
+    if (awaitingSnapshot) {
+      return MODE_SYNC;
+    }
+    if (app.lastSnapshotMs > 0 && millis() - app.lastSnapshotMs > STALE_AFTER_MS) {
+      return MODE_STALE;
+    }
+    if (app.activityStatus == "waiting") {
+      return MODE_WAIT;
+    }
+    if (app.activityStatus == "running") {
+      return MODE_WORK;
+    }
+    return MODE_IDLE;
+  }
   if (app.statusKind == "error") {
     return MODE_ERR;
   }
@@ -1431,7 +1457,7 @@ bool setCurrentStatus(String speaker, String kind, String text) {
   speaker = fitText(speaker.isEmpty() ? "Codex" : speaker, 12);
   kind = fitText(kind.isEmpty() ? "status" : kind, 16);
   text = fitText(text.isEmpty() ? kind : text, 96);
-  const bool completed = kind == "complete" || kind == "completed" || kind == "task_complete";
+  const bool completed = kind == "complete" || kind == "completed" || kind == "task_complete" || kind == "review";
   const bool changed = speaker != app.statusSpeaker || text != app.statusText || kind != app.statusKind;
 
   app.statusSpeaker = speaker;
@@ -1449,6 +1475,7 @@ bool setCurrentStatus(String speaker, String kind, String text) {
       || kind == "disconnected"
       || kind == "completed"
       || kind == "complete"
+      || kind == "review"
       || kind == "error"
     )
   ) {
@@ -1468,6 +1495,42 @@ bool handleStatus(JsonObject status) {
   const String kind = status["kind"] | "status";
   const String text = status["text"] | "";
   return setCurrentStatus(speaker, kind, text);
+}
+
+bool handleCodexActivity(JsonObject activity) {
+  String status = activity["status"] | "idle";
+  String title = activity["title"] | "Codex";
+  String subtitle = activity["subtitle"] | "";
+  String waitingKind = activity["waiting_kind"] | "";
+  status.toLowerCase();
+  waitingKind.toLowerCase();
+  if (
+    status != "idle"
+    && status != "running"
+    && status != "waiting"
+    && status != "failed"
+    && status != "review"
+  ) {
+    status = "idle";
+  }
+  if (subtitle.isEmpty()) {
+    subtitle = status;
+  }
+
+  const bool changed =
+    !app.hasCodexActivity
+    || status != app.activityStatus
+    || title != app.activityTitle
+    || subtitle != app.activitySubtitle
+    || waitingKind != app.activityWaitingKind;
+
+  app.hasCodexActivity = true;
+  app.activityStatus = status;
+  app.activityTitle = title;
+  app.activitySubtitle = subtitle;
+  app.activityWaitingKind = waitingKind;
+  const String currentKind = status == "failed" ? "error" : status;
+  return setCurrentStatus(title, currentKind, subtitle) || changed;
 }
 
 uint8_t handleActivity(JsonArray activity) {
@@ -1629,10 +1692,18 @@ void handleSnapshot(JsonDocument& doc) {
     changed = updateRateLimits(doc["rate_limits"].as<JsonObject>()) || changed;
   }
 
-  const bool hasStructuredText = doc["status"].is<JsonObject>() || doc["activity"].is<JsonArray>();
-  if (doc["status"].is<JsonObject>()) {
+  const bool hasCodexActivity = doc["codex_activity"].is<JsonObject>();
+  const bool hasStructuredText = hasCodexActivity || doc["status"].is<JsonObject>() || doc["activity"].is<JsonArray>();
+  if (hasCodexActivity) {
+    changed = handleCodexActivity(doc["codex_activity"].as<JsonObject>()) || changed;
+  } else {
+    changed = app.hasCodexActivity || changed;
+    app.hasCodexActivity = false;
+  }
+
+  if (!hasCodexActivity && doc["status"].is<JsonObject>()) {
     changed = handleStatus(doc["status"].as<JsonObject>()) || changed;
-  } else if (doc["msg"].is<const char*>()) {
+  } else if (!hasCodexActivity && doc["msg"].is<const char*>()) {
     changed = setCurrentStatus("Codex", "status", doc["msg"].as<String>()) || changed;
   }
 

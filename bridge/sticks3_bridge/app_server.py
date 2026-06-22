@@ -5,6 +5,7 @@ import asyncio
 import json
 import logging
 import shlex
+import time
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Any
@@ -13,8 +14,10 @@ from .device import StickS3Device
 from .protocol import (
     SUPPORTED_INTERACTION_METHODS,
     Snapshot,
+    codex_activity,
     interaction_response,
     item_summary,
+    legacy_status_from_activity,
     latest_entries,
     normalize_goal,
     normalize_plan_update,
@@ -144,6 +147,9 @@ class AppState:
     plan: dict[str, Any] | None = None
     goal: dict[str, Any] | None = None
     last_message: str = "Connected to Codex app"
+    last_activity_status: str = "idle"
+    last_error: str | None = None
+    activity_updated_at: float = field(default_factory=time.time)
     active_thread_id: str | None = None
     active_turn_id: str | None = None
 
@@ -151,21 +157,56 @@ class AppState:
         self,
         prompt: dict[str, str] | None = None,
         interaction: dict[str, Any] | None = None,
+        waiting_kind: str | None = None,
     ) -> Snapshot:
         running = sum(1 for status in self.statuses.values() if status == "active")
         waiting = len(self.waiting_threads) + (1 if interaction or prompt else 0)
+        current_activity = self.codex_activity(
+            running=running,
+            waiting=waiting,
+            waiting_kind=waiting_kind,
+        )
         return Snapshot(
             total=len(self.statuses),
             running=running,
             waiting=waiting,
             msg=self.last_message,
             entries=latest_entries(self.entries),
+            status=legacy_status_from_activity(current_activity),
+            codex_activity=current_activity,
             tokens=self.tokens_total,
             rate_limits=self.rate_limits,
             plan=self.plan,
             goal=self.goal,
             prompt=prompt,
             interaction=interaction,
+        )
+
+    def codex_activity(self, *, running: int, waiting: int, waiting_kind: str | None = None) -> Any:
+        if waiting > 0:
+            status = "waiting"
+            subtitle = self.last_message or "Waiting for input"
+        elif self.last_error:
+            status = "failed"
+            subtitle = self.last_error
+        elif running > 0 or self.active_turn_id:
+            status = "running"
+            subtitle = self.last_message or "Working"
+        elif self.last_activity_status in {"review", "failed"}:
+            status = self.last_activity_status
+            subtitle = self.last_message or ("Ready for review" if status == "review" else "Codex error")
+        else:
+            status = "idle"
+            subtitle = self.last_message or "Idle"
+
+        thread_label = self.active_thread_id[:8] if self.active_thread_id else None
+        return codex_activity(
+            status,
+            title=thread_label or "Codex",
+            subtitle=subtitle,
+            waiting_kind=waiting_kind,
+            updated_at=self.activity_updated_at,
+            thread_label=thread_label,
         )
 
 
@@ -192,6 +233,21 @@ def extract_total_tokens(params: dict[str, Any]) -> int | None:
         if isinstance(value, int):
             return max(0, value)
     return None
+
+
+def waiting_kind_for_request(method: str, params: dict[str, Any], interaction: dict[str, Any]) -> str:
+    if method == TOOL_REQUEST_USER_INPUT_METHOD:
+        return "question"
+    if method == "mcpServer/elicitation/request":
+        return "tool"
+    if method == "item/fileChange/requestApproval":
+        return "patch"
+    if method == "item/commandExecution/requestApproval":
+        if isinstance(params.get("networkApprovalContext"), dict):
+            return "network"
+        title = str(interaction.get("title") or "").lower()
+        return "exec" if "command" in title else "permission"
+    return "permission"
 
 
 class CodexAppServerBridge:
@@ -333,7 +389,14 @@ class CodexAppServerBridge:
                 "hint": str(interaction.get("body") or "Approval requested"),
             }
         self.state.last_message = str(interaction.get("body") or interaction.get("title") or "Codex request")
-        await self.send_snapshot(self.state.snapshot(prompt=prompt, interaction=interaction))
+        self.state.activity_updated_at = time.time()
+        await self.send_snapshot(
+            self.state.snapshot(
+                prompt=prompt,
+                interaction=interaction,
+                waiting_kind=waiting_kind_for_request(str(method), params, interaction),
+            )
+        )
 
         try:
             response = await self.device.wait_for_interaction(str(interaction["id"]), timeout=self.approval_timeout)
@@ -345,6 +408,7 @@ class CodexAppServerBridge:
 
         await self.transport.send({"id": request_id, "result": result})
         self.state.last_message = self.response_summary(str(method), response)
+        self.state.activity_updated_at = time.time()
         await self.send_snapshot(self.state.snapshot())
 
     def response_summary(self, method: str, response: dict[str, Any]) -> str:
@@ -395,6 +459,7 @@ class CodexAppServerBridge:
             }
         )
         self.state.last_message = "Interrupt sent"
+        self.state.activity_updated_at = time.time()
         await self.send_snapshot(self.state.snapshot())
 
     async def handle_notification(self, message: dict[str, Any]) -> None:
@@ -402,6 +467,7 @@ class CodexAppServerBridge:
         params = message.get("params") or {}
         if isinstance(params, dict):
             self.update_active_context(params)
+        previous_activity = (self.state.last_message, self.state.last_activity_status, self.state.last_error, self.state.active_turn_id)
 
         if method == "thread/status/changed":
             thread_id = params.get("threadId")
@@ -414,6 +480,11 @@ class CodexAppServerBridge:
                     self.state.waiting_threads.add(str(thread_id))
                 else:
                     self.state.waiting_threads.discard(str(thread_id))
+                if status_type == "active":
+                    self.state.last_activity_status = "running"
+                    self.state.last_error = None
+                elif status_type in {"failed", "error"}:
+                    self.state.last_activity_status = "failed"
                 self.state.last_message = f"Thread {status_type}"
 
         elif method == "item/started":
@@ -422,6 +493,8 @@ class CodexAppServerBridge:
             if summary:
                 self.state.entries.appendleft(summary)
                 self.state.last_message = summary
+                self.state.last_activity_status = "running"
+                self.state.last_error = None
 
         elif method == "item/completed":
             item = params.get("item") or {}
@@ -466,7 +539,9 @@ class CodexAppServerBridge:
 
         elif method == "error":
             error = params.get("error") or {}
-            self.state.last_message = str(error.get("message") or "Codex error")
+            self.state.last_error = str(error.get("message") or "Codex error")
+            self.state.last_activity_status = "failed"
+            self.state.last_message = self.state.last_error
 
         elif method == "turn/started":
             turn = params.get("turn") if isinstance(params, dict) else None
@@ -475,11 +550,17 @@ class CodexAppServerBridge:
                 if turn_id:
                     self.state.active_turn_id = str(turn_id)
             self.state.last_message = "Turn started"
+            self.state.last_activity_status = "running"
+            self.state.last_error = None
 
         elif method == "turn/completed":
             self.state.last_message = "Turn completed"
             self.state.active_turn_id = None
+            self.state.last_activity_status = "review"
 
+        current_activity = (self.state.last_message, self.state.last_activity_status, self.state.last_error, self.state.active_turn_id)
+        if current_activity != previous_activity:
+            self.state.activity_updated_at = time.time()
         await self.send_snapshot(self.state.snapshot())
 
     def _request_id(self) -> int:

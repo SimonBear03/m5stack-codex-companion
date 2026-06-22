@@ -41,6 +41,8 @@ class AppServerBridgeTests(unittest.IsolatedAsyncioTestCase):
 
         prompt_wire = device.snapshots[0].to_wire()
         self.assertEqual("approval", prompt_wire["interaction"]["kind"])
+        self.assertEqual("waiting", prompt_wire["codex_activity"]["status"])
+        self.assertEqual("exec", prompt_wire["codex_activity"]["waiting_kind"])
         self.assertEqual(["once", "session", "deny", "cancel"], [option["id"] for option in prompt_wire["interaction"]["options"]])
         self.assertEqual({"decision": "acceptForSession"}, transport.sent[-1]["result"])
 
@@ -75,6 +77,8 @@ class AppServerBridgeTests(unittest.IsolatedAsyncioTestCase):
         prompt_wire = device.snapshots[0].to_wire()
         self.assertEqual("choice", prompt_wire["interaction"]["kind"])
         self.assertEqual("mode", prompt_wire["interaction"]["question_id"])
+        self.assertEqual("waiting", prompt_wire["codex_activity"]["status"])
+        self.assertEqual("question", prompt_wire["codex_activity"]["waiting_kind"])
         self.assertEqual({"answers": {"mode": {"answers": ["once"]}}}, transport.sent[-1]["result"])
 
     async def test_plan_and_goal_notifications_reach_snapshot(self) -> None:
@@ -116,6 +120,42 @@ class AppServerBridgeTests(unittest.IsolatedAsyncioTestCase):
         wire = device.snapshots[-1].to_wire()
         self.assertEqual("Implement plan page", wire["plan"]["step"])
         self.assertEqual("Ship the StickS3 companion", wire["goal"]["objective"])
+
+    async def test_turn_lifecycle_maps_to_codex_activity(self) -> None:
+        device = FakeStickS3Device()
+        bridge = CodexAppServerBridge(transport=DummyTransport(), device=device)
+
+        await bridge.handle_notification(
+            {
+                "method": "turn/started",
+                "params": {"threadId": "thread-1", "turn": {"id": "turn-1"}},
+            }
+        )
+        self.assertEqual("running", device.snapshots[-1].to_wire()["codex_activity"]["status"])
+
+        await bridge.handle_notification(
+            {
+                "method": "turn/completed",
+                "params": {"threadId": "thread-1", "turnId": "turn-1"},
+            }
+        )
+        self.assertEqual("review", device.snapshots[-1].to_wire()["codex_activity"]["status"])
+
+    async def test_error_notification_maps_to_failed_codex_activity(self) -> None:
+        device = FakeStickS3Device()
+        bridge = CodexAppServerBridge(transport=DummyTransport(), device=device)
+
+        await bridge.handle_notification(
+            {
+                "method": "error",
+                "params": {"error": {"message": "Codex failed"}},
+            }
+        )
+
+        wire = device.snapshots[-1].to_wire()
+        self.assertEqual("failed", wire["codex_activity"]["status"])
+        self.assertEqual("danger", wire["codex_activity"]["level"])
+        self.assertEqual({"speaker": "Codex", "kind": "error", "text": "Codex failed"}, wire["status"])
 
     async def test_goal_cleared_reaches_snapshot(self) -> None:
         device = FakeStickS3Device()

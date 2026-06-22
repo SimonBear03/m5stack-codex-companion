@@ -86,7 +86,7 @@ python3 scripts/sticks3-macos-bridge stop
 Runtime files live in `runtime/` and are ignored by Git:
 
 - `bridge.pid`: the process started by the supervisor
-- `bridge-status.json`: lifecycle, current status, thread, tokens, rate limits, and latest device telemetry when the StickS3 replies to `status`
+- `bridge-status.json`: lifecycle, canonical `codex_activity`, legacy current status, thread, tokens, rate limits, and latest device telemetry when a companion replies to `status`
 - `bridge.log`: bridge stdout/stderr from background starts
 
 The generated Bluetooth-permission wrapper is installed outside the repo at

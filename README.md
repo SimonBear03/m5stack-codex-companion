@@ -1,8 +1,8 @@
 # StickS3 / Cardputer Codex Companion
 
-Custom M5Stack firmware for a serious minimal Codex status dashboard.
+Custom M5Stack firmware for a compact Codex companion activity display.
 
-The StickS3 and Cardputer ADV targets are BLE displays for Codex activity on Simon's Mac. A local bridge connects the device either to Codex Desktop rollout logs in read-only observer mode or to a Codex App Server endpoint for protocol validation. Public Codex docs do not currently document native desktop-app BLE pairing, so this repo uses a small JSONL-over-BLE device protocol.
+The StickS3 and Cardputer ADV targets are BLE displays for Codex activity on Simon's Mac. A local bridge connects the device either to Codex Desktop rollout logs in read-only observer mode or to a Codex App Server endpoint for protocol validation. Public Codex docs do not currently document native desktop-app BLE pairing, so this repo uses a small JSONL-over-BLE device protocol whose primary payload is a Codex companion activity object.
 
 ## Current Scope
 
@@ -12,10 +12,11 @@ The StickS3 and Cardputer ADV targets are BLE displays for Codex activity on Sim
   - fixed 3x3 status matrix with mode-specific animation
   - small amber unread marker when newer body text arrives while reading older text
   - BLE, USB, and battery indicators
+- Canonical Codex activity state via `codex_activity`: `idle`, `running`, `waiting`, `failed`, or `review`, with compact title/subtitle text and optional waiting kind.
 - Usage section:
   - `5h` and `7d` remaining percentages with compact bars
   - compact token totals such as `842`, `12.4K`, `57.6M`, or `1.2B`
-- Pinned current action line with speaker labels such as `Codex`, `User`, `Tool`, and `System`.
+- Pinned current action line derived from the Codex activity title/subtitle, with legacy speaker labels still accepted during migration.
 - Scrollable wrapped body text backed by a fixed ring buffer in `Detail Full`, rendered as compact message blocks with colored speaker headers and blank separators.
 - Orientation-aware portrait and landscape dashboard layouts with wrapped body reflow. StickS3 uses IMU-driven autorotate; Cardputer defaults to fixed landscape.
 - Settings menu for brightness, power profile, detail level, sound, text navigation, auto-newest behavior, and rotation mode.
@@ -27,8 +28,8 @@ Current firmware is read-only for the Codex Desktop workflow. It does not expose
 
 ## Bridge Modes
 
-- `desktop-observer`: read-only status mirroring for the actual Codex Desktop app. It follows local rollout JSONL files under `~/.codex/sessions`, prefers non-subagent Desktop threads for activity, and forwards active/idle state, recent work-like activity, speaker-labeled activity, token totals, and rate limits. Usage is seeded from the freshest recent `token_count` event across rollout files so the account-level limits can show before the current thread starts work.
-- `app-server`: JSON-RPC validation path for a Codex App Server endpoint. The Python bridge still contains approval/choice mapping logic, but the current dashboard firmware is focused on read-only display.
+- `desktop-observer`: read-only status mirroring for the actual Codex Desktop app. It follows local rollout JSONL files under `~/.codex/sessions`, prefers the newest active non-subagent Desktop thread, and forwards canonical activity state, optional scrollback activity, token totals, and rate limits. Usage is seeded from the freshest recent `token_count` event across rollout files so the account-level limits can show before the current thread starts work.
+- `app-server`: JSON-RPC validation path for a Codex App Server endpoint. The Python bridge maps App Server events and interaction requests into the same canonical activity state, but the current firmware is focused on read-only display.
 
 True control of an already-open Codex Desktop app thread is blocked until Codex exposes a documented local attach/control endpoint.
 

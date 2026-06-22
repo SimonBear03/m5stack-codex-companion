@@ -2,6 +2,7 @@ import unittest
 
 from sticks3_bridge.protocol import (
     COMMAND_APPROVAL_METHOD,
+    CodexActivity,
     FILE_APPROVAL_METHOD,
     MAX_INTERACTION_OPTIONS,
     TOOL_REQUEST_USER_INPUT_METHOD,
@@ -10,6 +11,8 @@ from sticks3_bridge.protocol import (
     approval_prompt,
     approval_response,
     chunk_bytes,
+    codex_activity,
+    codex_state_from_activity,
     encode_json_line,
     interaction_response,
     normalize_goal,
@@ -220,6 +223,31 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(list(activity), wire["activity"])
         self.assertIn("msg", wire)
         self.assertIn("entries", wire)
+
+    def test_snapshot_serializes_codex_activity(self) -> None:
+        activity = codex_activity(
+            "waiting",
+            title="thread-1",
+            subtitle="Approve command",
+            waiting_kind="exec",
+            updated_at=1000,
+            thread_label="thread-1",
+            project_label="repo",
+        )
+        wire = Snapshot(codex_activity=activity).to_wire()
+
+        self.assertEqual("codex_activity/v1", wire["codex_activity"]["schema"])
+        self.assertEqual("waiting", wire["codex_activity"]["status"])
+        self.assertEqual("warning", wire["codex_activity"]["level"])
+        self.assertEqual("exec", wire["codex_activity"]["waiting_kind"])
+        self.assertEqual(1000 + 86400, wire["codex_activity"]["expires_at"])
+        self.assertEqual(0, wire["codex_activity"]["priority"])
+        self.assertEqual("wait", codex_state_from_activity(activity))
+
+    def test_codex_activity_normalizes_unknown_status(self) -> None:
+        wire = CodexActivity(status="unknown", updated_at=10).to_wire()
+        self.assertEqual("idle", wire["status"])
+        self.assertNotIn("expires_at", wire)
 
     def test_snapshot_can_omit_legacy_text_fields(self) -> None:
         wire = Snapshot(status={"speaker": "Codex", "kind": "idle", "text": "Idle"}, legacy_text=False).to_wire()

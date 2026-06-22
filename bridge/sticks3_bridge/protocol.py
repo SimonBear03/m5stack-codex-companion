@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Any
@@ -40,6 +41,29 @@ SUPPORTED_INTERACTION_METHODS = {
     TOOL_REQUEST_USER_INPUT_METHOD,
     MCP_ELICITATION_REQUEST_METHOD,
 }
+CODEX_ACTIVITY_SCHEMA = "codex_activity/v1"
+CODEX_ACTIVITY_STATUSES = {"idle", "running", "waiting", "failed", "review"}
+CODEX_ACTIVITY_LEVELS = {
+    "idle": "info",
+    "running": "info",
+    "waiting": "warning",
+    "failed": "danger",
+    "review": "success",
+}
+CODEX_ACTIVITY_PRIORITIES = {
+    "waiting": 0,
+    "failed": 1,
+    "review": 2,
+    "running": 3,
+    "idle": 4,
+}
+CODEX_ACTIVITY_EXPIRES_AFTER_SECONDS = {
+    "running": 180,
+    "failed": 3600,
+    "waiting": 86400,
+    "review": 604800,
+}
+CODEX_WAITING_KINDS = {"question", "patch", "exec", "network", "permission", "tool", "plan"}
 
 
 def compact_json(data: dict[str, Any]) -> str:
@@ -79,6 +103,126 @@ class JsonLineDecoder:
         return messages
 
 
+def normalize_activity_status(value: Any) -> str:
+    status = str(value or "idle").strip().lower()
+    return status if status in CODEX_ACTIVITY_STATUSES else "idle"
+
+
+def normalize_waiting_kind(value: Any) -> str | None:
+    if value is None:
+        return None
+    kind = str(value).strip().lower()
+    return kind if kind in CODEX_WAITING_KINDS else None
+
+
+@dataclass(frozen=True)
+class CodexActivity:
+    status: str = "idle"
+    title: str | None = None
+    subtitle: str | None = None
+    waiting_kind: str | None = None
+    level: str | None = None
+    is_loading: bool | None = None
+    updated_at: int | None = None
+    expires_at: int | None = None
+    priority: int | None = None
+    thread_label: str | None = None
+    project_label: str | None = None
+
+    def to_wire(self) -> dict[str, Any]:
+        status = normalize_activity_status(self.status)
+        updated_at = self.updated_at
+        if updated_at is None:
+            updated_at = int(time.time())
+
+        expires_at = self.expires_at
+        if expires_at is None and status in CODEX_ACTIVITY_EXPIRES_AFTER_SECONDS:
+            expires_at = updated_at + CODEX_ACTIVITY_EXPIRES_AFTER_SECONDS[status]
+
+        data: dict[str, Any] = {
+            "schema": CODEX_ACTIVITY_SCHEMA,
+            "status": status,
+            "level": self.level or CODEX_ACTIVITY_LEVELS[status],
+            "is_loading": bool(self.is_loading if self.is_loading is not None else status == "running"),
+            "updated_at": updated_at,
+            "priority": self.priority if self.priority is not None else CODEX_ACTIVITY_PRIORITIES[status],
+        }
+        if expires_at is not None:
+            data["expires_at"] = expires_at
+        if self.title:
+            data["title"] = short_text(self.title, 80)
+        if self.subtitle:
+            data["subtitle"] = short_text(self.subtitle, 120)
+        waiting_kind = normalize_waiting_kind(self.waiting_kind)
+        if waiting_kind:
+            data["waiting_kind"] = waiting_kind
+        if self.thread_label:
+            data["thread_label"] = short_text(self.thread_label, 48)
+        if self.project_label:
+            data["project_label"] = short_text(self.project_label, 48)
+        return data
+
+
+def codex_activity(
+    status: str,
+    *,
+    title: Any = None,
+    subtitle: Any = None,
+    waiting_kind: Any = None,
+    updated_at: float | int | None = None,
+    thread_label: Any = None,
+    project_label: Any = None,
+) -> CodexActivity:
+    normalized = normalize_activity_status(status)
+    timestamp = int(updated_at if updated_at is not None else time.time())
+    return CodexActivity(
+        status=normalized,
+        title=short_text(title, 80) if title is not None else None,
+        subtitle=short_text(subtitle, 120) if subtitle is not None else None,
+        waiting_kind=normalize_waiting_kind(waiting_kind),
+        level=CODEX_ACTIVITY_LEVELS[normalized],
+        is_loading=normalized == "running",
+        updated_at=timestamp,
+        expires_at=timestamp + CODEX_ACTIVITY_EXPIRES_AFTER_SECONDS[normalized]
+        if normalized in CODEX_ACTIVITY_EXPIRES_AFTER_SECONDS
+        else None,
+        priority=CODEX_ACTIVITY_PRIORITIES[normalized],
+        thread_label=short_text(thread_label, 48) if thread_label is not None else None,
+        project_label=short_text(project_label, 48) if project_label is not None else None,
+    )
+
+
+def legacy_status_from_activity(activity: CodexActivity | dict[str, Any] | None) -> dict[str, str] | None:
+    if activity is None:
+        return None
+    wire = activity.to_wire() if isinstance(activity, CodexActivity) else activity
+    status = normalize_activity_status(wire.get("status"))
+    title = short_text(wire.get("title") or "Codex", 16)
+    subtitle = short_text(wire.get("subtitle") or status, 96)
+    legacy_kind = {
+        "failed": "error",
+        "idle": "idle",
+        "review": "completed",
+        "running": "working",
+        "waiting": "waiting",
+    }[status]
+    return {"speaker": title, "kind": legacy_kind, "text": subtitle}
+
+
+def codex_state_from_activity(activity: CodexActivity | dict[str, Any] | None) -> str:
+    if activity is None:
+        return "wait"
+    wire = activity.to_wire() if isinstance(activity, CodexActivity) else activity
+    status = normalize_activity_status(wire.get("status"))
+    if status == "failed":
+        return "err"
+    if status == "waiting":
+        return "wait"
+    if status == "running":
+        return "work"
+    return "idle"
+
+
 @dataclass(frozen=True)
 class Snapshot:
     total: int = 0
@@ -87,6 +231,7 @@ class Snapshot:
     msg: str = "Connected to Codex app"
     entries: tuple[str, ...] = ()
     status: dict[str, Any] | None = None
+    codex_activity: CodexActivity | dict[str, Any] | None = None
     activity: tuple[dict[str, Any], ...] = ()
     tokens: int | None = None
     tokens_today: int | None = None
@@ -109,6 +254,12 @@ class Snapshot:
             data["entries"] = list(self.entries[:3])
         if self.status:
             data["status"] = self.status
+        if self.codex_activity:
+            data["codex_activity"] = (
+                self.codex_activity.to_wire()
+                if isinstance(self.codex_activity, CodexActivity)
+                else self.codex_activity
+            )
         if self.activity:
             data["activity"] = list(self.activity)
         if self.tokens is not None:

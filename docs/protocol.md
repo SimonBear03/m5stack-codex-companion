@@ -1,8 +1,8 @@
 # Protocol
 
-This firmware implements a small bridge protocol for the M5Stack Codex dashboard targets.
+This firmware implements a small bridge protocol for the M5Stack Codex companion targets.
 
-The BLE side is intentionally device-local and simple. It is not an official OpenAI BLE protocol. The Mac bridge maps Codex Desktop rollout events or Codex App Server events into compact dashboard snapshots.
+The BLE side is intentionally device-local and simple. It is not an official OpenAI BLE protocol. The Mac bridge maps Codex Desktop rollout events or Codex App Server events into a compact Codex companion activity payload, plus optional usage and scrollback data.
 
 ## BLE
 
@@ -64,7 +64,7 @@ For normal sync, the bridge authenticates each BLE connection with:
 
 The HMAC message is `auth:v1:<device_id>:<device_nonce>:<host_nonce>:<host_id>`, keyed by the stored per-device secret. When a device is paired, snapshots, `status`, `owner`, `name`, and `unpair` are private and are rejected until `auth` succeeds for the current BLE connection.
 
-## Dashboard Snapshot
+## Companion Snapshot
 
 The device accepts snapshots like:
 
@@ -73,11 +73,22 @@ The device accepts snapshots like:
   "total": 1,
   "running": 1,
   "waiting": 0,
-  "msg": "Codex working",
-  "entries": ["Codex: Editing firmware", "Tool: pio run"],
+  "codex_activity": {
+    "schema": "codex_activity/v1",
+    "status": "running",
+    "title": "thread-1",
+    "subtitle": "Editing firmware",
+    "level": "info",
+    "is_loading": true,
+    "updated_at": 1781109800,
+    "expires_at": 1781109980,
+    "priority": 3,
+    "thread_label": "thread-1",
+    "project_label": "sticks3-codex-companion"
+  },
   "status": {
     "speaker": "Codex",
-    "kind": "message",
+    "kind": "working",
     "text": "Editing firmware"
   },
   "activity": [
@@ -114,7 +125,11 @@ The device accepts snapshots like:
 }
 ```
 
-`status` is the pinned newest action line. `activity` is the scrollable body input and should be ordered oldest-to-newest so the newest message lands at the bottom of the terminal window. Each activity item should include a stable `seq`; the firmware dedupes recently seen sequence IDs so heartbeat snapshots do not duplicate body text. Bridges may omit `activity` on heartbeat snapshots when no new body text exists.
+`codex_activity` is the primary semantic state. Its `status` is one of `idle`, `running`, `waiting`, `failed`, or `review`. Priority order is `waiting`, `failed`, `review`, `running`, then `idle`. `waiting_kind` may be `question`, `patch`, `exec`, `network`, `permission`, `tool`, or `plan`. The bridge uses the same expiry windows as the desktop companion surface: about 3 minutes for `running`, 1 hour for `failed`, 1 day for `waiting`, and 1 week for `review`; `idle` has no expiry.
+
+`status`, `total`, `running`, `waiting`, `msg`, and `entries` are compatibility fields during the migration from the older dashboard snapshot. New firmware and the menu app prefer `codex_activity`; older firmware can still render `status` and the legacy counters.
+
+`activity` remains the optional scrollable body input and should be ordered oldest-to-newest so the newest message lands at the bottom of the terminal window. Each activity item should include a stable `seq`; the firmware dedupes recently seen sequence IDs so heartbeat snapshots do not duplicate body text. Bridges may omit `activity` on heartbeat snapshots when no new body text exists.
 
 The firmware renders conversation activity as compact message blocks, not a raw line stream: a colored header such as `[Codex]` or `[User]`, followed by flush-left wrapped body lines and a blank separator line before the next message. Tool activity is treated as pinned current status only and is not added to scrollback, so command noise does not displace the readable conversation.
 
@@ -222,10 +237,10 @@ The device displays remaining percentages beside compact bars, for example `5h 6
 
 ## Desktop Observer Mapping
 
-`desktop-observer` reads local Codex rollout JSONL and emits structured dashboard snapshots:
+`desktop-observer` reads local Codex rollout JSONL and emits `codex_activity` plus optional scrollback:
 
-- `task_started` -> `Codex: Working`
-- `task_complete` -> `Codex: Turn completed` plus the last agent message in activity
+- `task_started` -> `running`
+- `task_complete` -> `review` plus the last agent message in scrollback activity
 - `agent_message` -> `Codex` activity
 - `user_message` -> `User` activity
 - `response_item` function calls -> `Tool` activity with a cleaned tool name

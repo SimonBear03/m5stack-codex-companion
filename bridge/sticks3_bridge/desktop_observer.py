@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from .device import StickS3Device
-from .protocol import Snapshot, normalize_rate_limits, short_text
+from .protocol import Snapshot, codex_activity, codex_state_from_activity, normalize_rate_limits, short_text
 
 LOGGER = logging.getLogger(__name__)
 
@@ -436,10 +436,12 @@ class DesktopObserverState:
     rate_limits: dict[str, dict[str, Any]] | None = None
     usage_event_ts: float | None = None
     last_event_ts: float | None = None
+    activity_updated_at: float = field(default_factory=time.time)
 
     def snapshot(self, activity: tuple[dict[str, Any], ...] | None = None, *, working: bool | None = None) -> Snapshot:
         is_working = self.active if working is None else working
         label = self.thread_name or (self.thread_id[:8] if self.thread_id else "Desktop")
+        project_label = Path(self.cwd).name if self.cwd else None
         msg = self.last_message
         if not is_working and self.thread_id and msg == "Desktop observer connected":
             msg = short_text(f"Idle: {label}", 80)
@@ -448,6 +450,7 @@ class DesktopObserverState:
             short_text(f"{item.get('speaker', 'Codex')}: {item.get('text', '')}", 48)
             for item in reversed(ordered_activity)
         )
+        current_activity = self.codex_activity(working=is_working, label=label, project_label=project_label)
         return Snapshot(
             total=1 if self.thread_id else 0,
             running=1 if is_working else 0,
@@ -455,10 +458,35 @@ class DesktopObserverState:
             msg=msg,
             entries=entries[:3],
             status=self.status,
+            codex_activity=current_activity,
             activity=ordered_activity,
             tokens=self.tokens_total,
             rate_limits=self.rate_limits,
         )
+
+    def codex_activity(self, *, working: bool, label: str, project_label: str | None) -> Any:
+        status = self.activity_status(working=working)
+        subtitle = self.status.get("text") if isinstance(self.status, dict) else self.last_message
+        if not subtitle:
+            subtitle = "Working" if status == "running" else "Idle"
+        return codex_activity(
+            status,
+            title=label,
+            subtitle=subtitle,
+            updated_at=self.activity_updated_at,
+            thread_label=label if self.thread_id else None,
+            project_label=project_label,
+        )
+
+    def activity_status(self, *, working: bool) -> str:
+        kind = str(self.status.get("kind") or "").lower() if isinstance(self.status, dict) else ""
+        if kind == "error":
+            return "failed"
+        if working:
+            return "running"
+        if kind in {"completed", "complete", "task_complete"}:
+            return "review"
+        return "idle"
 
 
 class DesktopObserverBridge:
@@ -931,11 +959,42 @@ class DesktopObserverBridge:
             return {"speaker": "System", "kind": "connected", "text": "Connected"}
         return {"speaker": "Codex", "kind": "idle", "text": "Idle"}
 
+    @staticmethod
+    def sanitize_codex_activity(activity: Any, *, detail: int, working: bool) -> Any:
+        if detail == DETAIL_FULL or activity is None:
+            return activity
+        wire = activity.to_wire() if hasattr(activity, "to_wire") else dict(activity)
+        status = str(wire.get("status") or ("running" if working else "idle"))
+        subtitle = str(wire.get("subtitle") or "")
+        if detail == DETAIL_STATUS:
+            if status == "running":
+                subtitle = "Working"
+            elif status == "waiting":
+                subtitle = "Waiting"
+            elif status == "failed":
+                subtitle = "Bridge error"
+            elif status == "review":
+                subtitle = "Ready for review"
+            else:
+                subtitle = "Idle"
+        else:
+            subtitle = "Working" if working else "Usage synced"
+        return codex_activity(
+            status,
+            title=wire.get("title") or "Codex",
+            subtitle=subtitle,
+            waiting_kind=wire.get("waiting_kind"),
+            updated_at=wire.get("updated_at"),
+            thread_label=wire.get("thread_label"),
+            project_label=wire.get("project_label"),
+        )
+
     def snapshot_for_detail(self, snapshot: Snapshot, *, detail: int, working: bool) -> Snapshot:
         if detail == DETAIL_FULL:
             return snapshot
         status = self.sanitize_status(snapshot.status, detail=detail, working=working)
         msg = status["text"] if status else ("Working" if working else "Usage synced")
+        current_activity = self.sanitize_codex_activity(snapshot.codex_activity, detail=detail, working=working)
         return Snapshot(
             total=snapshot.total,
             running=snapshot.running,
@@ -943,6 +1002,7 @@ class DesktopObserverBridge:
             msg=msg,
             entries=(),
             status=status,
+            codex_activity=current_activity,
             activity=(),
             tokens=snapshot.tokens,
             tokens_today=snapshot.tokens_today,
@@ -962,6 +1022,14 @@ class DesktopObserverBridge:
                 "kind": "working" if working else "sync",
                 "text": "Working" if working else "Syncing",
             }
+        current_activity = self.sanitize_codex_activity(base.codex_activity, detail=detail, working=working)
+        if current_activity is None:
+            current_activity = codex_activity(
+                "running" if working else "idle",
+                title="Codex",
+                subtitle="Working" if working else "Syncing",
+                updated_at=self.state.last_event_ts,
+            )
         return Snapshot(
             total=base.total,
             running=base.running,
@@ -969,6 +1037,7 @@ class DesktopObserverBridge:
             msg=status["text"],
             entries=(),
             status=status,
+            codex_activity=current_activity,
             activity=(),
             tokens=base.tokens,
             tokens_today=base.tokens_today,
@@ -984,6 +1053,7 @@ class DesktopObserverBridge:
             "kind": short_text(kind or "status", 24),
             "text": clean,
         }
+        self.state.activity_updated_at = self.state.last_event_ts or time.time()
         self.state.last_message = clean
 
     def add_activity(self, speaker: str, kind: str, value: Any) -> None:
@@ -1184,7 +1254,9 @@ class DesktopObserverBridge:
                 error = fleet_summary.get("device_error")
         self._device_state = state
         self._device_error = error
-        codex_state = self.codex_state()
+        current_activity = self.state.snapshot(activity=(), working=self.is_working()).codex_activity
+        current_activity_wire = current_activity.to_wire() if hasattr(current_activity, "to_wire") else current_activity
+        codex_state = codex_state_from_activity(current_activity_wire)
         payload: dict[str, Any] = {
             "state": state,
             "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
@@ -1207,6 +1279,7 @@ class DesktopObserverBridge:
             "detail_mode": self.device_detail_mode(),
             "last_message": self.state.last_message,
             "status": self.state.status,
+            "codex_activity": current_activity_wire,
             "tokens": self.state.tokens_total,
             "rate_limits": self.state.rate_limits,
         }
@@ -1227,11 +1300,4 @@ class DesktopObserverBridge:
             LOGGER.debug("Could not write status file %s: %s", self.status_file, exc)
 
     def codex_state(self) -> str:
-        status_kind = str(self.state.status.get("kind") or "").lower() if isinstance(self.state.status, dict) else ""
-        if status_kind == "error":
-            return "err"
-        if self.is_working():
-            return "work"
-        if self.state.thread_id:
-            return "idle"
-        return "wait"
+        return codex_state_from_activity(self.state.snapshot(activity=(), working=self.is_working()).codex_activity)

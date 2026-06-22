@@ -490,6 +490,8 @@ class DesktopObserverTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(1234, wire["tokens"])
             self.assertEqual("5h", wire["rate_limits"]["primary"]["label"])
             self.assertEqual({"speaker": "Codex", "kind": "completed", "text": "Turn completed"}, wire["status"])
+            self.assertEqual("review", wire["codex_activity"]["status"])
+            self.assertEqual("Turn completed", wire["codex_activity"]["subtitle"])
             self.assertEqual("Codex", wire["activity"][-1]["speaker"])
             self.assertEqual("completed", wire["activity"][-1]["kind"])
             self.assertIn("Finished observer update", wire["activity"][-1]["text"])
@@ -529,6 +531,8 @@ class DesktopObserverTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual("thread-2", status["thread_id"])
             self.assertTrue(status["active"])
             self.assertEqual({"speaker": "Codex", "kind": "working", "text": "Working"}, status["status"])
+            self.assertEqual("running", status["codex_activity"]["status"])
+            self.assertEqual("Working", status["codex_activity"]["subtitle"])
             self.assertEqual("Working", status["detail"])
 
     async def test_status_file_updates_without_connected_device(self) -> None:
@@ -554,6 +558,7 @@ class DesktopObserverTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual("disconnected", status["state"])
             self.assertTrue(status["active"])
             self.assertEqual("thread-off-device", status["thread_id"])
+            self.assertEqual("running", status["codex_activity"]["status"])
 
     async def test_poll_once_seeds_usage_from_recent_rollout_when_current_thread_has_none(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -691,6 +696,8 @@ class DesktopObserverTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(2468, initial_wire["tokens"])
             self.assertEqual(70, initial_wire["rate_limits"]["primary"]["remaining_percent"])
             self.assertEqual({"speaker": "Codex", "kind": "message", "text": "Fresh reply status."}, initial_wire["status"])
+            self.assertEqual("running", initial_wire["codex_activity"]["status"])
+            self.assertEqual("Fresh reply status.", initial_wire["codex_activity"]["subtitle"])
             self.assertNotIn("msg", initial_wire)
             self.assertNotIn("entries", initial_wire)
             self.assertNotIn("activity", initial_wire)
@@ -727,6 +734,7 @@ class DesktopObserverTests(unittest.IsolatedAsyncioTestCase):
             initial_wire = device.snapshots[0].to_wire()
             self.assertEqual(1, initial_wire["running"])
             self.assertEqual({"speaker": "Codex", "kind": "thinking", "text": "Thinking"}, initial_wire["status"])
+            self.assertEqual("running", initial_wire["codex_activity"]["status"])
             self.assertEqual("work", bridge.codex_state())
 
     async def test_request_status_failure_after_delivery_keeps_snapshot_sent(self) -> None:
@@ -761,6 +769,8 @@ class DesktopObserverTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("entries", wire)
         self.assertNotIn("activity", wire)
         self.assertEqual({"speaker": "Codex", "kind": "message", "text": "Codex message"}, wire["status"])
+        self.assertEqual("idle", wire["codex_activity"]["status"])
+        self.assertEqual("Idle", wire["codex_activity"]["subtitle"])
         self.assertEqual(999, wire["tokens"])
 
     async def test_usage_detail_suppresses_specific_status_and_body_text(self) -> None:
@@ -784,6 +794,8 @@ class DesktopObserverTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("entries", wire)
         self.assertNotIn("activity", wire)
         self.assertEqual({"speaker": "Codex", "kind": "working", "text": "Working"}, wire["status"])
+        self.assertEqual("running", wire["codex_activity"]["status"])
+        self.assertEqual("Working", wire["codex_activity"]["subtitle"])
         self.assertEqual(1000, wire["tokens"])
         self.assertEqual(80, wire["rate_limits"]["primary"]["remaining_percent"])
 
@@ -803,6 +815,7 @@ class DesktopObserverTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("entries", wire)
         self.assertNotIn("activity", wire)
         self.assertEqual({"speaker": "Codex", "kind": "idle", "text": "Idle"}, wire["status"])
+        self.assertEqual("idle", wire["codex_activity"]["status"])
 
     async def test_detail_mode_skips_duplicate_sanitized_snapshots(self) -> None:
         device = FakeStickS3Device()
@@ -913,6 +926,8 @@ class DesktopObserverTests(unittest.IsolatedAsyncioTestCase):
         wire = bridge.build_snapshot().to_wire()
         self.assertEqual(1, wire["running"])
         self.assertEqual({"speaker": "Tool", "kind": "started", "text": "exec_command"}, wire["status"])
+        self.assertEqual("running", wire["codex_activity"]["status"])
+        self.assertEqual("exec_command", wire["codex_activity"]["subtitle"])
         self.assertEqual("work", bridge.codex_state())
 
     def test_reasoning_response_item_sets_working_early(self) -> None:
@@ -935,6 +950,7 @@ class DesktopObserverTests(unittest.IsolatedAsyncioTestCase):
         wire = bridge.build_snapshot().to_wire()
         self.assertEqual(1, wire["running"])
         self.assertEqual({"speaker": "Codex", "kind": "thinking", "text": "Thinking"}, wire["status"])
+        self.assertEqual("running", wire["codex_activity"]["status"])
 
     def test_reasoning_stays_working_past_old_short_grace(self) -> None:
         device = FakeStickS3Device()
@@ -967,7 +983,9 @@ class DesktopObserverTests(unittest.IsolatedAsyncioTestCase):
         bridge._active_work_deadline = time.monotonic() - 0.1
 
         self.assertFalse(bridge.is_working())
-        self.assertEqual(0, bridge.build_snapshot().to_wire()["running"])
+        wire = bridge.build_snapshot().to_wire()
+        self.assertEqual(0, wire["running"])
+        self.assertEqual("idle", wire["codex_activity"]["status"])
 
     def test_abort_like_event_clears_active_work(self) -> None:
         device = FakeStickS3Device()
@@ -989,6 +1007,7 @@ class DesktopObserverTests(unittest.IsolatedAsyncioTestCase):
         wire = bridge.build_snapshot().to_wire()
         self.assertEqual(0, wire["running"])
         self.assertEqual({"speaker": "Codex", "kind": "stopped", "text": "Turn stopped"}, wire["status"])
+        self.assertEqual("idle", wire["codex_activity"]["status"])
 
     def test_task_complete_clears_recent_work_grace(self) -> None:
         device = FakeStickS3Device()
@@ -1021,6 +1040,7 @@ class DesktopObserverTests(unittest.IsolatedAsyncioTestCase):
         wire = bridge.build_snapshot().to_wire()
         self.assertEqual(0, wire["running"])
         self.assertEqual({"speaker": "Codex", "kind": "completed", "text": "Turn completed"}, wire["status"])
+        self.assertEqual("review", wire["codex_activity"]["status"])
 
     def test_old_rollout_activity_does_not_replay_as_working_on_startup(self) -> None:
         device = FakeStickS3Device()
@@ -1104,6 +1124,7 @@ class DesktopObserverTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(status["active"])
             self.assertTrue(status["task_active"])
             self.assertEqual({"speaker": "Tool", "kind": "started", "text": "exec_command"}, status["status"])
+            self.assertEqual("running", status["codex_activity"]["status"])
 
     def test_token_count_updates_usage_without_changing_work_status(self) -> None:
         device = FakeStickS3Device()
@@ -1141,6 +1162,7 @@ class DesktopObserverTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, wire["running"])
         self.assertEqual(1234, wire["tokens"])
         self.assertEqual({"speaker": "Tool", "kind": "started", "text": "exec_command"}, wire["status"])
+        self.assertEqual("running", wire["codex_activity"]["status"])
         self.assertEqual("work", bridge.codex_state())
 
 

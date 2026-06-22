@@ -29,6 +29,34 @@ struct CurrentStatus: Decodable {
     let text: String?
 }
 
+struct CodexActivity: Decodable {
+    let status: String?
+    let title: String?
+    let subtitle: String?
+    let waitingKind: String?
+    let level: String?
+    let isLoading: Bool?
+    let updatedAt: Int?
+    let expiresAt: Int?
+    let priority: Int?
+    let threadLabel: String?
+    let projectLabel: String?
+
+    enum CodingKeys: String, CodingKey {
+        case status
+        case title
+        case subtitle
+        case waitingKind = "waiting_kind"
+        case level
+        case isLoading = "is_loading"
+        case updatedAt = "updated_at"
+        case expiresAt = "expires_at"
+        case priority
+        case threadLabel = "thread_label"
+        case projectLabel = "project_label"
+    }
+}
+
 struct CompanionDevice: Decodable {
     let deviceId: String?
     let label: String?
@@ -159,6 +187,7 @@ struct BridgePayload: Decodable {
     let deviceState: String?
     let devices: [CompanionDevice]?
     let connectedDeviceCount: Int?
+    let codexActivity: CodexActivity?
     let error: String?
     let launchAgentInstalled: Bool?
     let launchAgentLoaded: Bool?
@@ -189,6 +218,7 @@ struct BridgePayload: Decodable {
         case deviceState = "device_state"
         case devices
         case connectedDeviceCount = "connected_device_count"
+        case codexActivity = "codex_activity"
         case error
         case launchAgentInstalled = "launch_agent_installed"
         case launchAgentLoaded = "launch_agent_loaded"
@@ -262,14 +292,16 @@ final class BridgeModel: ObservableObject {
 
     private var shortCodexLabel: String {
         switch codexState {
-        case "work", "working":
+        case "work", "working", "running":
             return "Work"
         case "idle", "connected":
             return "Idle"
-        case "err", "error":
+        case "err", "error", "failed":
             return "Err"
-        case "wait", "starting":
+        case "wait", "starting", "waiting":
             return "Wait"
+        case "review":
+            return "Review"
         default:
             return codexState.prefix(1).uppercased() + codexState.dropFirst()
         }
@@ -277,14 +309,16 @@ final class BridgeModel: ObservableObject {
 
     var symbolName: String {
         switch codexState {
-        case "work", "working":
+        case "work", "working", "running":
             return "bolt.horizontal.circle.fill"
-        case "err", "error":
+        case "err", "error", "failed":
             return "exclamationmark.triangle.fill"
         case "idle", "connected":
             return "checkmark.circle.fill"
-        case "wait", "starting":
+        case "wait", "starting", "waiting":
             return "clock.circle.fill"
+        case "review":
+            return "checkmark.seal.fill"
         default:
             return "circle"
         }
@@ -292,6 +326,9 @@ final class BridgeModel: ObservableObject {
 
     var codexState: String {
         guard let payload else { return "wait" }
+        if let status = payload.codexActivity?.status, !status.isEmpty {
+            return status
+        }
         if let state = payload.codexState ?? payload.menuMode ?? payload.mode {
             return state
         }
@@ -356,20 +393,35 @@ final class BridgeModel: ObservableObject {
 
     var codexLabel: String {
         switch codexState {
-        case "work", "working":
+        case "work", "working", "running":
             return "Codex Work"
         case "idle", "connected":
             return "Codex Idle"
-        case "err", "error":
+        case "err", "error", "failed":
             return "Codex Err"
-        case "wait", "starting":
+        case "wait", "starting", "waiting":
             return "Codex Wait"
+        case "review":
+            return "Codex Review"
         default:
             return "Codex \(codexState.capitalized)"
         }
     }
 
     var statusLine: String {
+        if let activity = payload?.codexActivity {
+            let title = activity.title?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let subtitle = activity.subtitle?.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let title, let subtitle, !title.isEmpty, !subtitle.isEmpty {
+                return "\(title): \(subtitle)"
+            }
+            if let subtitle, !subtitle.isEmpty {
+                return subtitle
+            }
+            if let title, !title.isEmpty {
+                return title
+            }
+        }
         if let speaker = payload?.status?.speaker, let text = payload?.status?.text, !text.isEmpty {
             return "\(speaker): \(text)"
         }
@@ -757,14 +809,16 @@ struct ContentView: View {
 
     private func color(for title: String) -> Color {
         switch model.codexState {
-        case "work", "working":
+        case "work", "working", "running":
             return .cyan
-        case "err", "error":
+        case "err", "error", "failed":
             return .red
         case "idle", "connected":
             return .green
-        case "wait", "starting":
+        case "wait", "starting", "waiting":
             return .orange
+        case "review":
+            return .green
         default:
             return .secondary
         }
