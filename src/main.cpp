@@ -287,6 +287,7 @@ bool accelPrimed = false;
 bool pmicReady = false;
 bool speakerOutputActive = false;
 bool bleConnParamsPending = false;
+bool bleAdvertisingRestartRequested = false;
 float lastAx = 0.0f;
 float lastAy = 0.0f;
 float lastAz = 0.0f;
@@ -661,7 +662,7 @@ String modeLabel(StatusMode mode) {
     case MODE_ERR:
       return "ERR";
     case MODE_OFF:
-      return "OFF";
+      return "DISC";
     case MODE_SYNC:
       return "SYNC";
     case MODE_STALE:
@@ -906,7 +907,7 @@ void enterDisplaySleep() {
 #endif
   }
   M5.Display.sleep();
-  setCpuMhzIfNeeded(sleepCpuMhz());
+  setCpuMhzIfNeeded(bleConnected ? activeCpuMhz() : sleepCpuMhz());
   needsRedraw = false;
 }
 
@@ -1593,7 +1594,7 @@ void handleSnapshot(JsonDocument& doc) {
   const uint16_t nextTotal = doc["total"] | app.total;
   const uint16_t nextRunning = doc["running"] | 0;
   const uint16_t nextWaiting = doc["waiting"] | 0;
-  changed = nextTotal != app.total || nextRunning != app.running || nextWaiting != app.waiting;
+  changed = changed || nextTotal != app.total || nextRunning != app.running || nextWaiting != app.waiting;
   app.total = nextTotal;
   app.running = nextRunning;
   app.waiting = nextWaiting;
@@ -1676,6 +1677,7 @@ void handleCommand(JsonDocument& doc) {
     security.pairingStartedMs = millis();
     security.pairingActive = true;
     security.pairingConfirmed = false;
+    wakeDisplay();
     app.settings.open = false;
     setCurrentStatus("System", "pair", "Pair " + security.pairingCode);
     needsRedraw = true;
@@ -1831,7 +1833,7 @@ void requestBleConnectionTuning();
 class ServerCallbacks : public NimBLEServerCallbacks {
   void onConnect(NimBLEServer* server) override {
     bleServer = server;
-    wakeDisplay();
+    const bool wasSleeping = displaySleeping;
     bleConnected = true;
     resetAuthorizedSession();
     awaitingSnapshot = true;
@@ -1839,22 +1841,23 @@ class ServerCallbacks : public NimBLEServerCallbacks {
     lastAdvertisingEnsureMs = millis();
     requestBleConnectionTuning();
     setCurrentStatus("System", "sync", "BLE syncing");
-    requestCue(CUE_CONNECTED);
+    if (!wasSleeping) {
+      requestCue(CUE_CONNECTED);
+    }
   }
 
   void onDisconnect(NimBLEServer*) override {
-    wakeDisplay();
+    const bool wasSleeping = displaySleeping;
     bleConnected = false;
     resetAuthorizedSession();
     awaitingSnapshot = false;
     bleConnParamsPending = false;
+    bleAdvertisingRestartRequested = true;
     rxBuffer = "";
     setCurrentStatus("System", "disconnected", "BLE disconnected");
-    requestCue(CUE_DISCONNECTED);
-    delay(80);
-    applyBlePowerPolicy();
-    lastAdvertisingEnsureMs = millis();
-    NimBLEDevice::startAdvertising();
+    if (!wasSleeping) {
+      requestCue(CUE_DISCONNECTED);
+    }
   }
 };
 
@@ -1892,22 +1895,22 @@ void connectionParamsForPower(uint16_t& minInterval, uint16_t& maxInterval, uint
   switch (effectivePowerMode()) {
     case POWER_LOW:
       minInterval = 160;  // 200ms in 1.25ms units.
-      maxInterval = 320;  // 400ms.
+      maxInterval = 400;  // 500ms.
       latency = 8;
-      timeout = 700;      // 7s in 10ms units.
+      timeout = 1600;     // 16s in 10ms units.
       break;
     case POWER_AUTO:
-      minInterval = 80;   // 100ms.
-      maxInterval = 160;  // 200ms.
+      minInterval = 96;   // 120ms.
+      maxInterval = 192;  // 240ms.
       latency = 4;
-      timeout = 600;      // 6s.
+      timeout = 1200;     // 12s.
       break;
     case POWER_ALWAYS:
     default:
-      minInterval = 36;   // 45ms.
+      minInterval = 48;   // 60ms.
       maxInterval = 96;   // 120ms.
       latency = 2;
-      timeout = 500;      // 5s.
+      timeout = 1200;     // 12s.
       break;
   }
 }
@@ -1917,10 +1920,10 @@ esp_power_level_t bleTxPowerLevel() {
     case POWER_LOW:
       return ESP_PWR_LVL_N6;
     case POWER_AUTO:
-      return ESP_PWR_LVL_N3;
+      return ESP_PWR_LVL_N0;
     case POWER_ALWAYS:
     default:
-      return ESP_PWR_LVL_N3;
+      return ESP_PWR_LVL_P3;
   }
 }
 
@@ -1930,6 +1933,13 @@ void applyBlePowerPolicy() {
   NimBLEAdvertising* advertising = NimBLEDevice::getAdvertising();
   advertising->setMinInterval(advertisingMinInterval());
   advertising->setMaxInterval(advertisingMaxInterval());
+  uint16_t minInterval = 0;
+  uint16_t maxInterval = 0;
+  uint16_t latency = 0;
+  uint16_t timeout = 0;
+  connectionParamsForPower(minInterval, maxInterval, latency, timeout);
+  advertising->setMinPreferred(minInterval);
+  advertising->setMaxPreferred(maxInterval);
 }
 
 void requestBleConnectionTuning() {
@@ -1943,6 +1953,16 @@ void ensureBleAdvertising() {
   }
   lastAdvertisingEnsureMs = millis();
   applyBlePowerPolicy();
+  NimBLEDevice::startAdvertising();
+}
+
+void handleBleAdvertisingRestart() {
+  if (!bleAdvertisingRestartRequested || bleConnected) {
+    return;
+  }
+  bleAdvertisingRestartRequested = false;
+  applyBlePowerPolicy();
+  lastAdvertisingEnsureMs = millis();
   NimBLEDevice::startAdvertising();
 }
 
@@ -1981,7 +2001,7 @@ void handlePowerPolicyChange() {
   applyBrightness();
   applyBlePowerPolicy();
   requestBleConnectionTuning();
-  setCpuMhzIfNeeded(displaySleeping ? sleepCpuMhz() : activeCpuMhz());
+  setCpuMhzIfNeeded(displaySleeping && !bleConnected ? sleepCpuMhz() : activeCpuMhz());
   enforceIndicatorLedsOff(true);
   needsRedraw = true;
 }
@@ -2010,8 +2030,13 @@ void setupBle() {
   advertising->setScanResponse(true);
   advertising->setMinInterval(advertisingMinInterval());
   advertising->setMaxInterval(advertisingMaxInterval());
-  advertising->setMinPreferred(0x06);
-  advertising->setMaxPreferred(0x12);
+  uint16_t minInterval = 0;
+  uint16_t maxInterval = 0;
+  uint16_t latency = 0;
+  uint16_t timeout = 0;
+  connectionParamsForPower(minInterval, maxInterval, latency, timeout);
+  advertising->setMinPreferred(minInterval);
+  advertising->setMaxPreferred(maxInterval);
   lastAdvertisingEnsureMs = millis();
   NimBLEDevice::startAdvertising();
 }
@@ -2565,7 +2590,7 @@ void rotateSetting(int8_t delta = 1) {
       applyBrightness();
       applyBlePowerPolicy();
       requestBleConnectionTuning();
-      setCpuMhzIfNeeded(displaySleeping ? sleepCpuMhz() : activeCpuMhz());
+      setCpuMhzIfNeeded(displaySleeping && !bleConnected ? sleepCpuMhz() : activeCpuMhz());
       break;
     case SETTING_DETAIL:
       app.settings.detail = static_cast<DetailMode>(cycledIndex(app.settings.detail, DETAIL_COUNT, delta));
@@ -2960,6 +2985,7 @@ void loop() {
   handleSleepTimers();
   handleStatusAnimation();
   handlePowerPolicyChange();
+  handleBleAdvertisingRestart();
   ensureBleAdvertising();
   handleBleConnectionTuning();
   playPendingCue();

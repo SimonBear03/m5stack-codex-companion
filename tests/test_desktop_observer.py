@@ -9,6 +9,7 @@ from pathlib import Path
 from sticks3_bridge.desktop_observer import (
     DesktopObserverBridge,
     DesktopUsageSnapshot,
+    ROLLOUT_SWITCH_MIN_DWELL_SECONDS,
     compact_desktop_rate_limits,
     latest_account_usage,
     latest_user_rollout,
@@ -24,7 +25,11 @@ def datetime_now_iso_for_test() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
-def write_rollout(path: Path, *, thread_id: str, thread_source: str = "user") -> None:
+def timestamp_iso_for_test(timestamp: float) -> str:
+    return datetime.fromtimestamp(timestamp, timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def write_rollout(path: Path, *, thread_id: str, thread_source: str = "user", cwd: str = "/tmp/project") -> None:
     source = "vscode" if thread_source == "user" else {"subagent": {"other": "guardian"}}
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(
@@ -34,7 +39,7 @@ def write_rollout(path: Path, *, thread_id: str, thread_source: str = "user") ->
                 "type": "session_meta",
                 "payload": {
                     "id": thread_id,
-                    "cwd": "/tmp/project",
+                    "cwd": cwd,
                     "originator": "Codex Desktop",
                     "source": source,
                     "thread_source": thread_source,
@@ -43,6 +48,17 @@ def write_rollout(path: Path, *, thread_id: str, thread_source: str = "user") ->
         ),
         encoding="utf-8",
     )
+
+
+def append_rollout_event(path: Path, *, event_type: str, payload: dict, timestamp: float | None = None) -> None:
+    event = {
+        "type": event_type,
+        "payload": payload,
+    }
+    if timestamp is not None:
+        event["timestamp"] = timestamp_iso_for_test(timestamp)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(event_line(event))
 
 
 class StatusRequestFailingDevice(FakeStickS3Device):
@@ -61,6 +77,7 @@ class FakeFleetTarget:
         self.last_wire_payload = None
         self.last_activity_seq_sent = 0
         self.initial_sync_needed = False
+        self.initial_full_sync_pending = False
 
     def is_connected(self) -> bool:
         return self.state == "connected"
@@ -96,7 +113,7 @@ class FakeFleetDevice:
         return [target for target in self.targets if target.is_connected()]
 
     def needs_initial_sync(self) -> bool:
-        return any(target.initial_sync_needed for target in self.connected_targets())
+        return any(target.initial_sync_needed or target.initial_full_sync_pending for target in self.connected_targets())
 
     def aggregate_state(self) -> str:
         return "connected" if self.connected_targets() else "disconnected"
@@ -141,6 +158,190 @@ class DesktopObserverTests(unittest.IsolatedAsyncioTestCase):
             os.utime(subagent_rollout, (2000, 2000))
 
             self.assertEqual(user_rollout, latest_user_rollout(root))
+
+    def test_latest_user_rollout_prefers_active_rollout_over_newer_idle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            now = time.time()
+            active_rollout = root / "2026/06/14/rollout-active-thread.jsonl"
+            idle_rollout = root / "2026/06/16/rollout-idle-thread.jsonl"
+            write_rollout(active_rollout, thread_id="active-thread")
+            write_rollout(idle_rollout, thread_id="idle-thread")
+            append_rollout_event(active_rollout, event_type="event_msg", payload={"type": "task_started", "turn_id": "turn-1"}, timestamp=now - 30)
+            os.utime(active_rollout, (now - 60, now - 60))
+            os.utime(idle_rollout, (now, now))
+
+            self.assertEqual(active_rollout, latest_user_rollout(root))
+
+    def test_latest_user_rollout_chooses_newest_active_event(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            now = time.time()
+            older_activity = root / "2026/06/14/rollout-older-active-thread.jsonl"
+            newer_activity = root / "2026/06/15/rollout-newer-active-thread.jsonl"
+            write_rollout(older_activity, thread_id="older-active-thread")
+            write_rollout(newer_activity, thread_id="newer-active-thread")
+            append_rollout_event(older_activity, event_type="response_item", payload={"type": "reasoning", "summary": []}, timestamp=now - 90)
+            append_rollout_event(newer_activity, event_type="response_item", payload={"type": "function_call", "name": "functions.exec_command"}, timestamp=now - 10)
+            os.utime(older_activity, (now, now))
+            os.utime(newer_activity, (now - 80, now - 80))
+
+            self.assertEqual(newer_activity, latest_user_rollout(root))
+
+    def test_latest_user_rollout_keeps_current_when_active_events_are_close(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            now = time.time()
+            current_rollout = root / "2026/06/14/rollout-current-active-thread.jsonl"
+            challenger_rollout = root / "2026/06/15/rollout-challenger-active-thread.jsonl"
+            write_rollout(current_rollout, thread_id="current-active-thread")
+            write_rollout(challenger_rollout, thread_id="challenger-active-thread")
+            append_rollout_event(current_rollout, event_type="response_item", payload={"type": "reasoning", "summary": []}, timestamp=now - 8)
+            append_rollout_event(challenger_rollout, event_type="response_item", payload={"type": "function_call", "name": "functions.exec_command"}, timestamp=now - 6)
+
+            self.assertEqual(
+                current_rollout,
+                latest_user_rollout(root, current_path=current_rollout, switch_margin_seconds=4.0, now=now),
+            )
+
+    def test_latest_user_rollout_switches_when_challenger_is_clearly_newer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            now = time.time()
+            current_rollout = root / "2026/06/14/rollout-current-active-thread.jsonl"
+            challenger_rollout = root / "2026/06/15/rollout-challenger-active-thread.jsonl"
+            write_rollout(current_rollout, thread_id="current-active-thread")
+            write_rollout(challenger_rollout, thread_id="challenger-active-thread")
+            append_rollout_event(current_rollout, event_type="response_item", payload={"type": "reasoning", "summary": []}, timestamp=now - 40)
+            append_rollout_event(challenger_rollout, event_type="response_item", payload={"type": "function_call", "name": "functions.exec_command"}, timestamp=now - 6)
+
+            self.assertEqual(
+                challenger_rollout,
+                latest_user_rollout(root, current_path=current_rollout, switch_margin_seconds=4.0, now=now),
+            )
+
+    def test_latest_user_rollout_terminal_event_after_work_makes_rollout_inactive(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            now = time.time()
+            completed_rollout = root / "2026/06/16/rollout-completed-thread.jsonl"
+            active_rollout = root / "2026/06/15/rollout-active-thread.jsonl"
+            write_rollout(completed_rollout, thread_id="completed-thread")
+            write_rollout(active_rollout, thread_id="active-thread")
+            append_rollout_event(completed_rollout, event_type="event_msg", payload={"type": "task_started", "turn_id": "turn-1"})
+            append_rollout_event(completed_rollout, event_type="event_msg", payload={"type": "task_complete", "last_agent_message": "Done"}, timestamp=now - 30)
+            append_rollout_event(active_rollout, event_type="event_msg", payload={"type": "task_started", "turn_id": "turn-2"}, timestamp=now - 50)
+            os.utime(completed_rollout, (now, now))
+            os.utime(active_rollout, (now - 50, now - 50))
+
+            self.assertEqual(active_rollout, latest_user_rollout(root))
+
+    def test_latest_user_rollout_skips_active_subagent_rollout(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            now = time.time()
+            subagent_rollout = root / "2026/06/16/rollout-subagent-thread.jsonl"
+            user_rollout = root / "2026/06/15/rollout-user-thread.jsonl"
+            write_rollout(subagent_rollout, thread_id="subagent-thread", thread_source="subagent")
+            write_rollout(user_rollout, thread_id="user-thread")
+            append_rollout_event(subagent_rollout, event_type="event_msg", payload={"type": "task_started", "turn_id": "turn-1"}, timestamp=now - 5)
+            os.utime(subagent_rollout, (now, now))
+            os.utime(user_rollout, (now - 10, now - 10))
+
+            self.assertEqual(user_rollout, latest_user_rollout(root))
+
+    def test_latest_user_rollout_stale_work_event_does_not_count_active(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            now = time.time()
+            stale_rollout = root / "2026/06/16/rollout-stale-thread.jsonl"
+            active_rollout = root / "2026/06/15/rollout-active-thread.jsonl"
+            write_rollout(stale_rollout, thread_id="stale-thread")
+            write_rollout(active_rollout, thread_id="active-thread")
+            append_rollout_event(stale_rollout, event_type="event_msg", payload={"type": "task_started", "turn_id": "turn-1"}, timestamp=now - 700)
+            append_rollout_event(active_rollout, event_type="event_msg", payload={"type": "task_started", "turn_id": "turn-2"}, timestamp=now - 100)
+            os.utime(stale_rollout, (now, now))
+            os.utime(active_rollout, (now - 100, now - 100))
+
+            self.assertEqual(active_rollout, latest_user_rollout(root))
+
+    def test_latest_user_rollout_falls_back_to_newest_user_when_none_active(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            older_rollout = root / "2026/06/14/rollout-older-thread.jsonl"
+            newer_rollout = root / "2026/06/16/rollout-newer-thread.jsonl"
+            write_rollout(older_rollout, thread_id="older-thread")
+            write_rollout(newer_rollout, thread_id="newer-thread")
+            os.utime(older_rollout, (1000, 1000))
+            os.utime(newer_rollout, (2000, 2000))
+
+            self.assertEqual(newer_rollout, latest_user_rollout(root))
+
+    def test_latest_user_rollout_handles_large_unicode_tail(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            now = time.time()
+            rollout = root / "2026/06/16/rollout-large-unicode-thread.jsonl"
+            write_rollout(rollout, thread_id="large-unicode-thread")
+            with rollout.open("a", encoding="utf-8") as handle:
+                handle.write(("é" * 300000) + "\n")
+            append_rollout_event(rollout, event_type="event_msg", payload={"type": "task_started", "turn_id": "turn-1"}, timestamp=now - 5)
+
+            self.assertEqual(rollout, latest_user_rollout(root))
+
+    def test_explicit_rollout_and_thread_id_override_global_active_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            now = time.time()
+            active_rollout = root / "2026/06/16/rollout-active-thread.jsonl"
+            explicit_rollout = root / "2026/06/15/rollout-explicit-thread.jsonl"
+            thread_rollout = root / "2026/06/14/rollout-thread-target.jsonl"
+            write_rollout(active_rollout, thread_id="active-thread")
+            write_rollout(explicit_rollout, thread_id="explicit-thread")
+            write_rollout(thread_rollout, thread_id="thread-target")
+            append_rollout_event(active_rollout, event_type="event_msg", payload={"type": "task_started", "turn_id": "turn-1"}, timestamp=now - 5)
+            os.utime(active_rollout, (now, now))
+            os.utime(explicit_rollout, (now - 20, now - 20))
+            os.utime(thread_rollout, (now - 30, now - 30))
+
+            explicit_bridge = DesktopObserverBridge(device=FakeStickS3Device(), sessions_dir=root, rollout_path=explicit_rollout)
+            thread_bridge = DesktopObserverBridge(device=FakeStickS3Device(), sessions_dir=root, thread_id="thread-target")
+
+            self.assertEqual(explicit_rollout, explicit_bridge.resolve_rollout())
+            self.assertEqual(thread_rollout, thread_bridge.resolve_rollout())
+
+    def test_resolve_rollout_keeps_current_active_rollout_during_dwell(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            now = time.time()
+            current_rollout = root / "2026/06/14/rollout-current-active-thread.jsonl"
+            challenger_rollout = root / "2026/06/15/rollout-challenger-active-thread.jsonl"
+            write_rollout(current_rollout, thread_id="current-active-thread")
+            write_rollout(challenger_rollout, thread_id="challenger-active-thread")
+            append_rollout_event(current_rollout, event_type="response_item", payload={"type": "reasoning", "summary": []}, timestamp=now - 40)
+            append_rollout_event(challenger_rollout, event_type="response_item", payload={"type": "function_call", "name": "functions.exec_command"}, timestamp=now - 2)
+            bridge = DesktopObserverBridge(device=FakeStickS3Device(), sessions_dir=root)
+            bridge.rollout_path = current_rollout
+            bridge._rollout_selected_at = time.monotonic()
+
+            self.assertEqual(current_rollout, bridge.resolve_rollout())
+
+    def test_resolve_rollout_switches_after_current_rollout_is_terminal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            now = time.time()
+            current_rollout = root / "2026/06/14/rollout-current-active-thread.jsonl"
+            challenger_rollout = root / "2026/06/15/rollout-challenger-active-thread.jsonl"
+            write_rollout(current_rollout, thread_id="current-active-thread")
+            write_rollout(challenger_rollout, thread_id="challenger-active-thread")
+            append_rollout_event(current_rollout, event_type="response_item", payload={"type": "reasoning", "summary": []}, timestamp=now - 40)
+            append_rollout_event(current_rollout, event_type="event_msg", payload={"type": "task_complete"}, timestamp=now - 30)
+            append_rollout_event(challenger_rollout, event_type="response_item", payload={"type": "function_call", "name": "functions.exec_command"}, timestamp=now - 2)
+            bridge = DesktopObserverBridge(device=FakeStickS3Device(), sessions_dir=root)
+            bridge.rollout_path = current_rollout
+            bridge._rollout_selected_at = time.monotonic() - ROLLOUT_SWITCH_MIN_DWELL_SECONDS - 1.0
+
+            self.assertEqual(challenger_rollout, bridge.resolve_rollout())
 
     def test_latest_account_usage_reads_recent_token_count_across_rollouts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -651,6 +852,20 @@ class DesktopObserverTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(1, len(connected.snapshots))
         self.assertEqual(0, len(disconnected.snapshots))
 
+    async def test_fleet_initial_sync_does_not_duplicate_same_snapshot(self) -> None:
+        target = FakeFleetTarget("connected", detail=0)
+        target.initial_sync_needed = True
+        bridge = DesktopObserverBridge(device=FakeFleetDevice([target]))
+        bridge.state.thread_id = "thread-fleet-initial"
+        bridge.set_status("Codex", "idle", "Idle")
+
+        await bridge.send_snapshot(force=True)
+
+        self.assertEqual(1, len(target.snapshots))
+        self.assertFalse(target.initial_sync_needed)
+        self.assertNotIn("msg", target.snapshots[0].to_wire())
+        self.assertEqual("Idle", target.last_wire_payload["msg"])
+
     async def test_reconnected_fleet_device_gets_activity_from_its_own_cursor(self) -> None:
         first = FakeFleetTarget("first", detail=0)
         second = FakeFleetTarget("second", detail=0, connected=False)
@@ -669,10 +884,15 @@ class DesktopObserverTests(unittest.IsolatedAsyncioTestCase):
         bridge.add_activity("Codex", "message", "Second activity")
 
         await bridge.send_snapshot()
+        self.assertEqual(2, len(second.snapshots))
+        self.assertFalse(second.initial_sync_needed)
+        self.assertFalse(second.initial_full_sync_pending)
+        self.assertNotIn("activity", second.snapshots[0].to_wire())
 
         second_wire = second.snapshots[-1].to_wire()
         texts = [item["text"] for item in second_wire["activity"]]
         self.assertEqual(["First activity", "Second activity"], texts)
+        self.assertFalse(second.initial_full_sync_pending)
 
     def test_work_like_activity_sets_running_without_task_started(self) -> None:
         device = FakeStickS3Device()

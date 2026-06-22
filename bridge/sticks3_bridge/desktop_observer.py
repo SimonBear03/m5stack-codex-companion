@@ -22,6 +22,10 @@ DEFAULT_ACTIVE_HEARTBEAT_INTERVAL = 10.0
 DEFAULT_IDLE_HEARTBEAT_INTERVAL = 45.0
 ACTIVE_WORK_WATCHDOG_SECONDS = 600.0
 RECENT_WORK_EVENT_MAX_AGE_SECONDS = 120.0
+ROLLOUT_ACTIVITY_SCAN_FILE_LIMIT = 32
+ROLLOUT_ACTIVITY_TAIL_BYTES = 262144
+ROLLOUT_SWITCH_ACTIVITY_MARGIN_SECONDS = 20.0
+ROLLOUT_SWITCH_MIN_DWELL_SECONDS = 20.0
 USAGE_REFRESH_INTERVAL_SECONDS = 5.0
 USAGE_SCAN_FILE_LIMIT = 32
 USAGE_INCREMENTAL_LOOKBACK_BYTES = 65536
@@ -36,6 +40,26 @@ TRANSIENT_WORK_STATUS_KINDS = {
     "started",
     "thinking",
     "working",
+}
+WORK_RESPONSE_ITEM_TYPES = {
+    "function_call",
+    "custom_tool_call",
+    "function_call_output",
+    "message",
+    "reasoning",
+}
+WORK_EVENT_PAYLOAD_TYPES = {
+    "patch_apply_end",
+    "task_started",
+    "user_message",
+}
+TERMINAL_EVENT_PAYLOAD_TYPES = {
+    "canceled",
+    "cancelled",
+    "interrupted",
+    "task_aborted",
+    "task_complete",
+    "turn_aborted",
 }
 
 
@@ -102,6 +126,17 @@ class UsageFileCacheEntry:
     usage: DesktopUsageSnapshot | None = None
 
 
+@dataclass(frozen=True)
+class RolloutActivity:
+    path: Path
+    thread_id: str | None
+    cwd: str | None
+    mtime: float
+    active: bool
+    last_active_ts: float | None = None
+    last_terminal_ts: float | None = None
+
+
 def usage_from_token_count_payload(payload: dict[str, Any], *, event_ts: float | None = None, path: Path | None = None) -> DesktopUsageSnapshot:
     tokens_total: int | None = None
     info = payload.get("info") or {}
@@ -145,6 +180,109 @@ def is_user_rollout(path: Path) -> bool:
     return not (isinstance(source, dict) and "subagent" in source)
 
 
+def sorted_rollout_files(sessions_dir: Path) -> list[Path]:
+    try:
+        candidates = list(sessions_dir.glob("**/*.jsonl"))
+    except OSError:
+        return []
+    files: list[tuple[float, str, Path]] = []
+    for path in candidates:
+        try:
+            mtime = path.stat().st_mtime
+        except OSError:
+            continue
+        files.append((mtime, str(path), path))
+    files.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return [path for _, _, path in files]
+
+
+def recent_rollout_lines(path: Path, *, size: int) -> list[str]:
+    try:
+        with path.open("rb") as handle:
+            if size > ROLLOUT_ACTIVITY_TAIL_BYTES:
+                handle.seek(max(0, size - ROLLOUT_ACTIVITY_TAIL_BYTES))
+                handle.readline()
+            data = handle.read()
+    except OSError:
+        return []
+    return data.decode("utf-8", errors="ignore").splitlines()
+
+
+def rollout_event_activity_kind(event: dict[str, Any]) -> str | None:
+    payload = event.get("payload")
+    if not isinstance(payload, dict):
+        return None
+
+    event_type = event.get("type")
+    payload_type = payload.get("type")
+    if event_type == "turn_context":
+        return "active"
+    if not isinstance(payload_type, str):
+        return None
+    if event_type == "response_item":
+        return "active" if payload_type in WORK_RESPONSE_ITEM_TYPES else None
+    if event_type != "event_msg":
+        return None
+    if payload_type in TERMINAL_EVENT_PAYLOAD_TYPES:
+        return "terminal"
+    if payload_type == "agent_message":
+        message = payload.get("message")
+        return "active" if isinstance(message, str) and message.strip() else None
+    if payload_type in WORK_EVENT_PAYLOAD_TYPES:
+        return "active"
+    return None
+
+
+def scan_rollout_activity(path: Path, *, now: float | None = None) -> RolloutActivity | None:
+    metadata = rollout_metadata(path)
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+
+    current = time.time() if now is None else now
+    last_active_index: int | None = None
+    last_terminal_index: int | None = None
+    last_active_ts: float | None = None
+    last_terminal_ts: float | None = None
+
+    for index, line in enumerate(recent_rollout_lines(path, size=stat.st_size)):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        try:
+            event = json.loads(stripped)
+        except json.JSONDecodeError:
+            continue
+        kind = rollout_event_activity_kind(event)
+        if kind is None:
+            continue
+        event_ts = event_timestamp_seconds(event)
+        event_time = event_ts if event_ts is not None else stat.st_mtime
+        if kind == "active":
+            if last_active_index is None or index > last_active_index:
+                last_active_index = index
+                last_active_ts = event_time
+        elif last_terminal_index is None or index > last_terminal_index:
+            last_terminal_index = index
+            last_terminal_ts = event_time
+
+    active = False
+    if last_active_index is not None and (last_terminal_index is None or last_active_index > last_terminal_index):
+        assert last_active_ts is not None
+        active = current - last_active_ts <= ACTIVE_WORK_WATCHDOG_SECONDS
+
+    return RolloutActivity(
+        path=path,
+        thread_id=str(metadata.get("id")) if metadata.get("id") else None,
+        cwd=str(metadata.get("cwd")) if metadata.get("cwd") else None,
+        mtime=stat.st_mtime,
+        active=active,
+        last_active_ts=last_active_ts,
+        last_terminal_ts=last_terminal_ts,
+    )
+
+
 def find_rollout_by_thread_id(sessions_dir: Path, thread_id: str) -> Path | None:
     matches = sorted(
         sessions_dir.glob(f"**/*{thread_id}*.jsonl"),
@@ -160,20 +298,45 @@ def find_rollout_by_thread_id(sessions_dir: Path, thread_id: str) -> Path | None
     return None
 
 
-def latest_user_rollout(sessions_dir: Path) -> Path | None:
-    files = sorted(sessions_dir.glob("**/*.jsonl"), key=lambda path: path.stat().st_mtime, reverse=True)
-    for path in files:
-        if is_user_rollout(path):
-            return path
+def latest_user_rollout(
+    sessions_dir: Path,
+    *,
+    current_path: Path | None = None,
+    switch_margin_seconds: float = 0.0,
+    now: float | None = None,
+) -> Path | None:
+    files = sorted_rollout_files(sessions_dir)
+    user_files = [path for path in files if is_user_rollout(path)]
+    current = time.time() if now is None else now
+    active_rollouts: list[RolloutActivity] = []
+    current_activity: RolloutActivity | None = None
+    for path in user_files[:ROLLOUT_ACTIVITY_SCAN_FILE_LIMIT]:
+        activity = scan_rollout_activity(path, now=current)
+        if current_path is not None and path == current_path:
+            current_activity = activity
+        if activity is not None and activity.active and activity.last_active_ts is not None:
+            active_rollouts.append(activity)
+    if active_rollouts:
+        active_rollouts.sort(key=lambda activity: (activity.last_active_ts or 0.0, activity.mtime, str(activity.path)), reverse=True)
+        winner = active_rollouts[0]
+        if (
+            current_path is not None
+            and current_activity is not None
+            and current_activity.active
+            and current_activity.last_active_ts is not None
+            and winner.path != current_path
+            and winner.last_active_ts is not None
+            and winner.last_active_ts - current_activity.last_active_ts < switch_margin_seconds
+        ):
+            return current_path
+        return winner.path
+    for path in user_files:
+        return path
     return files[0] if files else None
 
 
 def recent_rollout_files(sessions_dir: Path, *, limit: int = USAGE_SCAN_FILE_LIMIT) -> list[Path]:
-    try:
-        files = sorted(sessions_dir.glob("**/*.jsonl"), key=lambda path: path.stat().st_mtime, reverse=True)
-    except OSError:
-        return []
-    return files[:limit]
+    return sorted_rollout_files(sessions_dir)[:limit]
 
 
 def latest_usage_from_rollout(path: Path, *, start_offset: int = 0) -> DesktopUsageSnapshot | None:
@@ -316,6 +479,7 @@ class DesktopObserverBridge:
     ) -> None:
         self.device = device
         self.sessions_dir = sessions_dir or (default_codex_home() / "sessions")
+        self.fixed_rollout_path = rollout_path
         self.rollout_path = rollout_path
         self.thread_id = thread_id
         self.poll_interval = poll_interval
@@ -335,6 +499,7 @@ class DesktopObserverBridge:
         self._last_usage_scan = 0.0
         self._usage_file_cache: dict[Path, UsageFileCacheEntry] = {}
         self._last_wire_payload: dict[str, Any] | None = None
+        self._rollout_selected_at = time.monotonic() if rollout_path is not None else 0.0
         self._poll_lock = asyncio.Lock()
         self._snapshot_lock = asyncio.Lock()
         self._device_connected = bool(getattr(device, "always_connected", False))
@@ -438,6 +603,7 @@ class DesktopObserverBridge:
             rate_limits = self.state.rate_limits
             usage_event_ts = self.state.usage_event_ts
             self.rollout_path = path
+            self._rollout_selected_at = time.monotonic()
             self._offset = 0
             self._last_size = 0
             self._last_activity_seq_sent = 0
@@ -475,11 +641,29 @@ class DesktopObserverBridge:
         return self.refresh_account_usage(force=self._last_usage_scan <= 0.0) or changed
 
     def resolve_rollout(self) -> Path | None:
-        if self.rollout_path and self.rollout_path.exists():
-            return self.rollout_path
+        if self.fixed_rollout_path is not None:
+            return self.fixed_rollout_path if self.fixed_rollout_path.exists() else None
         if self.thread_id:
             return find_rollout_by_thread_id(self.sessions_dir, self.thread_id)
-        return latest_user_rollout(self.sessions_dir)
+        candidate = latest_user_rollout(
+            self.sessions_dir,
+            current_path=self.rollout_path,
+            switch_margin_seconds=ROLLOUT_SWITCH_ACTIVITY_MARGIN_SECONDS,
+        )
+        if candidate is None or self.rollout_path is None or candidate == self.rollout_path:
+            return candidate
+        current_activity = scan_rollout_activity(self.rollout_path)
+        candidate_activity = scan_rollout_activity(candidate)
+        if (
+            current_activity is not None
+            and current_activity.active
+            and candidate_activity is not None
+            and candidate_activity.active
+        ):
+            return self.rollout_path
+        if time.monotonic() - self._rollout_selected_at >= ROLLOUT_SWITCH_MIN_DWELL_SECONDS:
+            return candidate
+        return candidate
 
     def apply_line(self, line: str) -> bool:
         stripped = line.strip()
@@ -568,7 +752,7 @@ class DesktopObserverBridge:
             self.add_activity("System", "started", "Turn started")
             return True
 
-        if payload_type in {"task_complete", "task_aborted", "turn_aborted", "interrupted", "cancelled", "canceled"}:
+        if payload_type in TERMINAL_EVENT_PAYLOAD_TYPES:
             self.clear_active_work()
             summary = payload.get("last_agent_message") or "Turn completed"
             completed = payload_type == "task_complete"
@@ -692,7 +876,9 @@ class DesktopObserverBridge:
         for target in self.device.all_targets():
             target.last_wire_payload = None
             target.last_activity_seq_sent = 0
-            target.initial_sync_needed = target.is_connected()
+            target.initial_sync_needed = False
+            if hasattr(target, "initial_full_sync_pending"):
+                target.initial_full_sync_pending = False
 
     def device_detail_mode(self, target: Any | None = None) -> int:
         source = target if target is not None else self.device
@@ -845,6 +1031,10 @@ class DesktopObserverBridge:
         LOGGER.warning("Companion send failed for %s: %s", getattr(target, "label", "device"), exc)
         target.state = "disconnected"
         target.error = str(exc)
+        if hasattr(target, "initial_sync_needed"):
+            target.initial_sync_needed = False
+        if hasattr(target, "initial_full_sync_pending"):
+            target.initial_full_sync_pending = False
         await target.close()
         self.write_status(getattr(self.device, "aggregate_state", lambda: "disconnected")(), detail="Companion disconnected", error=str(exc))
 
@@ -916,10 +1106,6 @@ class DesktopObserverBridge:
             except Exception as exc:
                 await self.mark_device_send_failure(exc)
                 return
-            try:
-                await self.device.request_status()
-            except Exception as exc:
-                LOGGER.debug("StickS3 status request failed after snapshot delivery: %s", exc)
             if activity:
                 self._last_activity_seq_sent = max(self.activity_seq_value(item) for item in activity)
             await asyncio.sleep(0.05)
@@ -941,25 +1127,44 @@ class DesktopObserverBridge:
                 try:
                     if target.initial_sync_needed:
                         initial = self.initial_sync_snapshot(detail=detail)
+                        initial_wire_payload = initial.to_wire()
                         await target.send_snapshot(initial)
                         target.initial_sync_needed = False
+                        target.last_wire_payload = initial_wire_payload
+                        if self.initial_sync_covers_snapshot(initial_wire_payload, wire_payload):
+                            target.last_wire_payload = wire_payload
+                            if hasattr(target, "initial_full_sync_pending"):
+                                target.initial_full_sync_pending = False
+                            sent_any = True
+                            continue
+                        if hasattr(target, "initial_full_sync_pending"):
+                            target.initial_full_sync_pending = True
+                        await asyncio.sleep(0.08)
                     await target.send_snapshot(snapshot)
                 except Exception as exc:
                     await self.mark_target_send_failure(target, exc)
                     continue
-                try:
-                    await target.request_status()
-                except Exception as exc:
-                    LOGGER.debug("Companion status request failed after snapshot delivery: %s", exc)
                 if activity:
                     target.last_activity_seq_sent = max(self.activity_seq_value(item) for item in activity)
                 target.last_wire_payload = wire_payload
+                if hasattr(target, "initial_full_sync_pending"):
+                    target.initial_full_sync_pending = False
                 sent_any = True
             self._last_sent_working = working
             self._last_sent = time.monotonic()
             self.write_status(getattr(self.device, "aggregate_state", lambda: "disconnected")(), detail=self.state.last_message)
             if sent_any:
                 await asyncio.sleep(0.05)
+
+    @staticmethod
+    def initial_sync_covers_snapshot(initial_wire_payload: dict[str, Any], wire_payload: dict[str, Any]) -> bool:
+        if wire_payload.get("activity"):
+            return False
+        compact_payload = dict(wire_payload)
+        compact_payload.pop("msg", None)
+        compact_payload.pop("entries", None)
+        compact_payload.pop("activity", None)
+        return compact_payload == initial_wire_payload
 
     async def handle_device_controls(self) -> None:
         while True:
@@ -978,10 +1183,7 @@ class DesktopObserverBridge:
             if error is None:
                 error = fleet_summary.get("device_error")
         self._device_state = state
-        if error is not None:
-            self._device_error = error
-        elif state == "connected":
-            self._device_error = None
+        self._device_error = error
         codex_state = self.codex_state()
         payload: dict[str, Any] = {
             "state": state,
