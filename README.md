@@ -56,8 +56,8 @@ As of 2026-06-14:
 ## Build And Flash
 
 ```bash
-git clone https://github.com/SimonBear03/sticks3-codex-companion.git
-cd sticks3-codex-companion
+git clone https://github.com/SimonBear03/m5stack-codex-companion.git
+cd m5stack-codex-companion
 
 python3 -m venv .venv
 source .venv/bin/activate
