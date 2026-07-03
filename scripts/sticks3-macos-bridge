@@ -22,18 +22,27 @@ RUNTIME_DIR = Path(os.environ.get("STICKS3_RUNTIME_DIR", REPO_ROOT / "runtime"))
 PID_FILE = RUNTIME_DIR / "bridge.pid"
 STATUS_FILE = RUNTIME_DIR / "bridge-status.json"
 LOG_FILE = RUNTIME_DIR / "bridge.log"
-APP_DIR = RUNTIME_DIR / "StickS3Bridge.app"
+APP_DIR = RUNTIME_DIR / ".M5StackCodexBridge.app"
+VISIBLE_RUNTIME_APP_DIR = RUNTIME_DIR / "M5StackCodexBridge.app"
 APP_CONTENTS = APP_DIR / "Contents"
 APP_MACOS = APP_CONTENTS / "MacOS"
 APP_RESOURCES = APP_CONTENTS / "Resources"
-APP_EXEC = APP_MACOS / "StickS3BridgeLauncher"
+APP_EXEC = APP_MACOS / "M5StackCodexBridgeLauncher"
 APP_MAIN = APP_RESOURCES / "bridge_app_main.py"
 APP_PLIST = APP_CONTENTS / "Info.plist"
 APP_PKGINFO = APP_CONTENTS / "PkgInfo"
-AGENT_LABEL = "com.simon.sticks3-codex-companion.bridge"
+AGENT_LABEL = "com.simon.m5stack-codex-companion.bridge"
+LEGACY_AGENT_LABEL = "com.simon.sticks3-codex-companion.bridge"
 AGENT_PLIST = Path.home() / "Library" / "LaunchAgents" / f"{AGENT_LABEL}.plist"
-APP_SUPPORT_DIR = Path.home() / "Library" / "Application Support" / "StickS3 Codex Companion"
-AGENT_APP_DIR = APP_SUPPORT_DIR / "StickS3Bridge.app"
+LEGACY_AGENT_PLIST = Path.home() / "Library" / "LaunchAgents" / f"{LEGACY_AGENT_LABEL}.plist"
+APP_SUPPORT_DIR = Path.home() / "Library" / "Application Support" / "M5Stack Codex Companion"
+LEGACY_APP_SUPPORT_DIR = Path.home() / "Library" / "Application Support" / "StickS3 Codex Companion"
+AGENT_APP_DIR = APP_SUPPORT_DIR / ".M5StackCodexBridge.app"
+VISIBLE_AGENT_APP_DIR = APP_SUPPORT_DIR / "M5StackCodexBridge.app"
+LEGACY_AGENT_APP_DIR = LEGACY_APP_SUPPORT_DIR / "StickS3Bridge.app"
+SPOTLIGHT_EXCLUDE_FILE = APP_SUPPORT_DIR / ".metadata_never_index"
+PAIRING_STORE_PATH = APP_SUPPORT_DIR / "paired-devices.json"
+LEGACY_PAIRING_STORE_PATH = LEGACY_APP_SUPPORT_DIR / "paired-devices.json"
 BRIDGE_PYTHON_INFO: dict[str, str] | None = None
 
 
@@ -325,7 +334,7 @@ def python_config_flags(*args: str) -> list[str]:
 
 
 def app_info_plist() -> str:
-    return """<?xml version="1.0" encoding="UTF-8"?>
+    return f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -333,15 +342,15 @@ def app_info_plist() -> str:
   <key>CFBundleDevelopmentRegion</key>
   <string>en</string>
   <key>CFBundleDisplayName</key>
-  <string>StickS3 Codex Bridge</string>
+  <string>M5Stack Codex Bridge</string>
   <key>CFBundleExecutable</key>
-  <string>StickS3BridgeLauncher</string>
+  <string>{APP_EXEC.name}</string>
   <key>CFBundleIdentifier</key>
-  <string>com.simon.sticks3bridge.helper</string>
+  <string>com.simon.m5stackcodexbridge.helper</string>
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
   <key>CFBundleName</key>
-  <string>StickS3 Codex Bridge</string>
+  <string>M5Stack Codex Bridge</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
@@ -350,25 +359,34 @@ def app_info_plist() -> str:
   <string>1</string>
   <key>LSUIElement</key>
   <true/>
+  <key>LSBackgroundOnly</key>
+  <true/>
   <key>NSBluetoothAlwaysUsageDescription</key>
-  <string>StickS3 Codex Bridge uses Bluetooth to connect to Simon's M5Stack StickS3 dashboard.</string>
+  <string>M5Stack Codex Bridge uses Bluetooth to connect to paired M5Stack Codex companion devices.</string>
   <key>NSBluetoothPeripheralUsageDescription</key>
-  <string>StickS3 Codex Bridge uses Bluetooth to connect to Simon's M5Stack StickS3 dashboard.</string>
+  <string>M5Stack Codex Bridge uses Bluetooth to connect to paired M5Stack Codex companion devices.</string>
 </dict>
 </plist>
 """
 
 
 def app_launcher_source() -> str:
-    return f"""#!/bin/zsh
-set -euo pipefail
+    python_home = json.dumps(str(python_home_dir()))
+    python_executable = json.dumps(str(python_bin()))
+    return f"""#include <Python.h>
+#include <stdio.h>
+#include <stdlib.h>
 
-if [[ "$#" -lt 1 ]]; then
-  echo "missing bridge app main path" >&2
-  exit 64
-fi
+int main(int argc, char **argv) {{
+    if (argc < 2) {{
+        fputs("missing bridge app main path\\n", stderr);
+        return 64;
+    }}
 
-exec {shlex.quote(str(python_bin()))} "$@"
+    setenv("PYTHONHOME", {python_home}, 0);
+    setenv("PYTHONEXECUTABLE", {python_executable}, 0);
+    return Py_BytesMain(argc, argv);
+}}
 """
 
 
@@ -393,7 +411,7 @@ PID_FILE.write_text(f"{{os.getpid()}}\\n", encoding="utf-8")
 log = LOG_FILE.open("ab", buffering=0)
 os.dup2(log.fileno(), 1)
 os.dup2(log.fileno(), 2)
-print(f"\\n[app {{os.getpid()}}] starting StickS3 bridge", flush=True)
+print(f"\\n[app {{os.getpid()}}] starting M5Stack Codex bridge", flush=True)
 
 version = f"python{{sys.version_info.major}}.{{sys.version_info.minor}}"
 site_packages = REPO_ROOT / ".bridge-venv" / "lib" / version / "site-packages"
@@ -469,11 +487,11 @@ def app_paths(app_dir: Path) -> dict[str, Path]:
         "contents": contents,
         "macos": contents / "MacOS",
         "resources": contents / "Resources",
-        "exec": contents / "MacOS" / "StickS3BridgeLauncher",
+        "exec": contents / "MacOS" / APP_EXEC.name,
         "main": contents / "Resources" / "bridge_app_main.py",
         "plist": contents / "Info.plist",
         "pkginfo": contents / "PkgInfo",
-        "launcher_source": contents / "Resources" / "launcher.sh",
+        "launcher_source": contents / "Resources" / "launcher.c",
     }
 
 
@@ -495,7 +513,6 @@ def app_bundle_current(app_dir: Path) -> bool:
     paths = app_paths(app_dir)
     return (
         paths["exec"].exists()
-        and text_matches(paths["exec"], app_launcher_source())
         and text_matches(paths["plist"], app_info_plist())
         and text_matches(paths["pkginfo"], "APPL????")
         and text_matches(paths["main"], app_main_source())
@@ -504,19 +521,37 @@ def app_bundle_current(app_dir: Path) -> bool:
 
 
 def build_app_launcher() -> None:
-    APP_EXEC.write_text(app_launcher_source(), encoding="utf-8")
+    clang = shutil.which("clang") or "/usr/bin/clang"
+    source_path = APP_RESOURCES / "launcher.c"
+    command = [
+        clang,
+        *python_config_flags("--cflags"),
+        str(source_path),
+        "-o",
+        str(APP_EXEC),
+        *python_config_flags("--embed", "--ldflags"),
+    ]
+    libdir = bridge_python_info().get("libdir")
+    if libdir:
+        command.append(f"-Wl,-rpath,{libdir}")
+    result = subprocess.run(command, text=True, capture_output=True)
+    if result.returncode != 0:
+        message = result.stderr.strip() or result.stdout.strip() or "clang failed"
+        raise RuntimeError(f"Could not build {APP_EXEC.name}: {message}")
     APP_EXEC.chmod(0o755)
 
 
 def ensure_bridge_app() -> Path:
+    if VISIBLE_RUNTIME_APP_DIR.exists():
+        shutil.rmtree(VISIBLE_RUNTIME_APP_DIR)
     APP_MACOS.mkdir(parents=True, exist_ok=True)
     APP_RESOURCES.mkdir(parents=True, exist_ok=True)
     changed = False
     changed = write_text_if_changed(APP_PLIST, app_info_plist()) or changed
     changed = write_text_if_changed(APP_PKGINFO, "APPL????", encoding="ascii") or changed
     changed = write_text_if_changed(APP_MAIN, app_main_source()) or changed
-    changed = write_text_if_changed(APP_RESOURCES / "launcher.sh", app_launcher_source()) or changed
-    old_launcher_source = APP_RESOURCES / "launcher.c"
+    changed = write_text_if_changed(APP_RESOURCES / "launcher.c", app_launcher_source()) or changed
+    old_launcher_source = APP_RESOURCES / "launcher.sh"
     try:
         old_launcher_source.unlink()
         changed = True
@@ -532,13 +567,58 @@ def ensure_bridge_app() -> Path:
         changed = True
     except FileNotFoundError:
         pass
+    old_launcher = APP_MACOS / "StickS3BridgeLauncher"
+    try:
+        old_launcher.unlink()
+        changed = True
+    except FileNotFoundError:
+        pass
 
     if changed:
         sign_app_bundle(APP_DIR)
     return APP_DIR
 
 
+def migrate_legacy_support() -> bool:
+    migrated = False
+    if not PAIRING_STORE_PATH.exists() and LEGACY_PAIRING_STORE_PATH.exists():
+        PAIRING_STORE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(LEGACY_PAIRING_STORE_PATH), str(PAIRING_STORE_PATH))
+        os.chmod(PAIRING_STORE_PATH, 0o600)
+        migrated = True
+    try:
+        LEGACY_APP_SUPPORT_DIR.rmdir()
+    except OSError:
+        pass
+    return migrated
+
+
+def remove_legacy_agent_files() -> None:
+    try:
+        LEGACY_AGENT_PLIST.unlink()
+    except FileNotFoundError:
+        pass
+    if LEGACY_AGENT_APP_DIR.exists():
+        shutil.rmtree(LEGACY_AGENT_APP_DIR)
+    if VISIBLE_AGENT_APP_DIR.exists():
+        shutil.rmtree(VISIBLE_AGENT_APP_DIR)
+    try:
+        LEGACY_APP_SUPPORT_DIR.rmdir()
+    except OSError:
+        pass
+
+
+def mark_support_dir_private() -> None:
+    APP_SUPPORT_DIR.mkdir(parents=True, exist_ok=True)
+    if not SPOTLIGHT_EXCLUDE_FILE.exists():
+        SPOTLIGHT_EXCLUDE_FILE.write_text("", encoding="utf-8")
+
+
 def ensure_agent_app() -> Path:
+    migrate_legacy_support()
+    mark_support_dir_private()
+    if VISIBLE_AGENT_APP_DIR.exists():
+        shutil.rmtree(VISIBLE_AGENT_APP_DIR)
     if app_bundle_current(AGENT_APP_DIR):
         return AGENT_APP_DIR
     source_app = ensure_bridge_app()
@@ -552,25 +632,25 @@ def ensure_agent_app() -> Path:
 def app_open_command(args: argparse.Namespace) -> list[str]:
     app_dir = ensure_agent_app()
     app_main = app_dir / "Contents" / "Resources" / "bridge_app_main.py"
-    app_exec = app_dir / "Contents" / "MacOS" / "StickS3BridgeLauncher"
-    return ["/bin/zsh", str(app_exec), str(app_main), *bridge_args(args)]
+    app_exec = app_dir / "Contents" / "MacOS" / APP_EXEC.name
+    return [str(app_exec), str(app_main), *bridge_args(args)]
 
 
 def launchd_domain() -> str:
     return f"gui/{os.getuid()}"
 
 
-def launchd_service() -> str:
-    return f"{launchd_domain()}/{AGENT_LABEL}"
+def launchd_service(label: str = AGENT_LABEL) -> str:
+    return f"{launchd_domain()}/{label}"
 
 
 def agent_payload(args: argparse.Namespace) -> dict[str, Any]:
     app_dir = ensure_agent_app()
     app_main = app_dir / "Contents" / "Resources" / "bridge_app_main.py"
-    app_exec = app_dir / "Contents" / "MacOS" / "StickS3BridgeLauncher"
+    app_exec = app_dir / "Contents" / "MacOS" / APP_EXEC.name
     return {
         "Label": AGENT_LABEL,
-        "ProgramArguments": ["/bin/zsh", str(app_exec), str(app_main), *bridge_args(args)],
+        "ProgramArguments": [str(app_exec), str(app_main), *bridge_args(args)],
         "RunAtLoad": True,
         "LimitLoadToSessionType": "Aqua",
         "KeepAlive": {"Crashed": True},
@@ -640,7 +720,7 @@ def command_start(args: argparse.Namespace) -> int:
         return 1
 
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
-    write_status("starting", detail="Starting StickS3 desktop observer")
+    write_status("starting", detail="Starting M5Stack Codex observer")
     with LOG_FILE.open("ab") as log:
         log.write(f"\n[{now_iso()}] starting bridge\n".encode("utf-8"))
         process = subprocess.Popen(
@@ -676,7 +756,7 @@ def command_run(args: argparse.Namespace) -> int:
 
     RUNTIME_DIR.mkdir(parents=True, exist_ok=True)
     PID_FILE.write_text(f"{os.getpid()}\n", encoding="utf-8")
-    write_status("starting", detail="Running StickS3 desktop observer")
+    write_status("starting", detail="Running M5Stack Codex observer")
     os.chdir(REPO_ROOT)
     os.execv(command[0], command)
     return 1
@@ -754,8 +834,11 @@ def command_ensure(args: argparse.Namespace) -> int:
 
 def unload_agent_quietly() -> None:
     launchctl("bootout", launchd_service())
+    launchctl("bootout", launchd_service(LEGACY_AGENT_LABEL))
     if AGENT_PLIST.exists():
         launchctl("bootout", launchd_domain(), str(AGENT_PLIST))
+    if LEGACY_AGENT_PLIST.exists():
+        launchctl("bootout", launchd_domain(), str(LEGACY_AGENT_PLIST))
 
 
 def command_install_agent(args: argparse.Namespace) -> int:
@@ -791,6 +874,7 @@ def command_install_agent(args: argparse.Namespace) -> int:
         return result.returncode
 
     launchctl("kickstart", "-k", launchd_service())
+    remove_legacy_agent_files()
     write_status("starting", detail="LaunchAgent installed and started")
     print(f"installed launch agent: {AGENT_PLIST}")
     return 0
@@ -802,9 +886,18 @@ def command_uninstall_agent(args: argparse.Namespace) -> int:
         AGENT_PLIST.unlink()
     except FileNotFoundError:
         pass
+    try:
+        LEGACY_AGENT_PLIST.unlink()
+    except FileNotFoundError:
+        pass
     command_stop(args)
     if AGENT_APP_DIR.exists():
         shutil.rmtree(AGENT_APP_DIR)
+    if VISIBLE_AGENT_APP_DIR.exists():
+        shutil.rmtree(VISIBLE_AGENT_APP_DIR)
+    if LEGACY_AGENT_APP_DIR.exists():
+        shutil.rmtree(LEGACY_AGENT_APP_DIR)
+    remove_legacy_agent_files()
     write_status("stopped", detail="LaunchAgent uninstalled")
     print(f"uninstalled launch agent: {AGENT_PLIST}")
     return 0
@@ -884,7 +977,7 @@ def add_bridge_options(parser: argparse.ArgumentParser) -> None:
         "--pairing-store",
         default=os.environ.get(
             "STICKS3_PAIRING_STORE",
-            str(Path.home() / "Library" / "Application Support" / "StickS3 Codex Companion" / "paired-devices.json"),
+            str(PAIRING_STORE_PATH),
         ),
     )
     parser.add_argument("--address", default=os.environ.get("STICKS3_ADDRESS"))
@@ -896,14 +989,14 @@ def add_bridge_options(parser: argparse.ArgumentParser) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Manage the StickS3 Codex Desktop observer on macOS.")
+    parser = argparse.ArgumentParser(description="Manage the M5Stack Codex Desktop observer on macOS.")
     subcommands = parser.add_subparsers(dest="command", required=True)
 
     start = subcommands.add_parser("start", help="Start the background bridge process.")
     add_bridge_options(start)
     start.set_defaults(func=command_start)
 
-    run = subcommands.add_parser("run", help="Run the bridge in the foreground, for launchd.")
+    run = subcommands.add_parser("run", help="Run the bridge in the foreground without the helper wrapper.")
     add_bridge_options(run)
     run.set_defaults(func=command_run)
 

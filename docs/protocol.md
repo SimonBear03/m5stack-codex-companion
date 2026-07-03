@@ -62,7 +62,7 @@ For normal sync, the bridge authenticates each BLE connection with:
 {"cmd":"auth","host_id":"...","nonce":"host-session-nonce","mac":"hex-hmac-sha256"}
 ```
 
-The HMAC message is `auth:v1:<device_id>:<device_nonce>:<host_nonce>:<host_id>`, keyed by the stored per-device secret. When a device is paired, snapshots, `status`, `owner`, `name`, and `unpair` are private and are rejected until `auth` succeeds for the current BLE connection.
+The HMAC message is `auth:v1:<device_id>:<device_nonce>:<host_nonce>:<host_id>`, keyed by the stored per-device secret. Unpaired devices accept only `hello`, `pair_begin`, and `pair_commit`; snapshots, `status`, `owner`, `name`, and `unpair` are private and are rejected until a paired host successfully runs `auth` for the current BLE connection.
 
 ## Companion Snapshot
 
@@ -84,7 +84,7 @@ The device accepts snapshots like:
     "expires_at": 1781109980,
     "priority": 3,
     "thread_label": "thread-1",
-    "project_label": "sticks3-codex-companion"
+    "project_label": "m5stack-codex-companion"
   },
   "status": {
     "speaker": "Codex",
@@ -221,6 +221,10 @@ The device replies:
 Battery telemetry fields are best-effort. `bat.mv` and `bat.ma` are omitted when the board API cannot provide a plausible reading. `bat.usb` means external power is present. `bat.charging` is emitted only when the board API reports a known charge state; when true, the top bar shows `CHG`, otherwise USB power shows as `USB`. `settings.power` maps the saved profile: `0=Always`, `1=Auto`, `2=Low`. `settings.effective_power` can report `2=Low` when the low-battery auto policy downgrades saved `Auto`; saved `Always` remains no-auto-sleep. `settings.detail` maps `0=Full`, `1=Status`, `2=Usage`. `settings.low_battery_max` is kept as a compatibility alias for `settings.low_battery_low`. `settings.auto_sleep_ms` is `0` when automatic display sleep is disabled for the current effective profile. `settings.deep_sleep_ms` and `settings.travel_shutdown_ms` are kept for compatibility and currently report `0` because dashboard power profiles keep BLE reachable. `settings.rotation_mode` maps `0=Auto`, `1=Lock`, `2=P`, `3=L`, `4=P180`, `5=L180`; `settings.display_rotation` is the active M5GFX rotation value `0..3`.
 
 The firmware also accepts authenticated `owner`, `name`, and `unpair` commands for compatibility with existing bridge tooling.
+The device also exposes a physical recovery path: select `Unpair host` in
+settings and hold the board's main confirm key, or hold that key during boot for
+about 2.5 seconds. This clears only the stored host id and secret; the stable
+device id and display settings remain intact.
 
 ## Rate Limits
 

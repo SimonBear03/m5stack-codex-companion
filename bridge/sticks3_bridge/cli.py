@@ -55,7 +55,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     app_server = subcommands.add_parser(
         "app-server",
-        help="Bridge a Codex App-compatible app-server endpoint to the StickS3 over BLE.",
+        help="Bridge a Codex App-compatible app-server endpoint to an M5Stack Codex companion over BLE.",
     )
     app_server.add_argument(
         "--transport",
@@ -78,7 +78,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     desktop_observer = subcommands.add_parser(
         "desktop-observer",
-        help="Read local Codex Desktop rollout logs and mirror status to the StickS3 over BLE.",
+        help="Read local Codex Desktop rollout logs and mirror status to M5Stack Codex companions over BLE.",
     )
     add_device_args(desktop_observer)
     desktop_observer.add_argument(
@@ -129,7 +129,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Maximum delay between BLE bridge reconnect attempts.",
     )
 
-    pair_device = subcommands.add_parser("pair-device", help="Pair one StickS3/Cardputer companion before it can receive Codex data.")
+    pair_device = subcommands.add_parser("pair-device", help="Pair one M5Stack Codex companion before it can receive Codex data.")
     pair_device.add_argument("--device-prefix", default=DEFAULT_DEVICE_PREFIXES)
     pair_device.add_argument("--address", help="BLE address to connect directly instead of scanning.")
     pair_device.add_argument("--scan-timeout", type=float, default=10.0)

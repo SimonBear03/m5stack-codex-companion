@@ -60,7 +60,7 @@ The current product path is status mirroring through `desktop-observer`. True co
 - `bridge/sticks3_bridge/` - Python bridge for Desktop observer and App Server JSON-RPC.
 - `scripts/sticks3-macos-bridge` - macOS supervisor for starting, stopping, reporting Desktop observer state, and installing a launch-at-login agent.
 - `macos/StickS3Companion/` - native SwiftUI menu bar app that displays bridge state and exposes Start/Stop/Restart actions.
-- `scripts/build-macos-companion` - packages `StickS3 Companion.app` into repo-local `dist/` using the installed Xcode toolchain and ad-hoc signing.
+- `scripts/build-macos-companion` - packages `M5Stack Codex Companion.app`, stages it in temp space, installs it to `/Applications`, and ad-hoc signs it with the installed Xcode toolchain.
 - `~/Library/Application Support/StickS3 Codex Companion/StickS3Bridge.app` - generated stable helper wrapper used by the menu-bar-started bridge without showing a second user-facing app.
 - `tests/` - Python protocol and bridge tests.
 - `platformio.ini` - PlatformIO config targeting ESP32-S3 Arduino for `sticks3` and `cardputer_adv`.
@@ -106,7 +106,7 @@ Current validation:
 - `desktop-observer` parses local Codex Desktop rollouts, skips newer subagent rollouts by default for activity, normalizes account token/rate-limit events from recent rollout files, emits structured `status`/`activity` snapshots, treats fresh tool/message activity as work-like for the dashboard top bar, and strips outgoing message payloads according to the device `Detail` setting.
 - `desktop-observer` can write a status JSON file for the macOS menu bar helper.
 - `scripts/sticks3-macos-bridge` provides supervised start/stop/restart/status and `install-agent`/`uninstall-agent` login auto-start management without killing unrelated manually started bridge processes.
-- `python3 scripts/sticks3-macos-bridge start` now launches the bridge through the stable generated `~/Library/Application Support/StickS3 Codex Companion/StickS3Bridge.app` wrapper with an `NSBluetoothAlwaysUsageDescription`. The wrapper launcher runs the bridge venv's Python through an explicit `/bin/zsh` invocation so script-exec quirks do not wedge startup. The generated app is reused and only rebuilt when its generated contents change.
+- `python3 scripts/sticks3-macos-bridge start` now launches the bridge through the stable generated `~/Library/Application Support/M5Stack Codex Companion/.M5StackCodexBridge.app` wrapper with an `NSBluetoothAlwaysUsageDescription`. The native launcher embeds the bridge venv's Python in the helper app process so macOS TCC checks the helper bundle's usage description. The support directory is marked out of Spotlight indexing so only the menu bar app should surface to users. The generated app is reused and only rebuilt when its generated contents change.
 - `python3 scripts/sticks3-macos-bridge install-agent` installs `~/Library/LaunchAgents/com.simon.sticks3-codex-companion.bridge.plist` and a generated helper app under Application Support. On this Mac, launchd can still refuse or immediately stop the background item until macOS allows it under System Settings -> General -> Login Items & Extensions. Opening the native `StickS3 Companion.app` queues `ensure`, so it is the practical fallback controller.
 - The old flicker issue was addressed by drawing to an `M5Canvas` sprite and pushing only on redraw.
 - The battery pass builds and adds profile-aware display sleep, power profiles, telemetry, redraw throttling, adaptive loop delay, BLE power tuning, low-battery Low override for `Auto`, and PMIC indicator LED suppression without disabling speaker or power rails. Top bar power text shows `CHG` for active charging and `USB` for external power when charging is complete/paused/unknown. `Always` is no-auto-sleep even at low battery. Deep sleep and Travel/PMIC shutdown were removed from the normal profiles because they break live monitoring.
@@ -188,8 +188,8 @@ python3 scripts/sticks3-macos-bridge status
 
 If `agent-status` reports installed/loaded but `status` reports the supervisor
 as stopped, macOS blocked the LaunchAgent before the bridge process started.
-Allow the StickS3/zsh background item in System Settings -> General -> Login
-Items & Extensions, or open `dist/StickS3 Companion.app` / run
+Allow the M5Stack Codex background item in System Settings -> General -> Login
+Items & Extensions, or open `/Applications/M5Stack Codex Companion.app` / run
 `python3 scripts/sticks3-macos-bridge start` to launch the bridge in the current user
 session.
 

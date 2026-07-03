@@ -12,6 +12,7 @@ from sticks3_bridge.desktop_observer import (
     ROLLOUT_SWITCH_MIN_DWELL_SECONDS,
     compact_desktop_rate_limits,
     latest_account_usage,
+    latest_usage_from_rollout,
     latest_user_rollout,
 )
 from sticks3_bridge.device import FakeStickS3Device
@@ -132,6 +133,22 @@ class FakeFleetDevice:
 
 
 class DesktopObserverTests(unittest.IsolatedAsyncioTestCase):
+    async def test_restartable_loop_retries_after_unexpected_error(self) -> None:
+        bridge = DesktopObserverBridge(device=FakeStickS3Device(), reconnect_delay=0.01)
+        calls = 0
+
+        async def worker() -> None:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                raise RuntimeError("temporary failure")
+
+        with self.assertLogs("sticks3_bridge.desktop_observer", level="ERROR") as logs:
+            await bridge.restartable_loop("test worker", worker)
+
+        self.assertEqual(2, calls)
+        self.assertTrue(any("test worker loop failed; retrying" in message for message in logs.output))
+
     def test_desktop_rate_limits_normalize_codex_rollout_shape(self) -> None:
         normalized = compact_desktop_rate_limits(
             {
@@ -426,6 +443,31 @@ class DesktopObserverTests(unittest.IsolatedAsyncioTestCase):
             assert usage is not None
             self.assertEqual(100, usage.rate_limits["primary"]["remaining_percent"])
             self.assertEqual(1200, usage.tokens_total)
+
+    def test_latest_usage_incremental_scan_tolerates_utf8_boundary(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            rollout = Path(tmp) / "rollout-current-thread.jsonl"
+            prefix = "partial unicode boundary 😀 before token count\n".encode("utf-8")
+            token_line = event_line(
+                {
+                    "timestamp": "2026-06-14T05:25:00.000Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {"total_token_usage": {"total_tokens": 1200}},
+                        "rate_limits": {"primary": {"used_percent": 0.0, "window_minutes": 300}},
+                    },
+                }
+            ).encode("utf-8")
+            rollout.write_bytes(prefix + token_line)
+            start_offset = prefix.index("😀".encode("utf-8")) + 1
+
+            usage = latest_usage_from_rollout(rollout, start_offset=start_offset)
+
+            self.assertIsNotNone(usage)
+            assert usage is not None
+            self.assertEqual(1200, usage.tokens_total)
+            self.assertEqual(100, usage.rate_limits["primary"]["remaining_percent"])
 
     async def test_poll_once_builds_desktop_snapshot_from_rollout(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

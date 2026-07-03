@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import time
+from collections.abc import Awaitable, Callable
 from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -342,11 +343,12 @@ def recent_rollout_files(sessions_dir: Path, *, limit: int = USAGE_SCAN_FILE_LIM
 def latest_usage_from_rollout(path: Path, *, start_offset: int = 0) -> DesktopUsageSnapshot | None:
     latest: DesktopUsageSnapshot | None = None
     try:
-        with path.open("r", encoding="utf-8") as handle:
+        with path.open("rb") as handle:
             if start_offset > 0:
                 handle.seek(start_offset)
                 handle.readline()
-            for line in handle:
+            for raw_line in handle:
+                line = raw_line.decode("utf-8", errors="ignore")
                 if '"token_count"' not in line:
                     continue
                 try:
@@ -537,9 +539,22 @@ class DesktopObserverBridge:
     async def run(self) -> None:
         self.write_status(self._device_state, detail="Codex observer running")
         async with asyncio.TaskGroup() as task_group:
-            task_group.create_task(self.device_connection_loop())
-            task_group.create_task(self.handle_device_controls())
-            task_group.create_task(self.observer_loop())
+            task_group.create_task(self.restartable_loop("device connection", self.device_connection_loop))
+            task_group.create_task(self.restartable_loop("device controls", self.handle_device_controls))
+            task_group.create_task(self.restartable_loop("rollout observer", self.observer_loop))
+
+    async def restartable_loop(self, label: str, worker: Callable[[], Awaitable[None]]) -> None:
+        while True:
+            try:
+                await worker()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                LOGGER.exception("%s loop failed; retrying", label)
+                self.write_status("error", detail=f"{label} loop failed; retrying", error=str(exc))
+                await asyncio.sleep(self.reconnect_delay)
+                continue
+            return
 
     async def observer_loop(self) -> None:
         while True:
@@ -576,7 +591,7 @@ class DesktopObserverBridge:
                     self._device_state = "disconnected"
                     self._device_error = "BLE link closed"
                     await self.device.close()
-                    self.write_status(self._device_state, detail="StickS3 disconnected", error=self._device_error)
+                    self.write_status(self._device_state, detail="Companion disconnected", error=self._device_error)
                     delay = self.reconnect_delay
                     continue
                 await asyncio.sleep(1.0)
@@ -584,7 +599,7 @@ class DesktopObserverBridge:
 
             self._device_state = "scanning"
             self._device_error = None
-            self.write_status(self._device_state, detail="Scanning for StickS3")
+            self.write_status(self._device_state, detail="Scanning for companions")
             try:
                 await self.device.connect()
             except Exception as exc:
@@ -1090,12 +1105,12 @@ class DesktopObserverBridge:
         return tuple(item for item in ordered if self.activity_seq_value(item) > last_sent)
 
     async def mark_device_send_failure(self, exc: Exception) -> None:
-        LOGGER.warning("StickS3 send failed: %s", exc)
+        LOGGER.warning("Companion send failed: %s", exc)
         self._device_connected = False
         self._device_state = "disconnected"
         self._device_error = str(exc)
         await self.device.close()
-        self.write_status(self._device_state, detail="StickS3 disconnected", error=str(exc))
+        self.write_status(self._device_state, detail="Companion disconnected", error=str(exc))
 
     async def mark_target_send_failure(self, target: Any, exc: Exception) -> None:
         LOGGER.warning("Companion send failed for %s: %s", getattr(target, "label", "device"), exc)
@@ -1239,7 +1254,7 @@ class DesktopObserverBridge:
     async def handle_device_controls(self) -> None:
         while True:
             message = await self.device.wait_for_control()
-            LOGGER.info("Ignoring StickS3 control in desktop-observer mode: %s", message)
+            LOGGER.info("Ignoring companion control in desktop-observer mode: %s", message)
             self.state.last_message = "Observer is read-only"
             await self.send_snapshot()
 

@@ -598,7 +598,7 @@ final class BridgeModel: ObservableObject {
 
     func revealBridgeHelper() {
         let url = URL(fileURLWithPath: NSHomeDirectory())
-            .appendingPathComponent("Library/Application Support/StickS3 Codex Companion/StickS3Bridge.app")
+            .appendingPathComponent("Library/Application Support/M5Stack Codex Companion/M5StackCodexBridge.app")
         NSWorkspace.shared.activateFileViewerSelecting([url])
     }
 
@@ -641,7 +641,7 @@ struct ContentView: View {
             Image(systemName: model.symbolName)
                 .foregroundStyle(color(for: model.menuTitle))
             VStack(alignment: .leading, spacing: 2) {
-                Text("StickS3 Companion")
+                Text("M5Stack Codex Companion")
                     .font(.headline)
                 Text(model.menuTitle)
                     .font(.caption)
@@ -932,7 +932,7 @@ struct UsageBar: View {
 }
 
 @main
-struct StickS3CompanionApp: App {
+struct M5StackCodexCompanionApp: App {
     @StateObject private var model = BridgeModel()
 
     var body: some Scene {

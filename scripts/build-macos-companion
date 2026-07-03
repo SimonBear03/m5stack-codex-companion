@@ -3,18 +3,26 @@ set -euo pipefail
 
 REPO="${STICKS3_REPO:-$(cd "$(dirname "$0")/.." && pwd)}"
 PACKAGE_DIR="$REPO/macos/StickS3Companion"
-PRODUCT="StickS3Companion"
-APP_NAME="StickS3 Companion.app"
-APP_DIR="${STICKS3_COMPANION_APP:-$REPO/dist/$APP_NAME}"
+PRODUCT="M5StackCodexCompanion"
+APP_NAME="M5Stack Codex Companion.app"
+INSTALL_DIR="${STICKS3_COMPANION_INSTALL_DIR:-/Applications}"
+APP_DIR="${STICKS3_COMPANION_APP:-$INSTALL_DIR/$APP_NAME}"
+STAGING_ROOT="${STICKS3_COMPANION_STAGING_DIR:-${TMPDIR:-/tmp}/m5stack-codex-companion-build}"
+STAGING_APP_DIR="$STAGING_ROOT/$APP_NAME"
 BUILD_DIR="$PACKAGE_DIR/.build/release"
 BINARY="$BUILD_DIR/$PRODUCT"
 LAUNCH=0
+INSTALL=1
 export DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
 
 for arg in "$@"; do
   case "$arg" in
     --launch)
       LAUNCH=1
+      ;;
+    --no-install)
+      INSTALL=0
+      APP_DIR="$STAGING_APP_DIR"
       ;;
     *)
       echo "unknown argument: $arg" >&2
@@ -30,11 +38,16 @@ fi
 
 swift build -c release --package-path "$PACKAGE_DIR"
 
-rm -rf "$APP_DIR"
-mkdir -p "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Resources"
-cp "$BINARY" "$APP_DIR/Contents/MacOS/$PRODUCT"
+if [[ -z "$APP_DIR" || "$APP_DIR" != *.app ]]; then
+  echo "refusing to install to non-app path: $APP_DIR" >&2
+  exit 64
+fi
 
-cat > "$APP_DIR/Contents/Info.plist" <<PLIST
+rm -rf "$STAGING_APP_DIR"
+mkdir -p "$STAGING_APP_DIR/Contents/MacOS" "$STAGING_APP_DIR/Contents/Resources"
+cp "$BINARY" "$STAGING_APP_DIR/Contents/MacOS/$PRODUCT"
+
+cat > "$STAGING_APP_DIR/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
   "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -43,15 +56,15 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
   <key>CFBundleDevelopmentRegion</key>
   <string>en</string>
   <key>CFBundleDisplayName</key>
-  <string>StickS3 Companion</string>
+  <string>M5Stack Codex Companion</string>
   <key>CFBundleExecutable</key>
   <string>$PRODUCT</string>
   <key>CFBundleIdentifier</key>
-  <string>com.simon.sticks3companion</string>
+  <string>com.simon.m5stackcodexcompanion</string>
   <key>CFBundleInfoDictionaryVersion</key>
   <string>6.0</string>
   <key>CFBundleName</key>
-  <string>StickS3 Companion</string>
+  <string>M5Stack Codex Companion</string>
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
@@ -65,23 +78,35 @@ cat > "$APP_DIR/Contents/Info.plist" <<PLIST
   <key>NSPrincipalClass</key>
   <string>NSApplication</string>
   <key>NSBluetoothAlwaysUsageDescription</key>
-  <string>StickS3 Companion uses Bluetooth to pair with and update Simon's StickS3 and Cardputer dashboard devices.</string>
+  <string>M5Stack Codex Companion uses Bluetooth to pair with and update M5Stack Codex companion devices.</string>
   <key>NSBluetoothPeripheralUsageDescription</key>
-  <string>StickS3 Companion uses Bluetooth to pair with and update Simon's StickS3 and Cardputer dashboard devices.</string>
+  <string>M5Stack Codex Companion uses Bluetooth to pair with and update M5Stack Codex companion devices.</string>
   <key>NSDocumentsFolderUsageDescription</key>
-  <string>StickS3 Companion reads the local StickS3 bridge status and Codex session logs from Simon's Documents workspace.</string>
+  <string>M5Stack Codex Companion reads the local bridge status and Codex session logs from the selected workspace.</string>
   <key>STICKS3RepoPath</key>
   <string>$REPO</string>
 </dict>
 </plist>
 PLIST
 
-printf 'APPL????' > "$APP_DIR/Contents/PkgInfo"
-/usr/bin/codesign --force --deep --sign - "$APP_DIR" >/dev/null
+printf 'APPL????' > "$STAGING_APP_DIR/Contents/PkgInfo"
+/usr/bin/codesign --force --deep --sign - "$STAGING_APP_DIR" >/dev/null
+
+if (( INSTALL )); then
+  mkdir -p "$(dirname "$APP_DIR")"
+  rm -rf "$APP_DIR"
+  /usr/bin/ditto "$STAGING_APP_DIR" "$APP_DIR"
+fi
+
 /usr/bin/xattr -cr "$APP_DIR" 2>/dev/null || true
 /usr/bin/xattr -rd com.apple.provenance "$APP_DIR" 2>/dev/null || true
 
-echo "Built $APP_DIR"
+echo "Built $STAGING_APP_DIR"
+if (( INSTALL )); then
+  echo "Installed $APP_DIR"
+else
+  echo "Install skipped; app is at $APP_DIR"
+fi
 
 if (( LAUNCH )); then
   /usr/bin/open -n "$APP_DIR"

@@ -300,8 +300,8 @@ class CodexAppServerBridge:
                 "method": "initialize",
                 "params": {
                     "clientInfo": {
-                        "name": "sticks3-codex-companion",
-                        "title": "StickS3 Codex Companion",
+                        "name": "m5stack-codex-companion",
+                        "title": "M5Stack Codex Companion",
                         "version": "0.1.0",
                     },
                     "capabilities": {"experimentalApi": True},
@@ -402,7 +402,7 @@ class CodexAppServerBridge:
             response = await self.device.wait_for_interaction(str(interaction["id"]), timeout=self.approval_timeout)
             result = interaction_response(str(method), interaction, response)
         except TimeoutError:
-            LOGGER.warning("Timed out waiting for StickS3 interaction for request %s", request_id)
+            LOGGER.warning("Timed out waiting for companion interaction for request %s", request_id)
             response = {"action": "cancel", "value": "cancel"}
             result = interaction_response(str(method), interaction, response)
 
@@ -445,7 +445,7 @@ class CodexAppServerBridge:
 
     async def interrupt_active_turn(self) -> None:
         if not self.state.active_thread_id or not self.state.active_turn_id:
-            LOGGER.info("Ignoring StickS3 interrupt; no active turn id is known")
+            LOGGER.info("Ignoring companion interrupt; no active turn id is known")
             return
         request_id = self._request_id()
         await self.transport.send(

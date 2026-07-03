@@ -3,14 +3,17 @@ from __future__ import annotations
 import json
 import os
 import secrets
+import shutil
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any
 
 
-APP_SUPPORT_DIR = Path.home() / "Library" / "Application Support" / "StickS3 Codex Companion"
+APP_SUPPORT_DIR = Path.home() / "Library" / "Application Support" / "M5Stack Codex Companion"
+LEGACY_APP_SUPPORT_DIR = Path.home() / "Library" / "Application Support" / "StickS3 Codex Companion"
 DEFAULT_PAIRING_STORE_PATH = APP_SUPPORT_DIR / "paired-devices.json"
+LEGACY_PAIRING_STORE_PATH = LEGACY_APP_SUPPORT_DIR / "paired-devices.json"
 
 
 def utc_now_iso() -> str:
@@ -62,8 +65,35 @@ class PairedDevice:
 
 
 class PairingStore:
-    def __init__(self, path: Path | None = None) -> None:
-        self.path = path or DEFAULT_PAIRING_STORE_PATH
+    def __init__(
+        self,
+        path: Path | None = None,
+        *,
+        legacy_path: Path | None = None,
+        migrate_legacy: bool = True,
+    ) -> None:
+        self.path = (path or DEFAULT_PAIRING_STORE_PATH).expanduser()
+        if legacy_path is not None:
+            self.legacy_path: Path | None = legacy_path.expanduser()
+        elif self.path == DEFAULT_PAIRING_STORE_PATH:
+            self.legacy_path = LEGACY_PAIRING_STORE_PATH
+        else:
+            self.legacy_path = None
+        if migrate_legacy:
+            self.migrate_legacy_store()
+
+    def migrate_legacy_store(self) -> bool:
+        legacy_path = self.legacy_path
+        if legacy_path is None or self.path.exists() or not legacy_path.exists():
+            return False
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(legacy_path), str(self.path))
+        os.chmod(self.path, 0o600)
+        try:
+            legacy_path.parent.rmdir()
+        except OSError:
+            pass
+        return True
 
     def load(self) -> dict[str, Any]:
         try:

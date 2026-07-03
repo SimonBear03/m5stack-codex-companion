@@ -254,7 +254,7 @@ class BleStickS3Device(StickS3Device):
 
     async def send_json(self, data: dict[str, Any]) -> None:
         if self._client is None:
-            raise RuntimeError("StickS3 BLE client is not connected")
+            raise RuntimeError("Companion BLE client is not connected")
         chunks = chunk_bytes(encode_json_line(data), self.chunk_size)
         for index, chunk in enumerate(chunks):
             await asyncio.wait_for(
@@ -386,7 +386,7 @@ class BleStickS3Device(StickS3Device):
 
     def _handle_notification(self, _: int, data: bytearray) -> None:
         for message in self._decoder.feed(bytes(data)):
-            LOGGER.debug("StickS3 -> host: %s", message)
+            LOGGER.debug("Companion -> host: %s", message)
             ack = message.get("ack")
             if isinstance(ack, str):
                 self._ack_queues.setdefault(ack, asyncio.Queue()).put_nowait(message)
@@ -721,7 +721,7 @@ class FakeStickS3Device(StickS3Device):
         self.always_connected = True
 
     async def connect(self) -> None:
-        LOGGER.info("Using fake StickS3 device with auto decision: %s", self.auto_decision)
+        LOGGER.info("Using fake companion device with auto decision: %s", self.auto_decision)
 
     async def close(self) -> None:
         return None

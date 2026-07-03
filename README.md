@@ -1,8 +1,8 @@
-# StickS3 / Cardputer Codex Companion
+# M5Stack Codex Companion
 
-Custom M5Stack firmware for a compact Codex companion activity display.
+Custom M5Stack firmware and a macOS bridge for compact Codex companion activity displays.
 
-The StickS3 and Cardputer ADV targets are BLE displays for Codex activity on Simon's Mac. A local bridge connects the device either to Codex Desktop rollout logs in read-only observer mode or to a Codex App Server endpoint for protocol validation. Public Codex docs do not currently document native desktop-app BLE pairing, so this repo uses a small JSONL-over-BLE device protocol whose primary payload is a Codex companion activity object.
+The StickS3 and Cardputer ADV targets are BLE displays for Codex activity on a Mac. A local bridge connects the device either to Codex Desktop rollout logs in read-only observer mode or to a Codex App Server endpoint for protocol validation. Public Codex docs do not currently document native desktop-app BLE pairing, so this repo uses a small JSONL-over-BLE device protocol whose primary payload is a Codex companion activity object.
 
 ## Current Scope
 
@@ -37,18 +37,18 @@ True control of an already-open Codex Desktop app thread is blocked until Codex 
 
 As of 2026-06-14:
 
-- StickS3 and Cardputer ADV firmware targets build successfully with PlatformIO on Simon's Mac.
+- StickS3 and Cardputer ADV firmware targets build successfully with PlatformIO on macOS.
 - Firmware binaries are about 1.10 MB or smaller, well within the direct-flash app size.
 - Physical StickS3 USB flashing has been validated.
-- The device advertises over BLE as `Codex-S3-0470` on Simon's StickS3.
+- StickS3 firmware advertises as `Codex-S3-XXXX`.
 - Cardputer ADV firmware advertises as `Codex-CP-XXXX` and builds, but still needs physical hardware validation.
 - The bridge connects over BLE and can mirror the current Codex Desktop thread with `desktop-observer`.
 - The bridge uses acknowledged BLE writes for JSONL chunks so partial JSON lines are less likely on the device.
 - BLE scans match named `Codex-S3-*` or `Codex-CP-*` devices for discovery, but `desktop-observer` syncs only to explicitly paired devices.
 - The Desktop observer can fan out to multiple paired companions, with independent reconnect and detail/privacy settings per device.
 - The Desktop observer seeds token/rate-limit rows from recent rollout logs, not only from the active thread's next task.
-- The native `StickS3 Companion.app` is the supported Mac menu bar controller; the old SwiftBar plugin workflow has been removed.
-- The generated BLE helper app now lives under Application Support, so only the native menu bar app is opened by the user.
+- The native `M5Stack Codex Companion.app` is the supported Mac menu bar controller; the old SwiftBar plugin workflow has been removed.
+- The generated BLE helper app now lives in a hidden Application Support bundle, so only the native menu bar app is opened by the user.
 - Soft speaker cues work on hardware through M5Unified's StickS3 speaker path after removing manual audio-enable toggling.
 - Python bridge tests pass.
 - M5Launcher WebUI upload was unreliable on StickS3 without SD; direct USB flash is the current working install path.
@@ -106,8 +106,12 @@ sticks3-bridge list-devices
 The device shows a `PAIR 123456` screen during pairing. Confirm on-device with Button A on StickS3 or GO/G0 on Cardputer. Pairing data is stored on macOS at:
 
 ```text
-~/Library/Application Support/StickS3 Codex Companion/paired-devices.json
+~/Library/Application Support/M5Stack Codex Companion/paired-devices.json
 ```
+
+If you used an older StickS3-branded build, the first launch migrates the old
+pairing store from `~/Library/Application Support/StickS3 Codex Companion/` so
+already-paired devices keep trusting the same Mac host secret.
 
 Remove a local pairing later with:
 
@@ -131,7 +135,7 @@ sticks3-bridge app-server --transport stdio --fake-device --auto-decision deny
 
 ## Mac Menu Bar Helper
 
-The repo includes a native macOS menu bar app, `StickS3 Companion.app`, plus a
+The repo includes a native macOS menu bar app, `M5Stack Codex Companion.app`, plus a
 small Python supervisor for the Desktop observer. The menu bar app is the
 user-facing controller. The supervisor owns only the bridge process that it
 starts, and writes runtime state under `runtime/`:
@@ -160,10 +164,10 @@ Build or update the native menu bar app from the repo root:
 That builds and opens a locally signed app at:
 
 ```text
-dist/StickS3 Companion.app
+/Applications/M5Stack Codex Companion.app
 ```
 
-Opening `StickS3 Companion.app` is enough to queue `scripts/sticks3-macos-bridge
+Opening `M5Stack Codex Companion.app` is enough to queue `scripts/sticks3-macos-bridge
 ensure` when the bridge is stopped. The menu title shows aggregate BLE state as
 `BLE connected/paired`, and the popover lists companions with board/name,
 connected/scanning/disconnected state, detail mode, last-seen time, and errors.
@@ -171,19 +175,24 @@ Single-device and multi-device states use the same layout. The app also shows
 current Codex status, token count when present, 5h/7d limits, thread info, and
 Start/Stop/Restart actions. No paid Apple Developer account is needed for local
 use; the app is ad-hoc signed by the build script.
+The app stores this repo path in its `Info.plist`, so it can live in
+Applications while still controlling the local bridge code and venv.
+This is a developer install shape, not a public release artifact. See
+`docs/distribution.md` for the signed/notarized app and Homebrew Cask plan.
 
 On macOS, the supervisor starts the BLE-touching bridge through one stable
 generated app bundle at:
 
 ```text
-~/Library/Application Support/StickS3 Codex Companion/StickS3Bridge.app
+~/Library/Application Support/M5Stack Codex Companion/.M5StackCodexBridge.app
 ```
 
 That wrapper exists so macOS can see an `NSBluetoothAlwaysUsageDescription`
-string for Bluetooth permission. The wrapper launches the repo's bridge venv
-Python through a stable hidden app bundle, generated locally under Application
-Support and reused across menu refreshes. It is rebuilt only when the generated
-wrapper contents change.
+string for Bluetooth permission. Its native launcher embeds the repo's bridge
+venv Python in the helper app process, generated locally under Application
+Support and reused across menu refreshes. The support directory is marked out of
+Spotlight indexing so users should only see `M5Stack Codex Companion.app`. The
+helper is rebuilt only when the generated wrapper contents change.
 
 To start it automatically at login and avoid manual bridge starts:
 
@@ -192,20 +201,23 @@ python3 scripts/sticks3-macos-bridge install-agent --scan-timeout 60
 python3 scripts/sticks3-macos-bridge agent-status
 ```
 
-This writes `~/Library/LaunchAgents/com.simon.sticks3-codex-companion.bridge.plist`
+This writes `~/Library/LaunchAgents/com.simon.m5stack-codex-companion.bridge.plist`
 and installs a generated helper app under
-`~/Library/Application Support/StickS3 Codex Companion/StickS3Bridge.app`.
+`~/Library/Application Support/M5Stack Codex Companion/.M5StackCodexBridge.app`.
+Install migrates the old StickS3-branded pairing store when needed and unloads
+the old StickS3-branded LaunchAgent/helper so macOS does not run two bridge
+processes.
 Recent macOS builds may still require allowing the helper under System Settings
--> General -> Login Items & Extensions. Opening `StickS3 Companion.app` remains
+-> General -> Login Items & Extensions. Opening `M5Stack Codex Companion.app` remains
 the practical fallback when launchd refuses the background item.
 Because the repo is under `~/Documents`, macOS may also ask once for folder
-access when `StickS3 Codex Bridge` reads the bridge code and local Codex session
+access when `M5Stack Codex Bridge` reads the bridge code and local Codex session
 logs. Repeated folder or Bluetooth prompts usually mean the app was rebuilt,
 moved, denied earlier, or launched from a different bundle path.
 Newer macOS builds can still block unsigned local background items before the
 bridge starts. If `agent-status` says the LaunchAgent is installed/loaded but
 the bridge supervisor is stopped, check System Settings -> General -> Login
-Items & Extensions and allow the StickS3/zsh background item. The `start`
+Items & Extensions and allow the M5Stack Codex background item. The `start`
 command falls back to a direct app-wrapper launch if the LaunchAgent kickstart
 does not produce a bridge PID. Remove the agent later with:
 
@@ -238,7 +250,7 @@ StickS3 settings menu:
 
 - Button B: next option.
 - Button A: rotate/toggle selected value.
-- Long A: close settings.
+- Long A: close settings, or unpair the trusted host when `Unpair host` is selected.
 - Auto-closes after 12 seconds of no input.
 
 Cardputer settings menu:
@@ -247,8 +259,11 @@ Cardputer settings menu:
 - Left/Right, or `,`/`/` without Fn: previous/next value.
 - Enter or GO/G0 short: rotate/toggle selected value forward.
 - Backspace, Esc, or `` ` `` without Fn: close settings.
-- GO/G0 long: enter display sleep.
+- GO/G0 long: enter display sleep, or unpair the trusted host when `Unpair host` is selected.
 - Auto-closes after 12 seconds of no input.
+
+The settings list scrolls automatically when the selected option moves beyond
+the visible rows. `^` and `v` markers indicate hidden settings above or below.
 
 Settings, in order:
 
@@ -259,6 +274,12 @@ Settings, in order:
 - Text nav: `Page`, `Line`
 - Auto newest: `On`, `Off`
 - Rotation: `Auto`, `Lock`, `P`, `L`, `P180`, `L180`
+- Unpair host: hold the board's main confirm key to clear the trusted Mac host.
+
+If a companion is paired to an old or unavailable Mac, hold the main confirm key
+during boot for about 2.5 seconds to clear only the stored host secret. The
+stable device id and display settings are preserved, so the device can be paired
+again without a full flash erase.
 
 On StickS3, `Auto` rotates among all four physical directions after the device is held steady. `Lock` keeps the current direction. `P`, `L`, `P180`, and `L180` force fixed portrait/landscape directions. On Cardputer, `Auto` is skipped because there is no validated IMU orientation path; the default is fixed landscape.
 

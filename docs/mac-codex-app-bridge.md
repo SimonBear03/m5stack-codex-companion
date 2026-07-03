@@ -11,7 +11,7 @@ There are two bridge modes:
 - `desktop-observer`: read-only status mirroring for the actual Codex Desktop app. It follows local rollout JSONL files under `~/.codex/sessions`, prefers non-subagent Desktop threads for activity, and forwards active/idle state, speaker-labeled activity, token totals, and rate limits. Rate-limit rows are seeded from recent `token_count` events across rollout files.
 - `app-server`: JSON-RPC validation path for an App Server endpoint. It can still exercise approval and choice mapping in the Python bridge, but the current dashboard firmware is read-only.
 
-True control of an already-open Codex Desktop app thread is currently blocked by product surface, not by StickS3 firmware. On Simon's Mac, Codex Desktop is running private `stdio://` app-server processes and the default app-server control socket `/Users/simon/.codex/app-server-control/app-server-control.sock` is not present. Public docs describe how to expose an App Server transport, but not how third-party hardware can attach to an existing Desktop thread.
+True control of an already-open Codex Desktop app thread is currently blocked by product surface, not by M5Stack firmware. Codex Desktop may run private `stdio://` app-server processes without exposing the default app-server control socket at `~/.codex/app-server-control/app-server-control.sock`. Public docs describe how to expose an App Server transport, but not how third-party hardware can attach to an existing Desktop thread.
 
 ## Flow
 
@@ -19,10 +19,10 @@ True control of an already-open Codex Desktop app thread is currently blocked by
 Codex Desktop rollout logs OR App Server endpoint
   <-> Mac bridge
   <-> BLE Nordic UART Service JSONL
-  <-> StickS3 minimal dashboard
+  <-> M5Stack companion dashboard
 ```
 
-For the Desktop app experience Simon asked for, run:
+For the local Desktop app observer experience, run:
 
 ```bash
 sticks3-bridge --log-level INFO desktop-observer --scan-timeout 15
@@ -35,7 +35,7 @@ sticks3-bridge desktop-observer --thread-id <thread-id>
 sticks3-bridge desktop-observer --rollout ~/.codex/sessions/.../rollout-....jsonl
 ```
 
-Observer mode is intentionally read-only. It mirrors status, activity, usage bars, and token totals. Activity follows the selected/current thread, while the `5h` and `7d` usage bars are account-level and can be seeded from recent rollout `token_count` events before the current thread starts a new task. The StickS3 `Detail` setting controls how much text the bridge sends: `Full` sends message activity, `Status` suppresses body text, and `Usage` sends generic state plus usage only, without legacy `msg`/`entries` text. Observer mode cannot approve prompts, answer prompts, or interrupt turns in the Codex Desktop UI.
+Observer mode is intentionally read-only. It mirrors status, activity, usage bars, and token totals. Activity follows the selected/current thread, while the `5h` and `7d` usage bars are account-level and can be seeded from recent rollout `token_count` events before the current thread starts a new task. The device `Detail` setting controls how much text the bridge sends: `Full` sends message activity, `Status` suppresses body text, and `Usage` sends generic state plus usage only, without legacy `msg`/`entries` text. Observer mode cannot approve prompts, answer prompts, or interrupt turns in the Codex Desktop UI.
 
 The bridge can attach to a running App Server endpoint:
 
@@ -73,7 +73,7 @@ Keep this separate from the PlatformIO `.venv/` if that environment was created 
 
 ## Menu Bar Supervisor
 
-The native `StickS3 Companion.app` wraps `desktop-observer` with a PID file,
+The native `M5Stack Codex Companion.app` wraps `desktop-observer` with a PID file,
 status JSON, and log file so it can be controlled from the macOS menu bar:
 
 ```bash
@@ -90,8 +90,9 @@ Runtime files live in `runtime/` and are ignored by Git:
 - `bridge.log`: bridge stdout/stderr from background starts
 
 The generated Bluetooth-permission wrapper is installed outside the repo at
-`~/Library/Application Support/StickS3 Codex Companion/StickS3Bridge.app` so
-only the native menu bar app is opened by the user.
+`~/Library/Application Support/M5Stack Codex Companion/.M5StackCodexBridge.app`.
+The support directory is marked out of Spotlight indexing so only the native menu
+bar app should appear as a user-openable app.
 
 The bridge retries BLE scan/connect/write failures by default. Normal device
 sleep, advertising delays, or transient disconnects should move the helper
@@ -101,7 +102,7 @@ and retry backoff is kept short for
 faster wake/reconnect. Default BLE scans use named `Codex-S3-*` and
 `Codex-CP-*` devices for discovery, not arbitrary Nordic UART Service
 peripherals, but Desktop observer sync is paired-only. Pairing records live at
-`~/Library/Application Support/StickS3 Codex Companion/paired-devices.json` and
+`~/Library/Application Support/M5Stack Codex Companion/paired-devices.json` and
 the observer fans out snapshots only after the device id authenticates with its
 stored secret. Each paired companion has an independent reconnect loop, status
 ack, and detail/privacy setting. After a BLE connect, the bridge re-polls Codex
@@ -119,26 +120,34 @@ Build or update the native menu bar app from the repo root:
 /bin/zsh scripts/build-macos-companion --launch
 ```
 
-That builds and opens a locally signed app at `dist/StickS3 Companion.app`.
+That builds and opens a locally signed app at
+`/Applications/M5Stack Codex Companion.app`.
 Opening it queues `scripts/sticks3-macos-bridge ensure` when the bridge is
 stopped. The app reads `runtime/bridge-status.json` every 2 seconds and exposes
 Start, Stop, Restart, Open Log, Open Repo, Reveal Helper, and Quit actions. The
 popover lists companions with board/name, connected/scanning/disconnected state,
 detail mode, last-seen time, and any error. Single-device and multi-device
 states use the same layout. No paid Apple Developer account is needed for local
-use; the app is ad-hoc signed.
+use; the app is ad-hoc signed. The app stores this repo path in its
+`Info.plist`, so it can live in Applications while still controlling the local
+bridge code and venv. This is a developer install shape, not a public release
+artifact; see `docs/distribution.md` for the signed/notarized app and Homebrew
+Cask plan.
 
 The supervisor generates a stable local helper wrapper at
-`~/Library/Application Support/StickS3 Codex Companion/StickS3Bridge.app` with
-the Bluetooth usage string. Its launcher runs the repo's bridge venv Python
-from a stable hidden app bundle. The wrapper is reused and only rebuilt when
+`~/Library/Application Support/M5Stack Codex Companion/.M5StackCodexBridge.app` with
+the Bluetooth usage string. Its native launcher embeds the repo's bridge venv
+Python in the helper app process. The wrapper is reused and only rebuilt when
 generated contents change; this avoids showing a second app next to
-`StickS3 Companion.app`. If macOS prompts for Bluetooth
-access to `StickS3 Codex Bridge`, allow it.
+`M5Stack Codex Companion.app`. If macOS prompts for Bluetooth
+access to `M5Stack Codex Bridge`, allow it.
+The first launch migrates the old StickS3-branded pairing store when needed, so
+already-paired devices keep trusting the same Mac host secret after the app
+renames its support directory.
 
 Because this repo lives under `~/Documents`, macOS may also ask once for folder
 access when the app reads the bridge code and local Codex rollout logs. That
-should be a one-time Files & Folders permission for `StickS3 Codex Bridge`.
+should be a one-time Files & Folders permission for `M5Stack Codex Bridge`.
 Repeated prompts usually mean the helper app was regenerated with a new identity,
 launched from a different bundle path, or the previous prompt was denied.
 
@@ -150,7 +159,7 @@ The menu title is intentionally compact:
 - `Codex Work · BLE 1/2`: Codex is active while one paired companion is connected
 - `Codex Err · BLE 0/2`: bridge or device error
 
-`Codex Work` uses the same recent-work window as the StickS3 top bar. Tool
+`Codex Work` uses the same recent-work window as the firmware top bar. Tool
 calls, tool output, patches, task starts, and Codex messages keep the bridge in
 work state briefly even if Codex Desktop batches a later completion event into
 the same poll. Old rollout events are not replayed as live work on startup.
@@ -165,16 +174,18 @@ python3 scripts/sticks3-macos-bridge agent-status
 ```
 
 The installer writes
-`~/Library/LaunchAgents/com.simon.sticks3-codex-companion.bridge.plist` and
+`~/Library/LaunchAgents/com.simon.m5stack-codex-companion.bridge.plist` and
 installs the generated helper app under Application Support. The bridge itself
-retries BLE failures forever by default, so normal StickS3 sleep,
+retries BLE failures forever by default, so normal companion display sleep,
 advertising delay, and transient disconnects should not require a restart.
+Installing unloads and removes the old StickS3-branded LaunchAgent/helper when
+present so macOS does not run two bridge processes.
 
 On newer macOS builds, launch-at-login is best-effort until the background item
 is accepted by the user. If `agent-status` reports installed/loaded while the
 bridge supervisor is still stopped, macOS blocked launchd before the bridge
 could start. Check System Settings -> General -> Login Items & Extensions and
-allow the StickS3/zsh background item. The native menu app remains the fallback
+allow the M5Stack Codex background item. The native menu app remains the fallback
 controller when the background item is blocked. The supervisor's `start` command
 falls back to direct app-wrapper launch when LaunchAgent kickstart does not
 produce a PID. Unload and remove the LaunchAgent later with:
@@ -250,7 +261,7 @@ Both boards:
 
 ## Usage Mapping
 
-The bridge calls App Server `account/rateLimits/read` after initialization and listens for `account/rateLimits/updated`. It forwards the Codex bucket's primary and secondary rolling windows to the StickS3.
+The bridge calls App Server `account/rateLimits/read` after initialization and listens for `account/rateLimits/updated`. It forwards the Codex bucket's primary and secondary rolling windows to the companion.
 
 The current observed App Server payload uses:
 
@@ -291,7 +302,7 @@ Validated on 2026-06-10:
 
 - Python tests cover protocol serialization, approval mapping in the bridge, rate-limit normalization, plan summaries, goal summaries, token usage forwarding, cleared goals, Desktop observer rollout selection, and structured snapshot parsing.
 - Firmware builds with PlatformIO.
-- Simon's physical StickS3 advertises as `Codex-S3-0470` over BLE.
+- A physical StickS3 advertises as `Codex-S3-XXXX` over BLE.
 - Direct USB flash works.
 - The bridge can connect to the physical StickS3 over BLE.
 - `desktop-observer` can mirror the current Codex Desktop rollout into dashboard snapshots.

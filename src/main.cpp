@@ -80,7 +80,8 @@ enum InputAction : uint8_t {
   ACTION_BACK,
   ACTION_GO,
   ACTION_SLEEP,
-  ACTION_JUMP_OR_SLEEP
+  ACTION_JUMP_OR_SLEEP,
+  ACTION_UNPAIR_HOST
 };
 
 enum PressEvent : uint8_t {
@@ -115,6 +116,7 @@ enum SettingIndex : uint8_t {
   SETTING_TEXT_NAV,
   SETTING_AUTO_NEWEST,
   SETTING_ROTATION,
+  SETTING_UNPAIR_HOST,
   SETTING_COUNT
 };
 
@@ -176,6 +178,7 @@ struct SettingsState {
   bool autoNewest = true;
   RotationMode rotation = ROTATION_AUTO;
   uint8_t selected = 0;
+  uint8_t scrollTop = 0;
   bool open = false;
   uint32_t lastInputMs = 0;
 };
@@ -395,6 +398,33 @@ bool constantTimeEquals(const String& left, const String& right) {
     diff |= static_cast<uint8_t>(left.charAt(i) ^ right.charAt(i));
   }
   return diff == 0;
+}
+
+void updateBoard();
+void clearPairing();
+
+bool bootUnpairButtonPressed() {
+  updateBoard();
+#if defined(CODEX_COMPANION_CARDPUTER)
+  return M5Cardputer.BtnA.isPressed();
+#else
+  return M5.BtnA.isPressed();
+#endif
+}
+
+void handleBootUnpairShortcut() {
+  if (!isPaired() || !bootUnpairButtonPressed()) {
+    return;
+  }
+  const uint32_t startedMs = millis();
+  while (millis() - startedMs < 2500) {
+    if (!bootUnpairButtonPressed()) {
+      return;
+    }
+    delay(20);
+  }
+  clearPairing();
+  Serial.println("Cleared pairing via boot unpair shortcut");
 }
 
 void loadSecurityState() {
@@ -1823,6 +1853,10 @@ void handleCommand(JsonDocument& doc) {
     sendAck("auth", true);
     return;
   }
+  if (!isPaired()) {
+    sendAck(command.c_str(), false, "not_paired");
+    return;
+  }
   if (isPaired() && !security.sessionAuthorized) {
     sendAck(command.c_str(), false, "unauthorized");
     return;
@@ -1873,7 +1907,7 @@ void handleLine(const String& line) {
     return;
   }
 
-  if (isPaired() && !security.sessionAuthorized) {
+  if (!isPaired() || !security.sessionAuthorized) {
     Serial.println("Ignoring unauthenticated snapshot");
     return;
   }
@@ -2016,6 +2050,16 @@ void applyBlePowerPolicy() {
 void requestBleConnectionTuning() {
   bleConnParamsPending = true;
   bleTuneRequestedMs = millis();
+}
+
+void disconnectBlePeers() {
+  if (bleServer == nullptr) {
+    return;
+  }
+  std::vector<uint16_t> peers = bleServer->getPeerDevices();
+  for (uint16_t peer : peers) {
+    bleServer->disconnect(peer);
+  }
 }
 
 void ensureBleAdvertising() {
@@ -2484,8 +2528,38 @@ String settingLabel(uint8_t index) {
       return String("Auto newest ") + (app.settings.autoNewest ? "On" : "Off");
     case SETTING_ROTATION:
       return "Rotation " + String(rotationName());
+    case SETTING_UNPAIR_HOST:
+      return isPaired() ? "Unpair host Hold" : "Host Unpaired";
     default:
       return "";
+  }
+}
+
+uint8_t settingsVisibleRows(int listBottom, uint8_t rowStart, uint8_t rowHeight) {
+  if (listBottom <= rowStart || rowHeight == 0) {
+    return 1;
+  }
+  uint8_t rows = static_cast<uint8_t>((listBottom - rowStart) / rowHeight);
+  if (rows < 1) {
+    rows = 1;
+  }
+  return min<uint8_t>(rows, SETTING_COUNT);
+}
+
+void updateSettingsScroll(uint8_t visibleRows) {
+  if (visibleRows >= SETTING_COUNT) {
+    app.settings.scrollTop = 0;
+    return;
+  }
+
+  const uint8_t maxTop = SETTING_COUNT - visibleRows;
+  if (app.settings.scrollTop > maxTop) {
+    app.settings.scrollTop = maxTop;
+  }
+  if (app.settings.selected < app.settings.scrollTop) {
+    app.settings.scrollTop = app.settings.selected;
+  } else if (app.settings.selected >= app.settings.scrollTop + visibleRows) {
+    app.settings.scrollTop = app.settings.selected - visibleRows + 1;
   }
 }
 
@@ -2498,15 +2572,36 @@ void drawSettings() {
   const bool landscape = isLandscape();
   const uint8_t rowStart = landscape ? 36 : 48;
   const uint8_t rowHeight = landscape ? 15 : 20;
-  for (uint8_t i = 0; i < SETTING_COUNT; ++i) {
-    const uint8_t y = rowStart + i * rowHeight;
+  const int listBottom = landscape ? canvas.height() - 4 : 170;
+  const uint8_t visibleRows = settingsVisibleRows(listBottom, rowStart, rowHeight);
+  const bool scrollable = visibleRows < SETTING_COUNT;
+  updateSettingsScroll(visibleRows);
+
+  const int rowFillWidth = canvas.width() - (scrollable ? 18 : 4);
+  const int textMaxWidth = canvas.width() - (scrollable ? 28 : 12);
+  for (uint8_t row = 0; row < visibleRows; ++row) {
+    const uint8_t i = app.settings.scrollTop + row;
+    if (i >= SETTING_COUNT) {
+      break;
+    }
+    const uint8_t y = rowStart + row * rowHeight;
     const bool selected = i == app.settings.selected;
     const uint16_t fg = selected ? TFT_BLACK : TFT_LIGHTGREY;
     const uint16_t bg = selected ? rgb(118, 166, 154) : TFT_BLACK;
     if (selected) {
-      canvas.fillRect(2, y - 2, canvas.width() - 4, DASHBOARD_FONT_HEIGHT + 2, bg);
+      canvas.fillRect(2, y - 2, rowFillWidth, DASHBOARD_FONT_HEIGHT + 2, bg);
     }
-    drawTextAt(6, y, fitTextPixels(settingLabel(i), canvas.width() - 12), fg, bg);
+    drawTextAt(6, y, fitTextPixels(settingLabel(i), textMaxWidth), fg, bg);
+  }
+  if (scrollable) {
+    const uint16_t marker = rgb(100, 104, 108);
+    const int markerX = canvas.width() - 10;
+    if (app.settings.scrollTop > 0) {
+      drawTextAt(markerX, rowStart, "^", marker);
+    }
+    if (app.settings.scrollTop + visibleRows < SETTING_COUNT) {
+      drawTextAt(markerX, rowStart + (visibleRows - 1) * rowHeight, "v", marker);
+    }
   }
 
   const int pct = batteryPercent();
@@ -2688,6 +2783,9 @@ void rotateSetting(int8_t delta = 1) {
       app.settings.rotation = cycledRotationMode(delta);
       applyRotationMode();
       break;
+    case SETTING_UNPAIR_HOST:
+      setCurrentStatus("System", "settings", isPaired() ? "Hold to unpair host" : "Host already unpaired");
+      break;
     default:
       break;
   }
@@ -2734,6 +2832,18 @@ void cancelPairing() {
   needsRedraw = true;
 }
 
+void unpairHostFromDevice() {
+  if (isPaired()) {
+    clearPairing();
+    setCurrentStatus("System", "unpair", "Host unpaired");
+  } else {
+    setCurrentStatus("System", "unpair", "Already unpaired");
+  }
+  app.settings.open = false;
+  needsRedraw = true;
+  disconnectBlePeers();
+}
+
 void dispatchInput(InputAction action) {
   if (action == ACTION_NONE) {
     return;
@@ -2778,8 +2888,17 @@ void dispatchInput(InputAction action) {
       case ACTION_SCROLL_OLDER_PAGE:
         rotateSetting(-1);
         break;
+      case ACTION_UNPAIR_HOST:
+        if (app.settings.selected == SETTING_UNPAIR_HOST) {
+          unpairHostFromDevice();
+        }
+        break;
       case ACTION_SLEEP:
-        enterDisplaySleep();
+        if (app.settings.selected == SETTING_UNPAIR_HOST) {
+          unpairHostFromDevice();
+        } else {
+          enterDisplaySleep();
+        }
         break;
       default:
         break;
@@ -2870,7 +2989,10 @@ void handleStickButtons(bool aPressed, bool bPressed) {
   if (aEvent == PRESS_SINGLE) {
     dispatchInput(app.settings.open ? ACTION_NEXT_VALUE : ACTION_SCROLL_NEWER);
   } else if (aEvent == PRESS_LONG) {
-    dispatchInput(app.settings.open ? ACTION_CLOSE_SETTINGS : ACTION_OPEN_SETTINGS);
+    const InputAction longAction = app.settings.open
+      ? (app.settings.selected == SETTING_UNPAIR_HOST ? ACTION_UNPAIR_HOST : ACTION_CLOSE_SETTINGS)
+      : ACTION_OPEN_SETTINGS;
+    dispatchInput(longAction);
   }
 
   if (bEvent == PRESS_SINGLE) {
@@ -3040,6 +3162,7 @@ void setup() {
 
   prefs.begin("codexdash", false);
   loadSecurityState();
+  handleBootUnpairShortcut();
   samplePowerTelemetry(true);
   loadSettings();
   initializeRotation();

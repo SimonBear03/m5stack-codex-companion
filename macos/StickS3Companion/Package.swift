@@ -3,16 +3,16 @@
 import PackageDescription
 
 let package = Package(
-    name: "StickS3Companion",
+    name: "M5StackCodexCompanion",
     platforms: [
         .macOS(.v13)
     ],
     products: [
-        .executable(name: "StickS3Companion", targets: ["StickS3Companion"])
+        .executable(name: "M5StackCodexCompanion", targets: ["M5StackCodexCompanion"])
     ],
     targets: [
         .executableTarget(
-            name: "StickS3Companion",
+            name: "M5StackCodexCompanion",
             path: "Sources"
         )
     ]
